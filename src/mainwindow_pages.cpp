@@ -949,6 +949,8 @@ QWidget* MainWindow::createSurfaceStatesPage()
             toggleField("tagThermal", "Tag: thermal", def.tagThermal, "Thermal states dry liquids and melt frozen states."),
             toggleField("tagViscous", "Tag: viscous", def.tagViscous, "Viscous states strongly resist washing and drying."),
             numberField("resistance", "Resistance", def.resistance, 0.0, 1.0, 0.005, "How hard the state is to suppress through the tag physics."),
+            numberField("gainRate", "Gain rate", def.gainRate, 0.05, 10.0, 0.01, "Multiplier on the runtime's accumulation speed — how fast this material takes the state on (cloth soaks fast, sealed metal beads instantly)."),
+            numberField("dryRate", "Dry rate", def.dryRate, 0.05, 10.0, 0.01, "Multiplier on the runtime's decay speed — low values stay wet/dusty long after the source stops. The preview's weather simulation honors both rates."),
             colorField("color", "Color", def.color, "State color. Darken blend multiplies the surface toward this raw color; Tint and Coat treat it as an sRGB overlay."),
             withRebuild(choiceField("blendMode", "Albedo blend", def.blendMode == 0 ? "Darken" : (def.blendMode == 2 ? "Coat" : "Tint"), {"Darken", "Tint", "Coat"}, "Darken multiplies (wetness, char), Tint layers a dusty film, Coat replaces toward the state color (frost, blood).")),
             numberField("desaturation", "Desaturation", def.desaturation, 0.0, 1.0, 0.005, "Tint blend only: washes out the underlying color."),
@@ -963,12 +965,18 @@ QWidget* MainWindow::createSurfaceStatesPage()
             numberField("sparkle", "Sparkle", def.sparkle, 0.0, 4.0, 0.01, "Crystal glinting through the procedural glint machinery."),
             numberField("glowIntensity", "Glow intensity", def.glowIntensity, 0.0, 64.0, 0.05, "Peak emissive energy of the blackbody ramp driven by the state amount."),
             numberField("cavityBias", "Cavity bias", def.cavityBias, 0.0, 1.0, 0.005, "How strongly the response map's cavity channel pulls accumulation in first."),
+            numberField("aoBias", "AO accumulation", def.aoBias, 0.0, 1.0, 0.005, "Free guidance from the RMAOS AO channel: occluded crevices collect this state. Works with or without a response map."),
+            numberField("heightBias", "Height pooling", def.heightBias, 0.0, 1.0, 0.005, "Free guidance from the height map: low areas pool the state first and dry last (puddles)."),
+            numberField("roughnessBias", "Roughness grip", def.roughnessBias, 0.0, 1.0, 0.005, "Free guidance from the roughness channel: rough areas grip the state, polished areas shed it."),
+            numberField("metalSeal", "Metal sealing", def.metalSeal, 0.0, 1.0, 0.005, "Metallic areas suppress porous absorption for this state — wet metal beads and glosses but never soak-darkens."),
+            numberField("emissiveDry", "Emissive drying", def.emissiveDry, 0.0, 1.0, 0.005, "Glowing-hot areas suppress this state per texel — frost never forms on the reactor vents."),
             numberField("threshold", "Threshold", def.threshold, 0.0, 1.0, 0.005, "Amount required before coverage starts to appear."),
             numberField("softness", "Reveal softness", def.softness, 0.01, 1.0, 0.005, "Width of the dissolve-style reveal around the variation channel."),
+            numberField("retention", "Porous retention", def.retention, 0.0, 1.0, 0.005, "Biases accumulation by the response map's porosity: porous areas collect the state first and are the last to dry."),
             numberField("directionality", "Directionality", def.directionality, 0.0, 1.0, 0.005, "Weights accumulation toward up-facing surfaces (snow, dust settling)."),
             numberField("streaking", "Streaking", def.streaking, 0.0, 1.0, 0.005, "Gravity-elongated accumulation on vertical surfaces (rain streaks, drips)."),
             numberField("edgeShedding", "Edge shedding", def.edgeShedding, 0.0, 1.0, 0.005, "Exposed edges (response map B below 0.5 as signed curvature) shed this state — worn corners stay clean."),
-            toggleField("ripples", "Ripples", def.ripples, "Animated liquid detail on up-facing surfaces while the state is active."),
+            toggleField("ripples", "Ripples & drips", def.ripples, "Animated liquid detail while the state is active: rain ripples on up-facing surfaces and droplets dripping down vertical ones with wet trails."),
             choiceField("maskChannel", "Dedicated mask", channelName(def.maskChannel), channelChoices, "Selects a Surface State Masks channel to replace the shared response accumulation with hand-authored placement."),
             choiceField("shelterChannel", "Shelter channel", channelName(def.shelterChannel), channelChoices, "Vertex-color channel that keeps areas clean (under armor plates, interiors); 1 = fully sheltered.")
         });
@@ -1016,6 +1024,9 @@ void MainWindow::addStatePresetRow(QFrame* card, int slot)
                 m_document.setSetting(presetSection, QStringLiteral("tagThermal"), preset.tagThermal);
                 m_document.setSetting(presetSection, QStringLiteral("tagViscous"), preset.tagViscous);
                 m_document.setSetting(presetSection, QStringLiteral("resistance"), preset.resistance);
+                m_document.setSetting(presetSection, QStringLiteral("gainRate"), preset.gainRate);
+                m_document.setSetting(presetSection, QStringLiteral("dryRate"), preset.dryRate);
+                m_document.setSetting(presetSection, QStringLiteral("retention"), preset.retention);
                 m_document.setSetting(presetSection, QStringLiteral("color"), preset.color);
                 m_document.setSetting(presetSection, QStringLiteral("blendMode"), preset.blendMode == 0 ? QStringLiteral("Darken") : (preset.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint")));
                 m_document.setSetting(presetSection, QStringLiteral("desaturation"), preset.desaturation);
@@ -1030,6 +1041,11 @@ void MainWindow::addStatePresetRow(QFrame* card, int slot)
                 m_document.setSetting(presetSection, QStringLiteral("sparkle"), preset.sparkle);
                 m_document.setSetting(presetSection, QStringLiteral("glowIntensity"), preset.glowIntensity);
                 m_document.setSetting(presetSection, QStringLiteral("cavityBias"), preset.cavityBias);
+                m_document.setSetting(presetSection, QStringLiteral("aoBias"), preset.aoBias);
+                m_document.setSetting(presetSection, QStringLiteral("heightBias"), preset.heightBias);
+                m_document.setSetting(presetSection, QStringLiteral("roughnessBias"), preset.roughnessBias);
+                m_document.setSetting(presetSection, QStringLiteral("metalSeal"), preset.metalSeal);
+                m_document.setSetting(presetSection, QStringLiteral("emissiveDry"), preset.emissiveDry);
                 m_document.setSetting(presetSection, QStringLiteral("threshold"), preset.threshold);
                 m_document.setSetting(presetSection, QStringLiteral("softness"), preset.softness);
                 m_document.setSetting(presetSection, QStringLiteral("directionality"), preset.directionality);

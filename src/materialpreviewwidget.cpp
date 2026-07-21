@@ -741,7 +741,9 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     }
     {
         const auto state=stateFor(QStringLiteral("DetailNormal"));const QVector3D normalColor=jsonColor(state.values,"normal","#8080FF");const float useNormal=used(state.values,"overrideNormal");
-        addSpecial(DetailNormalLayer,QStringLiteral("DetailNormal"),QVector4D(normalColor.x(),normalColor.y(),0,0),QVector4D(useNormal,useNormal,0,0));
+        addSpecial(DetailNormalLayer,QStringLiteral("DetailNormal"),
+            QVector4D(normalColor.x(),normalColor.y(),.5f,numberValue(state.values,"mask",1)),
+            QVector4D(useNormal,useNormal,used(state.values,"overrideRoughVariation"),used(state.values,"overrideMask")));
     }
     {
         const auto state=stateFor(QStringLiteral("SurfaceStateResponse"));
@@ -782,6 +784,7 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
         m_interiorRoomsV=numberValue(state.values,QStringLiteral("roomsV"),1.0f);
         m_interiorDepth=numberValue(state.values,QStringLiteral("depth"),1.0f);
         m_interiorBrightness=numberValue(state.values,QStringLiteral("brightness"),1.0f);
+        m_interiorEmissive=numberValue(state.values,QStringLiteral("windowEmissive"),0.0f);
     }
     {
         const auto state=document.textureSlot(QStringLiteral("Landscape"),QStringLiteral("macroVariation"));const QVector3D color=jsonColor(state.values,"color","#808080");const float useColor=used(state.values,"overrideColor");
@@ -1330,14 +1333,15 @@ void PbrPreviewGL::initializeGL()
         // already applied on the CPU; each slot's profile lives in these arrays.
         uniform float uStateAmount[8],uStateDesat[8],uStatePorosityInfluence[8],uStateRoughTarget[8],uStateRoughWeight[8];
         uniform float uStateF0Target[8],uStateF0Weight[8],uStateFilmF0[8],uStateSparkle[8],uStateGlowIntensity[8];
-        uniform float uStateCavityBias[8],uStateThreshold[8],uStateSoftness[8],uStateDirectionality[8],uStateStreaking[8];
+        uniform float uStateCavityBias[8],uStateThreshold[8],uStateSoftness[8],uStateDirectionality[8],uStateStreaking[8],uStateRetention[8];
+        uniform float uStateAoBias[8],uStateHeightBias[8],uStateRoughBias[8],uStateMetalSeal[8],uStateEmissiveDry[8];
         uniform int uStateBlendMode[8],uStateRoughMode[8],uStateKillMetallic[8],uStateRipples[8],uStateMaskChannel[8],uStateShelterChannel[8];
         uniform vec3 uStateColor[8];
         uniform bool uMeshHasVertexColors;
         uniform samplerCube uInterior;
         uniform bool uInteriorEnabled;
         uniform vec2 uInteriorRooms;
-        uniform float uInteriorDepth,uInteriorBrightness;
+        uniform float uInteriorDepth,uInteriorBrightness,uInteriorEmissive;
         uniform bool uParticleActive;
         uniform int uFlipbookEnabled[3],uFlipbookDriver[3],uFlipbookLoop[3],uFlipbookBlendOn[3],uPolarUvOn[3];
         uniform vec2 uFlipbookGrid[3];
@@ -1352,7 +1356,7 @@ void PbrPreviewGL::initializeGL()
         uniform int uSixWayALayer,uSixWayBLayer;
         uniform float uSixWayAmbient,uSixWayIntensity,uSixWayFireIntensity;
         uniform int uMotionVectorsLayer,uDetailNormalLayer;
-        uniform float uMotionStrength,uDetailNormalStrength,uDetailNormalScale;
+        uniform float uMotionStrength,uDetailNormalStrength,uDetailNormalScale,uDetailRoughVariation;
         uniform float uStateEdgeShedding[8];
         uniform bool uLandscapeUsePorosityTexture;
         uniform float uLandscapePorosity;
@@ -1529,20 +1533,63 @@ void PbrPreviewGL::initializeGL()
             float e=hash13(i+vec3(0,0,1)),g=hash13(i+vec3(1,0,1)),h=hash13(i+vec3(0,1,1)),j=hash13(i+vec3(1,1,1));
             return mix(mix(mix(a,b,f.x),mix(c,d,f.x),f.y),mix(mix(e,g,f.x),mix(h,j,f.x),f.y),f.z);
         }
+        // Raindrop drips: droplet heads sliding down vertical surfaces leaving
+        // fading trails above them. Evaluates neighboring columns so heads stay
+        // continuous across column borders. Returns the trail/head wetting mask
+        // and outputs the head's bump gradient in the (horizontal, up) wall plane.
+        float stateDripField(vec3 wp,vec3 n,float t,out vec2 gradient){
+            gradient=vec2(0.0);
+            float verticality=1.0-abs(n.y);
+            if(verticality<.25)return 0.0;
+            vec2 horizontalN=vec2(n.x,n.z);float horizontalLen=max(length(horizontalN),1e-4);horizontalN/=horizontalLen;
+            bool facesX=abs(horizontalN.x)>abs(horizontalN.y);
+            float u=facesX?wp.z:wp.x;
+            // Planar-projection quality: the u coordinate compresses as the
+            // wall turns diagonal toward the projection axis, so fade the
+            // drips out before trails can stretch across those regions.
+            float across=facesX?abs(horizontalN.y):abs(horizontalN.x);
+            float quality=1.0-smoothstep(.5,.72,across);
+            if(quality<=0.0)return 0.0;
+            const float columns=8.0;
+            float mask=0.0;
+            for(int c=-1;c<=1;++c){
+                float col=floor(u*columns)+float(c);
+                float center=(col+.5)/columns;
+                float seed=hash13(vec3(col,7.7,3.1));
+                float speed=.10+.25*seed;
+                float cycle=fract(t*speed+seed*11.0);
+                float active=step(.35,hash13(vec3(col,floor(t*speed+seed*11.0),9.3)));
+                float headY=1.2-cycle*2.8;
+                vec2 offset=vec2((u-center)*6.0,wp.y-headY);
+                float radius=length(offset);
+                float head=exp(-radius*radius*90.0)*active;
+                float above=wp.y-headY;
+                float trail=smoothstep(0.0,.08,above)*smoothstep(1.1,.12,above)*smoothstep(.07,.015,abs(u-center))*active;
+                mask=max(mask,max(head,trail*.7)*verticality*quality);
+                if(radius>1e-4)gradient+=-normalize(offset)*head*verticality*quality;
+            }
+            return mask;
+        }
         // Expanding hashed rain-ripple rings; returns a tangent-plane height
         // gradient for perturbing the shading normal on up-facing wet surfaces.
+        // Each octave evaluates its 3x3 cell neighborhood so rings stay
+        // continuous across cell borders instead of clipping to squares.
         vec2 stateRippleGradient(vec2 p,float t){
             vec2 gradient=vec2(0.0);
             for(int k=0;k<2;++k){
-                vec2 scaled=p*(3.5+float(k)*2.3)+vec2(float(k)*17.0,float(k)*9.0);
-                vec2 cell=floor(scaled);
-                vec2 center=cell+vec2(hash13(vec3(cell,1.7)),hash13(vec3(cell,9.1)));
-                float phase=hash13(vec3(cell,4.3));
-                float cycle=fract(t*.7+phase);
-                vec2 offset=scaled-center;float radius=length(offset);
-                float wave=radius*18.0-cycle*14.0;
-                float envelope=max(0.0,1.0-cycle*1.15)*smoothstep(1.0,.15,radius)*step(radius*.9,cycle*1.4);
-                if(radius>1e-4)gradient+=normalize(offset)*cos(wave)*envelope;
+                vec2 scaled=p*(7.0+float(k)*4.5)+vec2(float(k)*17.0,float(k)*9.0);
+                vec2 baseCell=floor(scaled);
+                for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x){
+                    vec2 cell=baseCell+vec2(float(x),float(y));
+                    vec2 center=cell+vec2(hash13(vec3(cell,1.7)),hash13(vec3(cell,9.1)));
+                    float phase=hash13(vec3(cell,4.3));
+                    float cycle=fract(t*.7+phase);
+                    vec2 offset=scaled-center;float radius=length(offset);
+                    float wave=radius*18.0-cycle*14.0;
+                    float envelope=max(0.0,1.0-cycle*1.15)*smoothstep(1.0,.15,radius)
+                        *(1.0-smoothstep(cycle*1.4-.12,cycle*1.4+.12,radius*.9));
+                    if(radius>1e-4)gradient+=normalize(offset)*cos(wave)*envelope;
+                }
             }
             return gradient;
         }
@@ -1943,8 +1990,11 @@ void PbrPreviewGL::initializeGL()
                 // Tiling micro-detail normal: cheap close-range surface texture
                 // (fabric weave, pores, machining) blended whiteout-style.
                 vec4 detail=specialSample(uDetailNormalLayer,uv*uDetailNormalScale);
-                vec2 detailXy=(detail.rg*2.0-1.0)*uDetailNormalStrength;
+                float detailMask=detail.a;
+                vec2 detailXy=(detail.rg*2.0-1.0)*uDetailNormalStrength*detailMask;
                 N=normalize(N+tangentToWorld*vec3(detailXy,0.0));
+                // B carries micro roughness breakup at the same detail scale.
+                rough=clamp(rough+(detail.b-.5)*2.0*uDetailRoughVariation*detailMask,0.0,1.0);
             }
             vec3 stateHeatGlow=vec3(0.0);
             float stateSparkle=0.0;
@@ -1961,12 +2011,31 @@ void PbrPreviewGL::initializeGL()
                     :vec4(fallbackPorosity,1.0,.5+(1.0-ao)*.5,clamp(vnoise3(vWorldPosition*9.0)*.7+.15,0.0,1.0));
                 float porosity=response.r,adhesion=response.g,cavity=response.b,variation=response.a;
                 float upness=clamp(N.y*.5+.5,0.0,1.0);
+                // Rain only lands on genuinely up-facing surfaces; undersides
+                // never ripple.
+                float rainUp=smoothstep(.05,.35,N.y);
                 float verticality=1.0-abs(N.y);
                 float streakNoise=vnoise3(vWorldPosition*vec3(22.0,2.5,22.0));
                 float rippleCover=0.0;
+                vec2 dripGradient=vec2(0.0);
+                float dripField=stateDripField(vWorldPosition,N,uTime,dripGradient);
+                float dripNormalCover=0.0;
+                // Map-guided accumulation: free signals from channels already
+                // sampled. Snapshots keep earlier states in the loop from
+                // feeding their own roughness/metal edits into later biases.
+                float preStateRough=rough,preStateMetal=metal;
+                float stateHeight=uHeightFallback;
+                if(uHasHeight&&!uOverrideHeight){vec4 stateHeightSample=texture(uHeight,heightUv);stateHeight=uHeightBlue?stateHeightSample.b:stateHeightSample.r;}
+                if(uHeightInvert)stateHeight=1.0-stateHeight;
+                float glowFactor=clamp(((uHasEmissive&&!uOverrideEmissiveMask)?texture(uEmissive,uv).a:uEmissiveMask)*min(uEmissiveIntensity,4.0)*.5,0.0,1.0);
                 for(int i=0;i<8;++i){
                     float amount=uStateAmount[i];
                     if(amount<=0.0)continue;
+                    // Glowing-hot areas suppress the state (rain steams off).
+                    amount*=1.0-glowFactor*uStateEmissiveDry[i];
+                    if(amount<=0.0)continue;
+                    // Metallic seals porous absorption for this state.
+                    float statePorosity=porosity*(1.0-preStateMetal*uStateMetalSeal[i]);
                     // Dissolve-style coverage: variation orders reveal, cavity
                     // pulls collection in first, adhesion caps it all. A
                     // dedicated mask channel replaces the shared accumulation.
@@ -1977,7 +2046,11 @@ void PbrPreviewGL::initializeGL()
                         cover=m*adhesion*clamp(amount*2.0,0.0,1.0);
                     }else{
                         float a=amount-uStateThreshold[i];
-                        cover=smoothstep(variation-uStateSoftness[i],variation+uStateSoftness[i],a+cavity*uStateCavityBias[i])*adhesion*clamp(a*4.0,0.0,1.0);
+                        // Retention: porous areas collect first and dry last;
+                        // AO, low height, and roughness add free map guidance.
+                        float guidance=cavity*uStateCavityBias[i]+statePorosity*uStateRetention[i]
+                            +(1.0-ao)*uStateAoBias[i]+(1.0-stateHeight)*uStateHeightBias[i]+(preStateRough-.5)*uStateRoughBias[i];
+                        cover=smoothstep(variation-uStateSoftness[i],variation+uStateSoftness[i],a+guidance)*adhesion*clamp(a*4.0,0.0,1.0);
                     }
                     cover*=mix(1.0,upness*upness,uStateDirectionality[i]);
                     cover*=mix(1.0,clamp(streakNoise*1.7,0.0,1.0),uStateStreaking[i]*verticality);
@@ -1988,25 +2061,30 @@ void PbrPreviewGL::initializeGL()
                         float shelter=uStateShelterChannel[i]==0?vColor.r:(uStateShelterChannel[i]==1?vColor.g:(uStateShelterChannel[i]==2?vColor.b:vColor.a));
                         cover*=1.0-shelter;
                     }
+                    // Drips wet their trails even where base accumulation is low.
+                    if(uStateRipples[i]==1&&dripField>0.0){
+                        cover=max(cover,dripField*clamp(amount*1.5,0.0,1.0)*adhesion);
+                        dripNormalCover=max(dripNormalCover,clamp(amount*1.5,0.0,1.0));
+                    }
                     cover=clamp(cover,0.0,1.0);
                     if(cover<=0.0)continue;
                     float porosityMix=uStatePorosityInfluence[i];
                     if(uStateBlendMode[i]==0){
                         // Darken: multiplies toward the raw (non-gamma) color.
-                        base*=mix(vec3(1.0),max(uStateColor[i],vec3(0.0)),cover*mix(1.0,porosity,porosityMix));
+                        base*=mix(vec3(1.0),max(uStateColor[i],vec3(0.0)),cover*mix(1.0,statePorosity,porosityMix));
                     }else if(uStateBlendMode[i]==1){
                         vec3 tint=pow(max(uStateColor[i],vec3(.001)),vec3(2.2));
                         vec3 grayBase=vec3(dot(base,vec3(.299,.587,.114)));
                         base=mix(base,mix(base,grayBase,uStateDesat[i])*tint/max(dot(tint,vec3(.333)),.05)*.35+tint*.65,cover);
                     }else{
                         vec3 tint=pow(max(uStateColor[i],vec3(.001)),vec3(2.2));
-                        base=mix(base,tint*mix(1.0,.55,porosity*porosityMix),cover);
+                        base=mix(base,tint*mix(1.0,.55,statePorosity*porosityMix),cover);
                     }
-                    float roughWeight=uStateRoughWeight[i]*cover*mix(1.0,1.0-porosity*.6,porosityMix);
+                    float roughWeight=uStateRoughWeight[i]*cover*mix(1.0,1.0-statePorosity*.6,porosityMix);
                     if(uStateRoughMode[i]==1)rough=mix(rough,clamp(rough+uStateRoughTarget[i],0.0,1.0),roughWeight);
                     else rough=mix(rough,uStateRoughTarget[i],roughWeight);
                     dielectric=mix(dielectric,uStateF0Target[i],uStateF0Weight[i]*cover);
-                    dielectric=max(dielectric,uStateFilmF0[i]*cover*(1.0-porosity*porosityMix));
+                    dielectric=max(dielectric,uStateFilmF0[i]*cover*(1.0-statePorosity*porosityMix));
                     if(uStateKillMetallic[i]==1)metal=mix(metal,0.0,cover);
                     stateSparkle+=cover*uStateSparkle[i];
                     if(uStateGlowIntensity[i]>0.0){
@@ -2014,11 +2092,16 @@ void PbrPreviewGL::initializeGL()
                         vec3 glow=vec3(pow(amount,1.1),pow(amount,2.4)*.85,pow(amount,5.5)*.72);
                         stateHeatGlow+=glow*cover*uStateGlowIntensity[i];
                     }
-                    if(uStateRipples[i]==1)rippleCover=max(rippleCover,cover*upness);
+                    if(uStateRipples[i]==1)rippleCover=max(rippleCover,cover*rainUp);
                 }
                 if(rippleCover>0.0){
+                    // Subtract the height gradient so ring crests read as raised.
                     vec2 rippleGradient=stateRippleGradient(vWorldPosition.xz,uTime)*rippleCover*.35;
-                    N=normalize(N+vec3(rippleGradient.x,0.0,rippleGradient.y));
+                    N=normalize(N-vec3(rippleGradient.x,0.0,rippleGradient.y));
+                }
+                if(dripNormalCover>0.0){
+                    vec3 horizontalDir=abs(N.x)>abs(N.z)?vec3(0.0,0.0,1.0):vec3(1.0,0.0,0.0);
+                    N=normalize(N+(horizontalDir*dripGradient.x+vec3(0.0,1.0,0.0)*dripGradient.y)*dripNormalCover*.4);
                 }
             }
             vec4 emissionSample=layer0Sample(uEmissive,uv);
@@ -2214,7 +2297,7 @@ void PbrPreviewGL::initializeGL()
                 float imperfection=(imperfections.r*.5+imperfections.g*.35+imperfections.b*.2)*imperfections.a;
                 float refractionRough=clamp(uGlassRefractionRoughness+imperfection*.55,0.0,1.0),thickness=uGlassThinWalled?.02:max(transmission.a*uGlassThickness,.001);
                 vec3 refracted=refract(-V,N,1.0/max(uGlassIor,1.001));if(dot(refracted,refracted)<.001)refracted=-V;
-                vec3 transmitted;
+                vec3 transmitted;vec3 interiorGlow=vec3(0.0);
                 if(uInteriorEnabled){
                     // Interior mapping: intersect the view ray with a unit room
                     // box behind each window pane and sample its cubemap.
@@ -2226,13 +2309,18 @@ void PbrPreviewGL::initializeGL()
                     vec3 kPlanes=abs(invDir)-rayStart*invDir;
                     float kMin=min(min(kPlanes.x,kPlanes.y),kPlanes.z);
                     vec3 hit=rayStart+kMin*rayDir;
-                    transmitted=pow(max(texture(uInterior,hit).rgb,vec3(0.0)),vec3(2.2))*uInteriorBrightness/max(uEnvironmentIntensity,.05);
+                    vec4 interiorSample=texture(uInterior,hit);
+                    vec3 interiorLinear=pow(max(interiorSample.rgb,vec3(0.0)),vec3(2.2));
+                    transmitted=interiorLinear*uInteriorBrightness/max(uEnvironmentIntensity,.05);
+                    // Cubemap alpha marks self-lit interior areas: those windows
+                    // glow on their own, independent of scene lighting.
+                    interiorGlow=interiorLinear*interiorSample.a*uInteriorEmissive;
                 }else{
                     transmitted=textureLod(uPrefilteredEnvironment,environmentDirection(refracted),refractionRough*uPrefilteredEnvironmentMaxLod).rgb;
                 }
                 vec3 absorption=pow(max(transmission.rgb,vec3(.001)),vec3(thickness/max(uGlassAbsorptionDistance,.0001)));
                 float glassF0=pow((uGlassIor-1.0)/(uGlassIor+1.0),2.0);vec3 glassF=fresnel(NoV,vec3(glassF0));
-                color=mix(transmitted*absorption,envSpec,glassF)*uEnvironmentIntensity+environmentDiffuse*.08;opacity=clamp(uGlobalOpacity,0.02,1.0);
+                color=mix(transmitted*absorption,envSpec,glassF)*uEnvironmentIntensity+environmentDiffuse*.08+interiorGlow*absorption;opacity=clamp(uGlobalOpacity,0.02,1.0);
             }
 
             if((uShaderMode==4||(uShaderMode==8&&(hasSpecial(8)||hasSpecial(9))))&&!defaults){
@@ -2714,7 +2802,7 @@ void PbrPreviewGL::paintGL()
     m_secondaryBaseTexture->bind(6);m_secondaryNormalTexture->bind(7);m_secondaryRmaosTexture->bind(8);m_secondaryEmissiveTexture->bind(9);m_layerCoverageTexture->bind(10);m_gradientTexture->bind(11);
     m_tertiaryBaseTexture->bind(16);m_tertiaryNormalTexture->bind(17);m_tertiaryRmaosTexture->bind(18);m_tertiaryEmissiveTexture->bind(19);m_tertiaryCoverageTexture->bind(20);
     m_interiorTexture->bind(21);m_program->setUniformValue("uInterior",21);
-    m_program->setUniformValue("uInteriorEnabled",m_interiorEnabled);m_program->setUniformValue("uInteriorRooms",QVector2D(m_interiorRoomsU,m_interiorRoomsV));m_program->setUniformValue("uInteriorDepth",m_interiorDepth);m_program->setUniformValue("uInteriorBrightness",m_interiorBrightness);
+    m_program->setUniformValue("uInteriorEnabled",m_interiorEnabled);m_program->setUniformValue("uInteriorRooms",QVector2D(m_interiorRoomsU,m_interiorRoomsV));m_program->setUniformValue("uInteriorDepth",m_interiorDepth);m_program->setUniformValue("uInteriorBrightness",m_interiorBrightness);m_program->setUniformValue("uInteriorEmissive",m_interiorEmissive);
     m_program->setUniformValue("uBase",0);m_program->setUniformValue("uNormal",1);m_program->setUniformValue("uRmaos",2);m_program->setUniformValue("uEmissive",3);m_program->setUniformValue("uHeight",4);m_program->setUniformValue("uEnvironment",5);
     glActiveTexture(GL_TEXTURE15);glBindTexture(GL_TEXTURE_2D,m_shadowDepthTexture);m_program->setUniformValue("uShadowMap",15);m_program->setUniformValue("uShadowMatrix",m_shadowMatrix);m_program->setUniformValue("uShadowsEnabled",m_shadowsEnabled);m_program->setUniformValue("uShadowIntensity",m_shadowIntensity);m_program->setUniformValue("uDerivedEnvironmentShadow",m_derivedEnvironmentShadow);m_program->setUniformValue("uDerivedEnvironmentShadowWeight",m_derivedEnvironmentShadowWeight);
     m_program->setUniformValue("uPrefilteredEnvironment",12);m_program->setUniformValue("uBrdfLut",13);m_program->setUniformValue("uSpecial",14);m_program->setUniformValue("uEnvironmentSourceMaxLod",float(qMax(0,m_environmentTexture->mipLevels()-1)));m_program->setUniformValue("uPrefilteredEnvironmentMaxLod",m_prefilteredEnvironmentMaxLod);
@@ -2838,6 +2926,7 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uDetailNormalLayer",int(DetailNormalLayer));
     m_program->setUniformValue("uDetailNormalStrength",numberValue(detailNormal.values,QStringLiteral("strength"),1));
     m_program->setUniformValue("uDetailNormalScale",numberValue(detailNormal.values,QStringLiteral("uvScale"),4));
+    m_program->setUniformValue("uDetailRoughVariation",numberValue(detailNormal.values,QStringLiteral("roughVariation"),.5f));
     const auto landscapeNormalArray=m_document.textureSlot(QStringLiteral("Landscape"),QStringLiteral("normalHeightArray"));
     m_program->setUniformValue("uLandscapeUsePorosityTexture",!boolValue(landscapeNormalArray.values,QStringLiteral("overridePorosity"),true));
     m_program->setUniformValue("uLandscapePorosity",numberValue(landscapeNormalArray.values,QStringLiteral("porosity"),.5f));
@@ -2855,7 +2944,8 @@ void PbrPreviewGL::paintGL()
         constexpr int MaxStates=Pbr::MaxSurfaceStates;
         GLfloat amount[MaxStates]={},desat[MaxStates]={},porosityInfluence[MaxStates]={},roughTarget[MaxStates]={},roughWeight[MaxStates]={};
         GLfloat f0Target[MaxStates]={},f0Weight[MaxStates]={},filmF0[MaxStates]={},sparkle[MaxStates]={},glowIntensity[MaxStates]={};
-        GLfloat cavityBias[MaxStates]={},threshold[MaxStates]={},softness[MaxStates]={},directionality[MaxStates]={},streaking[MaxStates]={},edgeShedding[MaxStates]={};
+        GLfloat cavityBias[MaxStates]={},threshold[MaxStates]={},softness[MaxStates]={},directionality[MaxStates]={},streaking[MaxStates]={},edgeShedding[MaxStates]={},retention[MaxStates]={};
+        GLfloat aoBias[MaxStates]={},heightBias[MaxStates]={},roughBias[MaxStates]={},metalSeal[MaxStates]={},emissiveDry[MaxStates]={};
         GLint blendMode[MaxStates]={},roughMode[MaxStates]={},killMetallic[MaxStates]={},ripples[MaxStates]={},maskChannel[MaxStates],shelterChannel[MaxStates];
         QVector3D color[MaxStates];
         for(int i=0;i<MaxStates;++i){maskChannel[i]=-1;shelterChannel[i]=-1;}
@@ -2869,7 +2959,8 @@ void PbrPreviewGL::paintGL()
             f0Target[i]=float(state.f0Target);f0Weight[i]=float(state.f0Weight);filmF0[i]=float(state.filmF0);
             killMetallic[i]=state.killMetallic?1:0;sparkle[i]=float(state.sparkle);glowIntensity[i]=float(state.glowIntensity);
             cavityBias[i]=float(state.cavityBias);threshold[i]=float(state.threshold);softness[i]=float(state.softness);
-            directionality[i]=float(state.directionality);streaking[i]=float(state.streaking);edgeShedding[i]=float(state.edgeShedding);ripples[i]=state.ripples?1:0;
+            directionality[i]=float(state.directionality);streaking[i]=float(state.streaking);edgeShedding[i]=float(state.edgeShedding);retention[i]=float(state.retention);ripples[i]=state.ripples?1:0;
+            aoBias[i]=float(state.aoBias);heightBias[i]=float(state.heightBias);roughBias[i]=float(state.roughnessBias);metalSeal[i]=float(state.metalSeal);emissiveDry[i]=float(state.emissiveDry);
             maskChannel[i]=state.maskChannel;shelterChannel[i]=state.shelterChannel;
         }
         m_program->setUniformValueArray("uStateAmount",amount,MaxStates,1);
@@ -2888,6 +2979,12 @@ void PbrPreviewGL::paintGL()
         m_program->setUniformValueArray("uStateDirectionality",directionality,MaxStates,1);
         m_program->setUniformValueArray("uStateStreaking",streaking,MaxStates,1);
         m_program->setUniformValueArray("uStateEdgeShedding",edgeShedding,MaxStates,1);
+        m_program->setUniformValueArray("uStateRetention",retention,MaxStates,1);
+        m_program->setUniformValueArray("uStateAoBias",aoBias,MaxStates,1);
+        m_program->setUniformValueArray("uStateHeightBias",heightBias,MaxStates,1);
+        m_program->setUniformValueArray("uStateRoughBias",roughBias,MaxStates,1);
+        m_program->setUniformValueArray("uStateMetalSeal",metalSeal,MaxStates,1);
+        m_program->setUniformValueArray("uStateEmissiveDry",emissiveDry,MaxStates,1);
         m_program->setUniformValueArray("uStateBlendMode",blendMode,MaxStates);
         m_program->setUniformValueArray("uStateRoughMode",roughMode,MaxStates);
         m_program->setUniformValueArray("uStateKillMetallic",killMetallic,MaxStates);
@@ -3598,8 +3695,9 @@ void MaterialPreviewWidget::applyStateAmounts()
 
 void MaterialPreviewWidget::tickWeatherSimulation()
 {
-    // Looping 30 s event: build up, hold, then decay, driven into the raw
-    // amounts by tag so the interaction physics stays observable.
+    // Looping 30 s event: build up, hold, then decay. The envelope is the
+    // exposure target; each state's amount chases it at its own authored
+    // gain/dry rate, so cloth soaks fast and stays damp long after the storm.
     m_weatherClock+=.1;
     const double phase=std::fmod(m_weatherClock,30.0)/30.0;
     const double buildUp=std::clamp(phase/.35,0.0,1.0);
@@ -3608,13 +3706,16 @@ void MaterialPreviewWidget::tickWeatherSimulation()
     const int mode=m_weatherSim->currentIndex();
     for(int i=0;i<m_resolvedStates.size()&&i<m_stateFields.size();++i){
         const auto& state=m_resolvedStates[i];
-        double amount=0;
-        if(mode==1&&state.tagLiquid&&!state.tagViscous)amount=envelope;
-        else if(mode==2&&state.tagParticulate)amount=envelope;
-        else if(mode==3){if(state.tagFrozen)amount=envelope;else if(state.tagLiquid&&!state.tagViscous)amount=envelope*.25;}
-        else if(mode==4&&state.tagThermal)amount=envelope;
+        double target=0;
+        if(mode==1&&state.tagLiquid&&!state.tagViscous)target=envelope;
+        else if(mode==2&&state.tagParticulate)target=envelope;
+        else if(mode==3){if(state.tagFrozen)target=envelope;else if(state.tagLiquid&&!state.tagViscous)target=envelope*.25;}
+        else if(mode==4&&state.tagThermal)target=envelope;
+        const double current=m_stateFields[i]->value();
+        const double rate=target>current?state.gainRate:state.dryRate;
+        const double next=current+(target-current)*std::min(1.0,rate*1.2*.1);
         QSignalBlocker blocker(m_stateFields[i]);
-        m_stateFields[i]->setValue(amount);
+        m_stateFields[i]->setValue(next);
     }
     applyStateAmounts();
 }

@@ -46,7 +46,13 @@ Developed by Bungo + Claude.
   particulates, thermal dries liquids and melts frost into liquid), and a
   generic response profile — albedo blend, roughness/F0 response, sparkle,
   blackbody glow, up-facing directionality, vertical streaking, animated rain
-  ripples, vertex-color sheltering, and an optional dedicated placement mask
+  ripples plus droplets dripping down vertical surfaces with wet trails,
+  per-state gain/dry rate multipliers (honored by the weather simulation, so
+  cloth soaks fast and stays damp long after the storm), porosity retention
+  (porous areas collect first and dry last), map-guided accumulation from
+  channels every material already carries (AO crevice collection, height-map
+  puddling, roughness grip, metallic absorption sealing, emissive-hot
+  drying), vertex-color sheltering, and an optional dedicated placement mask
   channel. One shared packed response map (porosity, adhesion, cavity,
   variation) serves every state, with a procedural AO+noise fallback when
   none is authored. Wetness/Dust/Frost/Heat/Blood ship as factory presets,

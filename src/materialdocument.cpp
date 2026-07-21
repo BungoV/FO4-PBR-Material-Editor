@@ -471,6 +471,9 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     wetness.cavityBias = .2;
     wetness.directionality = .2; wetness.streaking = .35; wetness.ripples = true;
     wetness.edgeShedding = .3;
+    wetness.gainRate = 1.5; wetness.dryRate = .3; wetness.retention = .3;
+    wetness.aoBias = .15; wetness.heightBias = .3; wetness.roughnessBias = .1;
+    wetness.metalSeal = .8; wetness.emissiveDry = .4;
 
     SurfaceStateSpec dust;
     dust.slot = 1; dust.name = QStringLiteral("Dust");
@@ -481,6 +484,8 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     dust.cavityBias = .3;
     dust.directionality = .5;
     dust.edgeShedding = .35;
+    dust.gainRate = .7; dust.dryRate = .2;
+    dust.aoBias = .35; dust.heightBias = .1; dust.roughnessBias = .25; dust.emissiveDry = .3;
 
     SurfaceStateSpec frost;
     frost.slot = 2; frost.name = QStringLiteral("Frost");
@@ -493,6 +498,8 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     frost.cavityBias = .25;
     frost.directionality = .35;
     frost.edgeShedding = .25;
+    frost.gainRate = .8; frost.dryRate = .5;
+    frost.aoBias = .2; frost.heightBias = .15; frost.roughnessBias = .15; frost.emissiveDry = .7;
 
     SurfaceStateSpec heat;
     heat.slot = 3; heat.name = QStringLiteral("Heat");
@@ -500,6 +507,7 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     heat.color = QStringLiteral("#B3B3B3"); heat.blendMode = 0;  // char darkening .7
     heat.roughnessTarget = .85; heat.roughnessWeight = .7;
     heat.glowIntensity = 4;
+    heat.gainRate = 1.2; heat.dryRate = .6;
 
     SurfaceStateSpec blood;
     blood.slot = 4; blood.name = QStringLiteral("Blood");
@@ -511,6 +519,8 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     blood.resistance = .3;
     blood.streaking = .5;
     blood.edgeShedding = .15;
+    blood.gainRate = 2; blood.dryRate = .15; blood.retention = .2;
+    blood.aoBias = .1; blood.heightBias = .2; blood.metalSeal = .5;
 
     return {wetness, dust, frost, heat, blood};
 }
@@ -569,7 +579,9 @@ QVector<SurfaceStateSpec> resolveSurfaceStates(const MaterialDocument& document)
         // Visual parity with the pre-redesign shader: the enhancements did not
         // exist when these documents were authored.
         for (SurfaceStateSpec& state : presets) {
-            state.directionality = 0; state.streaking = 0; state.ripples = false; state.edgeShedding = 0;
+            state.directionality = 0; state.streaking = 0; state.ripples = false;
+            state.edgeShedding = 0; state.retention = 0; state.aoBias = 0;
+            state.heightBias = 0; state.roughnessBias = 0; state.metalSeal = 0; state.emissiveDry = 0;
         }
     }
 
@@ -589,6 +601,9 @@ QVector<SurfaceStateSpec> resolveSurfaceStates(const MaterialDocument& document)
             state.tagThermal = group.value(QStringLiteral("tagThermal")).toBool(state.tagThermal);
             state.tagViscous = group.value(QStringLiteral("tagViscous")).toBool(state.tagViscous);
             state.resistance = group.value(QStringLiteral("resistance")).toDouble(state.resistance);
+            state.gainRate = group.value(QStringLiteral("gainRate")).toDouble(state.gainRate);
+            state.dryRate = group.value(QStringLiteral("dryRate")).toDouble(state.dryRate);
+            state.retention = group.value(QStringLiteral("retention")).toDouble(state.retention);
             state.color = group.value(QStringLiteral("color")).toString(state.color);
             const QString defaultBlend = state.blendMode == 0 ? QStringLiteral("Darken") : (state.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint"));
             const QString blend = group.value(QStringLiteral("blendMode")).toString(defaultBlend);
@@ -606,6 +621,11 @@ QVector<SurfaceStateSpec> resolveSurfaceStates(const MaterialDocument& document)
             state.sparkle = group.value(QStringLiteral("sparkle")).toDouble(state.sparkle);
             state.glowIntensity = group.value(QStringLiteral("glowIntensity")).toDouble(state.glowIntensity);
             state.cavityBias = group.value(QStringLiteral("cavityBias")).toDouble(state.cavityBias);
+            state.aoBias = group.value(QStringLiteral("aoBias")).toDouble(state.aoBias);
+            state.heightBias = group.value(QStringLiteral("heightBias")).toDouble(state.heightBias);
+            state.roughnessBias = group.value(QStringLiteral("roughnessBias")).toDouble(state.roughnessBias);
+            state.metalSeal = group.value(QStringLiteral("metalSeal")).toDouble(state.metalSeal);
+            state.emissiveDry = group.value(QStringLiteral("emissiveDry")).toDouble(state.emissiveDry);
             state.threshold = group.value(QStringLiteral("threshold")).toDouble(state.threshold);
             state.softness = group.value(QStringLiteral("softness")).toDouble(state.softness);
             state.directionality = group.value(QStringLiteral("directionality")).toDouble(state.directionality);

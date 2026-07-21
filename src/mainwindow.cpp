@@ -799,6 +799,9 @@ void MainWindow::showBatchOperations()
                         document.setSetting(section, QStringLiteral("tagThermal"), state.tagThermal);
                         document.setSetting(section, QStringLiteral("tagViscous"), state.tagViscous);
                         document.setSetting(section, QStringLiteral("resistance"), state.resistance);
+                        document.setSetting(section, QStringLiteral("gainRate"), state.gainRate);
+                        document.setSetting(section, QStringLiteral("dryRate"), state.dryRate);
+                        document.setSetting(section, QStringLiteral("retention"), state.retention);
                         document.setSetting(section, QStringLiteral("color"), state.color);
                         document.setSetting(section, QStringLiteral("blendMode"), state.blendMode == 0 ? QStringLiteral("Darken") : (state.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint")));
                         document.setSetting(section, QStringLiteral("desaturation"), state.desaturation);
@@ -813,6 +816,11 @@ void MainWindow::showBatchOperations()
                         document.setSetting(section, QStringLiteral("sparkle"), state.sparkle);
                         document.setSetting(section, QStringLiteral("glowIntensity"), state.glowIntensity);
                         document.setSetting(section, QStringLiteral("cavityBias"), state.cavityBias);
+                        document.setSetting(section, QStringLiteral("aoBias"), state.aoBias);
+                        document.setSetting(section, QStringLiteral("heightBias"), state.heightBias);
+                        document.setSetting(section, QStringLiteral("roughnessBias"), state.roughnessBias);
+                        document.setSetting(section, QStringLiteral("metalSeal"), state.metalSeal);
+                        document.setSetting(section, QStringLiteral("emissiveDry"), state.emissiveDry);
                         document.setSetting(section, QStringLiteral("threshold"), state.threshold);
                         document.setSetting(section, QStringLiteral("softness"), state.softness);
                         document.setSetting(section, QStringLiteral("directionality"), state.directionality);

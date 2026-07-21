@@ -518,6 +518,9 @@ int main(int argc, char* argv[])
         check(presets.size() == 5 && presets[0].name == QStringLiteral("Wetness") && presets[0].tagLiquid
             && presets[1].tagParticulate && presets[2].tagFrozen && presets[3].tagThermal && presets[4].tagViscous,
             QStringLiteral("an unauthored document resolves to the five factory preset states"));
+        check(presets[1].aoBias == 0.35 && presets[0].heightBias == 0.3 && presets[0].metalSeal == 0.8
+            && presets[2].emissiveDry == 0.7 && presets[1].roughnessBias == 0.25,
+            QStringLiteral("map-guided accumulation biases resolve from the factory presets"));
         statesDocument.setSetting(QStringLiteral("SurfaceStates/Wetness"), QStringLiteral("wetRoughness"), 0.12);
         const auto legacy = Pbr::resolveSurfaceStates(statesDocument);
         check(legacy.size() == 5 && legacy[0].roughnessTarget == 0.12 && !legacy[0].ripples,
@@ -526,12 +529,20 @@ int main(int argc, char* argv[])
         statesDocument.setSetting(QStringLiteral("SurfaceStates/State5"), QStringLiteral("name"), QStringLiteral("Oil"));
         statesDocument.setSetting(QStringLiteral("SurfaceStates/State5"), QStringLiteral("tagLiquid"), true);
         statesDocument.setSetting(QStringLiteral("SurfaceStates/State5"), QStringLiteral("tagViscous"), true);
+        statesDocument.setSetting(QStringLiteral("SurfaceStates/State5"), QStringLiteral("gainRate"), 2.5);
+        statesDocument.setSetting(QStringLiteral("SurfaceStates/State5"), QStringLiteral("dryRate"), 0.1);
         statesDocument.setSetting(QStringLiteral("SurfaceStates/State1"), QStringLiteral("enabled"), false);
         const auto merged = Pbr::resolveSurfaceStates(statesDocument);
         bool oilFound = false, dustFound = false;
-        for (const auto& state : merged) { if (state.name == QStringLiteral("Oil")) oilFound = true; if (state.slot == 1) dustFound = true; }
+        double oilGainRate = 0, oilDryRate = 0;
+        for (const auto& state : merged) {
+            if (state.name == QStringLiteral("Oil")) { oilFound = true; oilGainRate = state.gainRate; oilDryRate = state.dryRate; }
+            if (state.slot == 1) dustFound = true;
+        }
         check(oilFound && !dustFound && merged.size() == 5,
             QStringLiteral("authored slots merge with the presets: custom Oil appears, disabled Dust disappears"));
+        check(oilGainRate == 2.5 && oilDryRate == 0.1,
+            QStringLiteral("per-state gain and dry rates resolve from authored slots"));
         const QString statesFile = directory.filePath(QStringLiteral("states.pbrm"));
         check(statesDocument.save(statesFile, &error), QStringLiteral("state-slot document saves: %1").arg(error));
         Pbr::MaterialDocument statesLoaded;

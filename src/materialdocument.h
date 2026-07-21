@@ -112,6 +112,8 @@ struct SurfaceStateSpec {
     // viscous states resist washing and drying.
     bool tagLiquid = false, tagParticulate = false, tagFrozen = false, tagThermal = false, tagViscous = false;
     double resistance = 0;              // 0 = fully susceptible to suppression
+    double gainRate = 1, dryRate = 1;   // multipliers on the runtime's accumulation/decay speed
+    double retention = 0;               // porous areas collect first and dry last
     QString color = QStringLiteral("#FFFFFF");
     int blendMode = 1;                  // 0 darken (raw multiplier), 1 tint, 2 coat
     double desaturation = 0;
@@ -123,6 +125,11 @@ struct SurfaceStateSpec {
     bool killMetallic = false;
     double sparkle = 0, glowIntensity = 0;
     double cavityBias = 0, threshold = 0, softness = .3;
+    double aoBias = 0;                  // free accumulation from the RMAOS AO channel (occluded collects)
+    double heightBias = 0;              // low height-map areas pool the state (puddles)
+    double roughnessBias = 0;           // rough areas grip the state, polished areas shed
+    double metalSeal = 0;               // metallic suppresses porous absorption (wet metal beads, never darkens)
+    double emissiveDry = 0;             // glowing-hot areas suppress the state (rain steams off the forge)
     double directionality = 0;          // accumulation weight toward up-facing surfaces
     double streaking = 0;               // gravity-elongated accumulation on vertical surfaces
     double edgeShedding = 0;            // exposed edges (response B < 0.5) shed accumulation

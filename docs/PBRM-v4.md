@@ -89,8 +89,21 @@ and a generic response profile (albedo blend mode/color/desaturation,
 roughness target/weight/mode, F0 target/weight, film F0, metallic
 suppression, sparkle, blackbody glow, accumulation cavity bias / threshold /
 softness, up-facing `directionality`, vertical `streaking`, animated
-`ripples`, optional dedicated `maskChannel` into the `primaryStateMasks`
-RGBA socket, and a vertex-color `shelterChannel`). Slot keys are sparse
+`ripples` — rain rings on up-facing surfaces plus droplets dripping down
+vertical ones — optional dedicated `maskChannel` into the
+`primaryStateMasks` RGBA socket, and a vertex-color `shelterChannel`).
+Temporal constants: `gainRate` and `dryRate` multiply the runtime's global
+accumulation and decay speeds (cloth soaks fast and dries slowly), and
+`retention` biases accumulation by response-map porosity so porous areas
+collect first and dry last.
+
+Map-guided accumulation reuses channels every material already carries, at
+zero extra cost: `aoBias` (occluded crevices collect), `heightBias` (low
+height-map areas pool and dry last), `roughnessBias` (rough areas grip,
+polished areas shed), `metalSeal` (metallic suppresses porous absorption —
+wet metal beads and glosses but never soak-darkens), and `emissiveDry`
+(glowing-hot texels suppress the state). The authored response map remains
+the hero-asset override on top of these free signals. Slot keys are sparse
 overrides of per-slot defaults: slots 0-4 default to the factory Wetness /
 Dust / Frost / Heat / Blood presets, slots 5-7 to disabled blanks. The
 pre-redesign named groups (`SurfaceStates/Wetness` … `Blood`) remain
@@ -108,8 +121,12 @@ state's `edgeShedding` weight. Additional additive channel semantics:
 the landscape `normalHeightArray` A is per-layer surface-state porosity
 (`overridePorosity`/`porosity` constants); `MotionVectors` (RG, effect
 families) shares the primary flipbook grid and advects frame cross-fades;
-`DetailNormal` (RG) is a tiling micro-detail normal with `strength` and
-`uvScale`.
+`DetailNormal` is a tiling micro-detail normal (`strength`, `uvScale`) whose
+optional B carries micro roughness variation (`overrideRoughVariation` /
+`roughVariation`, centered at 0.5 — BC5 textures simply skip it) and whose
+optional A masks where detail applies; the `InteriorMap` cubemap's alpha is
+a lit-window mask whose areas self-illuminate at the slot's
+`windowEmissive` intensity.
 
 `UV0/Oscillation`, `UV1/Oscillation`, and `UV2/Oscillation` are additive
 per-layer oscillator groups for non-linear ("breathing") animation: a

@@ -250,13 +250,17 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 numberField("mask", "Mask override", 1.0, 0.0, 1.0, 0.005, "Constant bent-normal mask."),
                 numberField("strength", "Strength", 1.0, 0.0, 1.0, 0.005, "Blends from the shading normal to the authored bent normal.")
             }));
-        add(slot(prefix + "DetailNormal", tr("Detail Normal"), "DTL", "Linear • RG detail normal (tiling)", QColor(112, 118, 196), false, {},
-            "Tiling close-range surface texture (fabric weave, pores, machining marks) layered whiteout-style over the base normal at its own UV scale.", {
+        add(slot(prefix + "DetailNormal", tr("Detail Normal"), "DTL", "Linear • RG detail normal / B roughness variation / A mask (tiling)", QColor(112, 118, 196), false, {},
+            "Tiling close-range surface texture (fabric weave, pores, machining marks) layered whiteout-style over the base normal at its own UV scale. Optional B adds micro roughness breakup at the same scale (BC5 textures simply skip it); optional A masks where detail applies.", {
                 toggleField("overrideNormal", "RG • Detail normal", true, "Checked replaces the sampled detail normal with a constant."),
                 colorField("normal", "Detail normal override", "#8080FF", "Constant tangent-space detail normal; neutral is #8080FF."),
+                toggleField("overrideRoughVariation", "B • Roughness variation", true, "Checked ignores the texture's roughness-variation channel (the default for two-channel BC5 detail normals)."),
+                toggleField("overrideMask", "A • Detail mask", true, "Checked applies detail everywhere instead of sampling the mask channel."),
+                numberField("mask", "Detail mask override", 1.0, 0.0, 1.0, 0.005, "Constant detail application when the mask channel is overridden."),
                 numberField("strength", "Detail strength", 1.0, 0.0, 4.0, 0.01, "Scales the detail perturbation; zero disables the layer."),
+                numberField("roughVariation", "Roughness variation", 0.5, 0.0, 1.0, 0.005, "Strength of the B-channel micro roughness breakup (centered at 0.5 gray)."),
                 numberField("uvScale", "UV scale", 4.0, 0.25, 64.0, 0.25, "Tiling multiplier relative to the primary UV transform.")
-            }, {QStringLiteral("R"), QStringLiteral("G")}));
+            }));
     }
     if (mode == Pbr::ShaderMode::StandardSurface || all) {
         add(slot(prefix + "Anisotropy", tr("Anisotropy"), "ANISO", "Linear • RG tangent direction / B strength / A mask", QColor(150, 132, 96), false, {},
@@ -343,12 +347,13 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 toggleField("overrideThickness", "A • Thickness", true, "Checked uses the constant optical-thickness override."),
                 numberField("thickness", "Thickness override", 1.0, 0.0, 1000.0, 0.01, "Constant thickness when texture alpha is overridden or unavailable.")
             }));
-        add(slot(prefix + "InteriorMap", tr("Interior Map"), "ROOM", "sRGB • Room cubemap (DDS)", QColor(94, 118, 96), false, {},
-            "Parallax cubemap rooms rendered behind the glass (building windows). The runtime projects a fake interior per window pane; the preview evaluates the same ray-box lookup.", {
+        add(slot(prefix + "InteriorMap", tr("Interior Map"), "ROOM", "sRGB • Room cubemap RGB / A lit-window mask (DDS)", QColor(94, 118, 96), false, {},
+            "Parallax cubemap rooms rendered behind the glass (building windows). The runtime projects a fake interior per window pane; the preview evaluates the same ray-box lookup. The cubemap's alpha marks self-lit interior areas that glow independently of scene lighting.", {
                 numberField("roomsU", "Rooms across U", 1.0, 0.25, 64.0, 0.25, "Window panes per UV tile horizontally.", 2),
                 numberField("roomsV", "Rooms across V", 1.0, 0.25, 64.0, 0.25, "Window panes per UV tile vertically.", 2),
                 numberField("depth", "Room depth", 1.0, 0.05, 8.0, 0.01, "Apparent depth of the room relative to its width."),
-                numberField("brightness", "Interior brightness", 1.0, 0.0, 32.0, 0.01, "Scales the room's emitted light.")
+                numberField("brightness", "Interior brightness", 1.0, 0.0, 32.0, 0.01, "Scales the room's emitted light."),
+                numberField("windowEmissive", "Lit-window emissive", 0.0, 0.0, 64.0, 0.05, "Self-illumination of alpha-masked interior areas — windows that glow at night. Zero disables the pass.")
             }, {}));
         add(slot(prefix + "Imperfections", tr("Surface Imperfections"), "IMP", "Linear • R smudges / G scratches / B dust / A mask", QColor(128, 131, 135), false, {},
             "Modulates roughness, normal response, and transmission with small glass imperfections.", {
