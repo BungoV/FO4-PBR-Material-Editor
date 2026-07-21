@@ -1,0 +1,8 @@
+<RCC>
+    <qresource prefix="/">
+        <file>style.qss</file>
+        <file>check.svg</file>
+        <file>check.xpm</file>
+        <file alias="app-icon.png">icons/pbr-material-editor-icon-256.png</file>
+    </qresource>
+</RCC>

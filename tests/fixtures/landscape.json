@@ -1,0 +1,50 @@
+{
+  "schema": "FO4.PBRM.Material",
+  "schemaVersion": 4,
+  "shader": "Landscape",
+  "secondaryUvEnabled": false,
+  "primaryUv": {},
+  "secondaryUv": {},
+  "resources": {
+    "Landscape": {
+      "baseColorArray": {
+        "enabled": true,
+        "expanded": true,
+        "path": "textures\\landscape\\golden_base_array.dds",
+        "values": {}
+      },
+      "normalHeightArray": {
+        "enabled": true,
+        "expanded": true,
+        "path": "textures\\landscape\\golden_normal_height_array.dds",
+        "values": {
+          "heightInBlue": true,
+          "normalStrength": 1.0
+        }
+      },
+      "rmaosArray": {
+        "enabled": true,
+        "expanded": true,
+        "path": "textures\\landscape\\golden_rmaos_array.dds",
+        "values": {
+          "overrideRoughness": false,
+          "overrideMetallic": false,
+          "overrideAo": false,
+          "overrideF0": true,
+          "f0": 0.04
+        }
+      }
+    }
+  },
+  "settings": {
+    "Landscape/Layers": {
+      "blend": "Weight",
+      "storage": "Texture Arrays",
+      "weightSource": "Runtime LAND",
+      "budget": 4,
+      "sharedSamplers": true,
+      "heightContrast": 1.0,
+      "transitionWidth": 0.1
+    }
+  }
+}

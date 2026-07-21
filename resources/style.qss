@@ -1,0 +1,83 @@
+QWidget {
+    background: #303236;
+    color: #e6e8eb;
+    font-family: "Segoe UI";
+    font-size: 9pt;
+}
+QLabel, QCheckBox { background: transparent; }
+QMainWindow, QDialog { background: #292b2f; }
+QMenuBar, QMenu, QToolBar { background: #25272a; color: #e6e8eb; }
+QMenuBar::item:selected, QMenu::item:selected { background: #3d6f9f; }
+QFrame#TopBar, QFrame#SidePanel, QFrame#PreviewPanel { background: #27292d; border: 1px solid #1b1c1f; }
+QFrame#Card { background: #2b2d31; border: 1px solid #474a50; border-radius: 2px; }
+QLabel#SectionTitle { color: #f2f3f5; font-weight: 600; }
+QLabel#PreviewSubheading {
+    color: #d9dce1;
+    font-weight: 600;
+    padding-top: 5px;
+    padding-bottom: 2px;
+    border-bottom: 1px solid #484b50;
+}
+QLabel#Muted { color: #aeb3ba; }
+QLabel#GroupTitle { color: #f0a54a; font-weight: 600; padding-top: 5px; }
+QLabel#StateBadge { font-size: 10pt; font-weight: 600; padding: 0 2px; background:transparent; color:#777c84; }
+QLabel#StateBadge[stateKind="override"] { color:#68b7f0; }
+QLabel#StateBadge[stateKind="invalid"] { color:#ff8484; }
+QLabel#StateBadge[stateKind="runtime"] { color:#ffb54a; }
+QLabel#VersionBadge { color:#d6a355; padding:0 6px; }
+QLabel#PathBadge { font-size: 8pt; font-weight: 600; padding: 2px 5px; border-radius: 2px; background:#274b3a; color:#a9e4c5; }
+QLabel#PathBadge[pathKind="absolute"] { background:#5b4524; color:#ffc56a; }
+QLabel#PathBadge[pathKind="invalid"] { background:#6a2d31; color:#ffd4d6; }
+QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {
+    background: #3c3f44;
+    border: 1px solid #4d5056;
+    border-radius: 2px;
+    min-height: 23px;
+    padding: 1px 6px;
+    selection-background-color: #3d78ae;
+}
+QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus { border-color: #5d92c5; }
+QLineEdit:disabled, QComboBox:disabled, QDoubleSpinBox:disabled, QToolButton:disabled {
+    background: #292b2f;
+    border-color: #3b3e43;
+    color: #777c84;
+}
+QPushButton, QToolButton {
+    background: #3a3d42;
+    border: 1px solid #50545a;
+    border-radius: 2px;
+    min-height: 23px;
+    padding: 1px 7px;
+}
+QPushButton:hover, QToolButton:hover { background: #484c52; }
+QPushButton:pressed, QToolButton:pressed { background: #355f86; }
+QToolButton#InputToggle { padding: 0; min-height: 23px; min-width: 23px; max-width: 23px; }
+QToolButton#InputToggle:checked { background: #4777ad; border-color: #76a1d0; }
+QToolButton#InputToggle:!checked { background: #25272b; border-color: #62666d; }
+QPushButton#TemplatesButton { padding-right: 20px; }
+QListWidget { background: #27292d; border: none; outline: none; }
+QListWidget::item { min-height: 25px; padding-left: 7px; }
+QListWidget::item:selected { background: #3d6f9f; color: #ffb44a; }
+QScrollArea { border: none; background: #303236; }
+QScrollBar:vertical { background: #25272a; width: 14px; margin: 0; }
+QScrollBar::handle:vertical { background: #62666c; min-height: 30px; border-radius: 5px; margin: 2px; }
+QScrollBar::handle:vertical:hover { background: #777c83; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QSplitter::handle { background: #1d1f22; width: 2px; }
+QCheckBox { spacing: 7px; }
+QCheckBox::indicator { width: 14px; height: 14px; }
+QCheckBox::indicator:unchecked { background: #202226; border: 1px solid #696d73; }
+QCheckBox::indicator:checked { background: #3d78ae; border: 1px solid #77a7d3; image: url(:/check.xpm); }
+QCheckBox:disabled { color: #777c84; }
+QGroupBox {
+    border: 1px solid #55585e;
+    border-radius: 2px;
+    margin-top: 8px;
+    padding-top: 7px;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; background: #27292d; }
+QTabWidget::pane { border: 1px solid #55585e; background: #303236; top: -1px; }
+QTabBar::tab { background: #292b2f; color: #aeb3ba; border: 1px solid #484b50; padding: 5px 10px; }
+QTabBar::tab:selected { background: #3c3f44; color: #f2f3f5; border-bottom-color: #3c3f44; }
+QTabBar::tab:hover:!selected { background: #34373b; color: #e6e8eb; }
+QStatusBar { background: #25272a; color: #aeb3ba; }

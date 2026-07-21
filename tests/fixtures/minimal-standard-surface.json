@@ -1,0 +1,55 @@
+{
+  "schema": "FO4.PBRM.Material",
+  "schemaVersion": 4,
+  "shader": "Standard",
+  "secondaryUvEnabled": false,
+  "primaryUv": {
+    "primaryBaseColor": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_base.dds",
+      "values": {
+        "tint": "#FFFFFF",
+        "scale": 1.0,
+        "blend": "Base"
+      }
+    },
+    "primaryNormal": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_n.dds",
+      "values": {
+        "strength": 1.0,
+        "heightInBlue": false,
+        "layerMaskInAlpha": false
+      }
+    },
+    "primaryRmaos": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_rmaos.dds",
+      "values": {
+        "overrideRoughness": false,
+        "roughness": 0.5,
+        "overrideMetallic": false,
+        "metallic": 0.0,
+        "overrideAo": false,
+        "ao": 1.0,
+        "overrideF0": true,
+        "f0": 0.04
+      }
+    },
+    "primaryEmissive": {
+      "enabled": false,
+      "expanded": false,
+      "path": "",
+      "values": {
+        "color": "#FFFFFF",
+        "intensity": 0.0
+      }
+    }
+  },
+  "secondaryUv": {},
+  "resources": {},
+  "settings": {}
+}

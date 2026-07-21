@@ -1,0 +1,30 @@
+# Build outputs
+bin/
+build/
+debug/
+release/
+publish/
+tests/debug/
+tests/release/
+tests/build/
+
+# qmake artifacts
+Makefile
+Makefile.*
+tests/Makefile
+tests/Makefile.*
+.qmake.stash
+tests/.qmake.stash
+object_script.*
+
+# Compiler intermediates
+*.o
+*.obj
+moc_*.cpp
+moc_*.h
+ui_*.h
+qrc_*.cpp
+
+# Editor sidecars and local scratch
+*.pbrm.autosave
+*.user

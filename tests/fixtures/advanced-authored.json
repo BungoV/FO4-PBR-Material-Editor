@@ -1,0 +1,106 @@
+{
+  "schema": "FO4.PBRM.Material",
+  "schemaVersion": 4,
+  "shader": "Advanced",
+  "secondaryUvEnabled": true,
+  "futureMetadata": {
+    "revision": 7,
+    "tool": "Golden Fixture"
+  },
+  "requirements": {
+    "standard.clearcoat": 1,
+    "standard.subsurface": 1
+  },
+  "primaryUv": {
+    "primaryBaseColor": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_adv_base.dds",
+      "values": {
+        "tint": "#F2E8DC",
+        "scale": 1.0,
+        "blend": "Base"
+      }
+    },
+    "primaryNormal": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_adv_n.dds",
+      "values": {
+        "strength": 1.2,
+        "heightInBlue": true
+      }
+    },
+    "primaryRmaos": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_adv_rmaos.dds",
+      "values": {
+        "overrideRoughness": false,
+        "overrideMetallic": false,
+        "overrideAo": false,
+        "overrideF0": true,
+        "f0": 0.04
+      }
+    },
+    "primaryEmissive": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_adv_glow.dds",
+      "values": {
+        "color": "#FF9C4A",
+        "intensity": 2.5
+      }
+    },
+    "primarySubsurface": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_adv_sss.dds",
+      "values": {
+        "overrideScatterTint": false,
+        "scatterTint": "#C46A5A",
+        "weight": 0.6,
+        "thickness": 2.0
+      }
+    },
+    "primarySurfaceEffects": {
+      "enabled": true,
+      "expanded": false,
+      "path": "",
+      "values": {
+        "overrideSheen": true,
+        "sheenFallback": 0.2,
+        "overrideGlints": true,
+        "glintsFallback": 0.0
+      }
+    }
+  },
+  "secondaryUv": {
+    "secondaryClearcoat": {
+      "enabled": true,
+      "expanded": true,
+      "path": "textures\\pbr\\golden_adv_coat.dds",
+      "values": {
+        "overrideNormal": false,
+        "normal": "#8080FF",
+        "roughness": 0.08,
+        "coverage": 1.0,
+        "normalStrength": 1.0,
+        "strength": 1.0,
+        "ior": 1.5
+      }
+    }
+  },
+  "resources": {},
+  "settings": {
+    "Shading/Subsurface": {
+      "mode": "Combined",
+      "profile": "Skin",
+      "transmission": 1.5
+    },
+    "Shading/SurfaceEffects": {
+      "sheenStrength": 0.75,
+      "sheenRoughness": 0.6
+    }
+  }
+}
