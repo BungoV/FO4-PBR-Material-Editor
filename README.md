@@ -8,10 +8,7 @@
 
 An independent C++20/Qt 6 material authoring application for the Fallout 4
 Community Shaders PBR material system. The UI and data model were written from
-scratch for this project and do not depend on Bethesda's Material Editor or the
-earlier C# prototype.
-
-Developed by Bungo + Claude.
+scratch for this project and do not depend on Bethesda's Material Editor.
 
 ## Current scope
 
