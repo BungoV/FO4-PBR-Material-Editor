@@ -212,6 +212,8 @@ integration.
 
 ## License
 
+Copyright (C) 2026 Bungo (BungoV)
+
 GPLv3 (see `LICENSE`), matching the Community Shaders ecosystem. The vendored
 `third_party/bc7enc` texture encoder is MIT licensed and keeps its own license
 file. Qt 6 is used under LGPLv3.
