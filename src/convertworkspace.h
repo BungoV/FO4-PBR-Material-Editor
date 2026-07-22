@@ -10,6 +10,7 @@
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -105,6 +106,7 @@ private:
     QDoubleSpinBox* m_overrideGlossCurve = nullptr;
     QDoubleSpinBox* m_overrideSpecPercentile = nullptr;
     QPushButton* m_reconvertButton = nullptr;
+    QGroupBox* m_selectedGroup = nullptr;
     QPushButton* m_maskLoadNif = nullptr;
     QComboBox* m_maskFillMode = nullptr;
     QComboBox* m_maskFillValue = nullptr;

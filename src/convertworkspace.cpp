@@ -12,6 +12,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
@@ -58,6 +59,9 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     sideLayout->setContentsMargins(7, 7, 7, 7);
     sideLayout->setSpacing(5);
 
+    auto* sourcesTitle = new QLabel(tr("Sources"), side);
+    sourcesTitle->setObjectName(QStringLiteral("SectionTitle"));
+    sideLayout->addWidget(sourcesTitle);
     const auto addPathRow = [&](const QString& label, const QString& settingsKey, const QString& dialogTitle) {
         auto* caption = new QLabel(label, side);
         sideLayout->addWidget(caption);
@@ -84,6 +88,10 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     connect(m_scanButton, &QPushButton::clicked, this, &ConvertWorkspace::scanSources);
     sideLayout->addWidget(m_scanButton);
 
+    auto* queueTitle = new QLabel(tr("Queue"), side);
+    queueTitle->setObjectName(QStringLiteral("SectionTitle"));
+    sideLayout->addSpacing(4);
+    sideLayout->addWidget(queueTitle);
     m_queue = new QTreeWidget(side);
     m_queue->setHeaderLabels({tr("Material"), tr("Status"), tr("Metal")});
     m_queue->setRootIsDecorated(false);
@@ -115,58 +123,31 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     sideLayout->addWidget(m_queueSummary);
     splitter->addWidget(side);
 
-    // ---- Right: options + actions + per-material detail ----
+    // ---- Center: actions on top, then batch options, the selected
+    // material's tools, and the findings — one concern per card.
     auto* main = new QFrame(splitter);
     auto* mainLayout = new QVBoxLayout(main);
     mainLayout->setContentsMargins(7, 7, 7, 7);
-    mainLayout->setSpacing(5);
+    mainLayout->setSpacing(7);
 
-    auto* optionsTitle = new QLabel(tr("Conversion options"), main);
-    mainLayout->addWidget(optionsTitle);
-    auto* optionsRow = new QHBoxLayout();
-    optionsRow->setSpacing(9);
-    const auto addSpin = [&](const QString& label, double value, double min, double max, double step) {
-        optionsRow->addWidget(new QLabel(label, main));
+    const auto makeSpin = [main](double value, double min, double max, double step, int decimals = 2) {
         auto* spin = new QDoubleSpinBox(main);
         spin->setRange(min, max);
         spin->setSingleStep(step);
-        spin->setDecimals(2);
+        spin->setDecimals(decimals);
         spin->setValue(value);
-        optionsRow->addWidget(spin);
         return spin;
     };
-    m_recovery = addSpin(tr("Metal recovery"), settings.value(QStringLiteral("Convert/recovery"), 1.0).toDouble(), 0.0, 1.0, 0.05);
-    m_glossCurve = addSpin(tr("Gloss curve"), settings.value(QStringLiteral("Convert/glossCurve"), 1.0).toDouble(), 0.25, 4.0, 0.05);
-    optionsRow->addWidget(new QLabel(tr("Derivation size"), main));
-    m_derivationSize = new QSpinBox(main);
-    m_derivationSize->setRange(64, 2048);
-    m_derivationSize->setSingleStep(64);
-    m_derivationSize->setValue(settings.value(QStringLiteral("Convert/derivationSize"), 512).toInt());
-    optionsRow->addWidget(m_derivationSize);
-    optionsRow->addStretch();
-    mainLayout->addLayout(optionsRow);
 
-    auto* togglesRow = new QHBoxLayout();
-    togglesRow->setSpacing(9);
-    m_detailAo = new QCheckBox(tr("Detail AO into RMAOS.B (FO4 sources)"), main);
-    m_detailAo->setChecked(settings.value(QStringLiteral("Convert/detailAo"), true).toBool());
-    togglesRow->addWidget(m_detailAo);
-    m_heightInBlue = new QCheckBox(tr("Derived height into Normal.B"), main);
-    m_heightInBlue->setChecked(settings.value(QStringLiteral("Convert/heightInBlue"), false).toBool());
-    togglesRow->addWidget(m_heightInBlue);
-    m_metalDiagnostic = new QCheckBox(tr("Write metallic diagnostic mask"), main);
-    m_metalDiagnostic->setChecked(settings.value(QStringLiteral("Convert/metalDiagnostic"), false).toBool());
-    togglesRow->addWidget(m_metalDiagnostic);
-    togglesRow->addStretch();
-    mainLayout->addLayout(togglesRow);
-
+    // Primary verbs.
     auto* actionsRow = new QHBoxLayout();
     actionsRow->setSpacing(5);
     m_dryRunButton = new QPushButton(tr("Dry Run"), main);
     m_dryRunButton->setToolTip(tr("Run the full pipeline without writing anything; statuses and findings fill in."));
     connect(m_dryRunButton, &QPushButton::clicked, this, [this] { startRun(true, RunScope::All); });
     actionsRow->addWidget(m_dryRunButton);
-    m_convertSelectedButton = new QPushButton(tr("Convert Selected"), main);
+    m_convertSelectedButton = new QPushButton(tr("Convert Checked"), main);
+    m_convertSelectedButton->setToolTip(tr("Convert the queue rows with a checked box."));
     connect(m_convertSelectedButton, &QPushButton::clicked, this, [this] { startRun(false, RunScope::Checked); });
     actionsRow->addWidget(m_convertSelectedButton);
     m_convertAllButton = new QPushButton(tr("Convert All"), main);
@@ -190,32 +171,67 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     actionsRow->addWidget(m_openInAuthor);
     mainLayout->addLayout(actionsRow);
 
-    // Per-material tuning: the manual half of the spec's review loop.
+    // Batch options: apply to every conversion this workspace runs.
+    auto* batchGroup = new QGroupBox(tr("Batch Options"), main);
+    auto* batchGrid = new QGridLayout(batchGroup);
+    batchGrid->setContentsMargins(9, 9, 9, 9);
+    batchGrid->setHorizontalSpacing(9);
+    batchGrid->setVerticalSpacing(6);
+    m_recovery = makeSpin(settings.value(QStringLiteral("Convert/recovery"), 1.0).toDouble(), 0.0, 1.0, 0.05);
+    m_recovery->setToolTip(tr("How strongly dark FO4 metal albedo is rebuilt from spec + cubemap hue."));
+    m_glossCurve = makeSpin(settings.value(QStringLiteral("Convert/glossCurve"), 1.0).toDouble(), 0.25, 4.0, 0.05);
+    m_glossCurve->setToolTip(tr("Response curve for the gloss/smoothness to roughness inversion (1 = linear)."));
+    m_derivationSize = new QSpinBox(batchGroup);
+    m_derivationSize->setRange(64, 2048);
+    m_derivationSize->setSingleStep(64);
+    m_derivationSize->setValue(settings.value(QStringLiteral("Convert/derivationSize"), 512).toInt());
+    m_derivationSize->setToolTip(tr("Resolution cap for the height/AO derivations (curvature always runs full-res)."));
+    batchGrid->addWidget(new QLabel(tr("Metal recovery"), batchGroup), 0, 0);
+    batchGrid->addWidget(m_recovery, 0, 1);
+    batchGrid->addWidget(new QLabel(tr("Gloss curve"), batchGroup), 0, 2);
+    batchGrid->addWidget(m_glossCurve, 0, 3);
+    batchGrid->addWidget(new QLabel(tr("Derivation size"), batchGroup), 0, 4);
+    batchGrid->addWidget(m_derivationSize, 0, 5);
+    batchGrid->setColumnStretch(6, 1);
+    m_detailAo = new QCheckBox(tr("Detail AO into RMAOS.B (FO4 sources)"), batchGroup);
+    m_detailAo->setChecked(settings.value(QStringLiteral("Convert/detailAo"), true).toBool());
+    m_heightInBlue = new QCheckBox(tr("Derived height into Normal.B"), batchGroup);
+    m_heightInBlue->setChecked(settings.value(QStringLiteral("Convert/heightInBlue"), false).toBool());
+    m_metalDiagnostic = new QCheckBox(tr("Write metallic diagnostic mask"), batchGroup);
+    m_metalDiagnostic->setChecked(settings.value(QStringLiteral("Convert/metalDiagnostic"), false).toBool());
+    batchGrid->addWidget(m_detailAo, 1, 0, 1, 2);
+    batchGrid->addWidget(m_heightInBlue, 1, 2, 1, 2);
+    batchGrid->addWidget(m_metalDiagnostic, 1, 4, 1, 3);
+    mainLayout->addWidget(batchGroup);
+
+    // Selected material: overrides + correction masking, disabled until a
+    // queue row is chosen so the scope is unmistakable.
+    m_selectedGroup = new QGroupBox(tr("Selected Material"), main);
+    auto* selectedLayout = new QVBoxLayout(m_selectedGroup);
+    selectedLayout->setContentsMargins(9, 9, 9, 9);
+    selectedLayout->setSpacing(6);
+
     auto* overrideRow = new QHBoxLayout();
     overrideRow->setSpacing(9);
-    m_overrideEnabled = new QCheckBox(tr("Override for this material"), main);
-    m_overrideEnabled->setToolTip(tr("Tune the conversion math for the selected material only; batch runs keep the global options."));
+    m_overrideEnabled = new QCheckBox(tr("Override math"), m_selectedGroup);
+    m_overrideEnabled->setToolTip(tr("Tune the conversion for this material only; batch runs keep the global options."));
     overrideRow->addWidget(m_overrideEnabled);
-    const auto addOverrideSpin = [&](const QString& label, double value, double min, double max, double step) {
-        overrideRow->addWidget(new QLabel(label, main));
-        auto* spin = new QDoubleSpinBox(main);
-        spin->setRange(min, max);
-        spin->setSingleStep(step);
-        spin->setDecimals(2);
-        spin->setValue(value);
-        overrideRow->addWidget(spin);
-        return spin;
-    };
-    m_overrideRecovery = addOverrideSpin(tr("Recovery"), 1.0, 0.0, 1.0, 0.05);
-    m_overrideGlossCurve = addOverrideSpin(tr("Gloss curve"), 1.0, 0.25, 4.0, 0.05);
-    m_overrideSpecPercentile = addOverrideSpin(tr("Spec clamp %"), 0.98, 0.5, 1.0, 0.01);
+    m_overrideRecovery = makeSpin(1.0, 0.0, 1.0, 0.05);
+    m_overrideGlossCurve = makeSpin(1.0, 0.25, 4.0, 0.05);
+    m_overrideSpecPercentile = makeSpin(0.98, 0.5, 1.0, 0.01);
     m_overrideSpecPercentile->setToolTip(tr("Percentile used to tame blown-out FO4 spec maps; lower clamps harder."));
-    m_reconvertButton = new QPushButton(tr("Reconvert This"), main);
+    overrideRow->addWidget(new QLabel(tr("Recovery"), m_selectedGroup));
+    overrideRow->addWidget(m_overrideRecovery);
+    overrideRow->addWidget(new QLabel(tr("Gloss curve"), m_selectedGroup));
+    overrideRow->addWidget(m_overrideGlossCurve);
+    overrideRow->addWidget(new QLabel(tr("Spec clamp %"), m_selectedGroup));
+    overrideRow->addWidget(m_overrideSpecPercentile);
+    overrideRow->addStretch();
+    m_reconvertButton = new QPushButton(tr("Reconvert This"), m_selectedGroup);
     m_reconvertButton->setToolTip(tr("Convert only the selected material with these overrides."));
     connect(m_reconvertButton, &QPushButton::clicked, this, [this] { startRun(false, RunScope::CurrentRow); });
     overrideRow->addWidget(m_reconvertButton);
-    overrideRow->addStretch();
-    mainLayout->addLayout(overrideRow);
+    selectedLayout->addLayout(overrideRow);
     const auto storeOverride = [this] {
         QTreeWidgetItem* item = m_queue->currentItem();
         const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
@@ -240,44 +256,52 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     // the preview to force dielectric/metal, save the 0.5-neutral sidecar.
     auto* maskRow = new QHBoxLayout();
     maskRow->setSpacing(9);
-    m_maskLoadNif = new QPushButton(tr("Load Reference NIF…"), main);
+    m_maskLoadNif = new QPushButton(tr("Load Reference NIF…"), m_selectedGroup);
     m_maskLoadNif->setToolTip(tr("Show the material's mesh in the preview so fills can be picked in 3D."));
     connect(m_maskLoadNif, &QPushButton::clicked, this, &ConvertWorkspace::loadMaskReference);
     maskRow->addWidget(m_maskLoadNif);
-    m_maskPickEnabled = new QCheckBox(tr("Pick fills"), main);
+    m_maskPickEnabled = new QCheckBox(tr("Pick fills"), m_selectedGroup);
     m_maskPickEnabled->setToolTip(tr("While checked, clicking the mesh applies the fill; camera drags still work."));
     connect(m_maskPickEnabled, &QCheckBox::toggled, this, [this](bool on) {
         m_preview->canvas()->setTrianglePickingEnabled(on);
     });
     maskRow->addWidget(m_maskPickEnabled);
-    maskRow->addWidget(new QLabel(tr("Fill"), main));
-    m_maskFillMode = new QComboBox(main);
+    maskRow->addWidget(new QLabel(tr("Fill"), m_selectedGroup));
+    m_maskFillMode = new QComboBox(m_selectedGroup);
     m_maskFillMode->addItems({tr("Triangle"), tr("Element"), tr("Submesh")});
     m_maskFillMode->setCurrentIndex(1);
     m_maskFillMode->setToolTip(tr("Triangle fills one face; Element fills the connected part under the click (position-welded); Submesh fills the whole shape."));
     maskRow->addWidget(m_maskFillMode);
-    m_maskFillValue = new QComboBox(main);
+    m_maskFillValue = new QComboBox(m_selectedGroup);
     m_maskFillValue->addItem(tr("Force Dielectric"), 0.0);
     m_maskFillValue->addItem(tr("Force Metal"), 1.0);
     m_maskFillValue->addItem(tr("Back to Inferred"), 0.5);
     m_maskFillValue->setToolTip(tr("What the fill paints into the 0.5-neutral correction mask."));
     maskRow->addWidget(m_maskFillValue);
-    m_maskClear = new QPushButton(tr("Clear Mask"), main);
+    m_maskClear = new QPushButton(tr("Clear Mask"), m_selectedGroup);
     connect(m_maskClear, &QPushButton::clicked, this, &ConvertWorkspace::clearMaskFills);
     maskRow->addWidget(m_maskClear);
-    m_maskSave = new QPushButton(tr("Save Mask"), main);
+    m_maskSave = new QPushButton(tr("Save Mask"), m_selectedGroup);
     m_maskSave->setToolTip(tr("Write the sidecar and attach it to this material's conversions."));
     connect(m_maskSave, &QPushButton::clicked, this, &ConvertWorkspace::saveMask);
     maskRow->addWidget(m_maskSave);
-    m_maskStatus = new QLabel(main);
-    maskRow->addWidget(m_maskStatus, 1);
-    mainLayout->addLayout(maskRow);
+    maskRow->addStretch();
+    selectedLayout->addLayout(maskRow);
+    m_maskStatus = new QLabel(m_selectedGroup);
+    m_maskStatus->setObjectName(QStringLiteral("Muted"));
+    m_maskStatus->setWordWrap(true);
+    selectedLayout->addWidget(m_maskStatus);
+    m_selectedGroup->setEnabled(false);
+    mainLayout->addWidget(m_selectedGroup);
 
-    auto* detailTitle = new QLabel(tr("Findings"), main);
-    mainLayout->addWidget(detailTitle);
-    m_detail = new QListWidget(main);
+    auto* findingsGroup = new QGroupBox(tr("Findings"), main);
+    auto* findingsLayout = new QVBoxLayout(findingsGroup);
+    findingsLayout->setContentsMargins(9, 9, 9, 9);
+    m_detail = new QListWidget(findingsGroup);
     m_detail->setWordWrap(true);
-    mainLayout->addWidget(m_detail, 1);
+    m_detail->setFrameShape(QFrame::NoFrame);
+    findingsLayout->addWidget(m_detail);
+    mainLayout->addWidget(findingsGroup, 1);
 
     splitter->addWidget(main);
 
@@ -294,6 +318,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     updatePreview(nullptr);
 
     updateButtons();
+    updateDetail();
 }
 
 ConvertWorkspace::~ConvertWorkspace()
@@ -488,7 +513,10 @@ void ConvertWorkspace::loadOverrideControls()
     const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
     const bool valid = row >= 0 && row < m_entries.size();
     const QSignalBlocker a(m_overrideEnabled), b(m_overrideRecovery), c(m_overrideGlossCurve), d(m_overrideSpecPercentile);
-    m_overrideEnabled->setEnabled(valid);
+    m_selectedGroup->setEnabled(valid);
+    m_selectedGroup->setTitle(valid
+        ? tr("Selected Material — %1").arg(QFileInfo(m_entries[row].materialPath).fileName())
+        : tr("Selected Material"));
     m_reconvertButton->setEnabled(valid && !m_running);
     if (!valid) { m_overrideEnabled->setChecked(false); return; }
     const auto override = m_overrides.constFind(m_entries[row].materialPath.toLower());
@@ -549,6 +577,7 @@ void ConvertWorkspace::updateDetail()
     const bool valid = row >= 0 && row < m_entries.size();
     updatePreview(valid ? &m_entries[row] : nullptr);
     if (!valid) {
+        m_detail->addItem(tr("Select a queue material to see its findings; Dry Run fills them in."));
         m_openInAuthor->setEnabled(false);
         return;
     }
