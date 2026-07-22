@@ -473,7 +473,9 @@ int main(int argc, char* argv[])
         QStringLiteral("tertiary members are absent from documents that never author them"));
     check(qFuzzyCompare(loaded.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySurfaceStateResponse")).values.value(QStringLiteral("porosity")).toDouble(), 0.8)
             && loaded.setting(QStringLiteral("SurfaceStates/Wetness"), QStringLiteral("wetRoughness")).toDouble() == 0.06,
-        QStringLiteral("surface state response input and state-look settings survive save/load"));
+        QStringLiteral("legacy response input with an assigned map and state-look settings are preserved inert"));
+    check(qFuzzyCompare(loaded.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values.value(QStringLiteral("porosity")).toDouble(), 0.8),
+        QStringLiteral("the response porosity constant folds onto RMAOS at load"));
     const auto loadedNormal = loaded.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal"));
     check(loadedNormal.enabled && !loadedNormal.expanded, QStringLiteral("texture enable/collapse state survives save/load"));
     check(loadedNormal.path == normal.path, QStringLiteral("texture path survives save/load"));
@@ -562,6 +564,132 @@ int main(int argc, char* argv[])
         const auto melted = Pbr::surfaceStateInteractions(physicsStates, {0.0f, 0.0f, 1.0f, 0.5f, 0.0f});
         check(melted[0] > 0.0f && melted[2] < 1.0f,
             QStringLiteral("heat melting frost yields liquid in the wetness slot"));
+    }
+
+    {
+        // v4 -> v5 migration: the retired response slot folds into its new
+        // homes, per-state bindings lift into SurfaceResponse, and the retired
+        // pattern source becomes Constant.
+        QJsonObject responseValues{{QStringLiteral("porosity"), 0.35}, {QStringLiteral("overridePorosity"), true},
+            {QStringLiteral("adhesion"), 0.6}};
+        QJsonObject responseSlot{{QStringLiteral("enabled"), true}, {QStringLiteral("expanded"), true},
+            {QStringLiteral("path"), QString()}, {QStringLiteral("values"), responseValues}};
+        QJsonObject v4Settings{
+            {QStringLiteral("SurfaceStates/State0"), QJsonObject{{QStringLiteral("name"), QStringLiteral("Wetness")},
+                {QStringLiteral("maskChannel"), QStringLiteral("G")}, {QStringLiteral("shelterChannel"), QStringLiteral("R")}}},
+            {QStringLiteral("UV1/Composition"), QJsonObject{{QStringLiteral("pattern"), QStringLiteral("Primary Normal Alpha")}}}
+        };
+        QJsonObject v4Root{{QStringLiteral("schema"), QStringLiteral("FO4.PBRM.Material")},
+            {QStringLiteral("schemaVersion"), 4}, {QStringLiteral("shader"), QStringLiteral("Standard")},
+            {QStringLiteral("secondaryUvEnabled"), true},
+            {QStringLiteral("primaryUv"), QJsonObject{{QStringLiteral("primarySurfaceStateResponse"), responseSlot}}},
+            {QStringLiteral("secondaryUv"), QJsonObject()}, {QStringLiteral("resources"), QJsonObject()},
+            {QStringLiteral("settings"), v4Settings}};
+        const QByteArray v4Payload = QJsonDocument(v4Root).toJson(QJsonDocument::Compact);
+        QByteArray v4Envelope;
+        QDataStream envelopeStream(&v4Envelope, QIODevice::WriteOnly);
+        envelopeStream.setByteOrder(QDataStream::LittleEndian);
+        envelopeStream << Pbr::MaterialDocument::Magic << Pbr::MaterialDocument::LegacyVersion << quint32(v4Payload.size());
+        v4Envelope.append(v4Payload);
+        const QString v4File = directory.filePath(QStringLiteral("legacy-v4.pbrm"));
+        QFile v4Out(v4File);
+        check(v4Out.open(QIODevice::WriteOnly) && v4Out.write(v4Envelope) == v4Envelope.size(),
+            QStringLiteral("legacy v4 envelope can be written"));
+        v4Out.close();
+        Pbr::MaterialDocument migrated;
+        check(migrated.load(v4File, &error), QStringLiteral("legacy v4 envelope loads into the v5 editor: %1").arg(error));
+        check(!migrated.textureSet(QStringLiteral("UV0")).contains(QStringLiteral("primarySurfaceStateResponse")),
+            QStringLiteral("v4->v5: a pathless response slot is removed after folding"));
+        const QJsonObject foldedRmaos = migrated.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values;
+        check(qFuzzyCompare(foldedRmaos.value(QStringLiteral("porosity")).toDouble(), 0.35)
+            && foldedRmaos.value(QStringLiteral("overridePorosity")).toBool(false),
+            QStringLiteral("v4->v5: the response porosity constant folds onto RMAOS"));
+        check(qFuzzyCompare(migrated.setting(QStringLiteral("SurfaceResponse"), QStringLiteral("adhesion")).toDouble(), 0.6),
+            QStringLiteral("v4->v5: the response adhesion constant folds into SurfaceResponse"));
+        check(migrated.setting(QStringLiteral("SurfaceResponse"), QStringLiteral("maskG")).toString() == QStringLiteral("Wetness")
+            && migrated.setting(QStringLiteral("SurfaceResponse"), QStringLiteral("shelterChannel")).toString() == QStringLiteral("Red"),
+            QStringLiteral("v4->v5: per-state mask/shelter selections lift into SurfaceResponse bindings"));
+        check(migrated.setting(QStringLiteral("UV1/Composition"), QStringLiteral("pattern")).toString() == QStringLiteral("Constant"),
+            QStringLiteral("v4->v5: the retired Primary Normal Alpha pattern source becomes Constant"));
+        check(!migrated.settingGroup(QStringLiteral("SurfaceStates/State0")).isEmpty(),
+            QStringLiteral("v4->v5: legacy state groups are preserved inert for the extraction tooling"));
+        const QString v5File = directory.filePath(QStringLiteral("migrated-v5.pbrm"));
+        check(migrated.save(v5File, &error), QStringLiteral("migrated document saves as v5: %1").arg(error));
+        QFile v5In(v5File);
+        check(v5In.open(QIODevice::ReadOnly), QStringLiteral("migrated v5 file reopens"));
+        const QJsonObject v5Root = QJsonDocument::fromJson(payloadFromEnvelope(v5In.readAll())).object();
+        check(v5Root.value(QStringLiteral("schemaVersion")).toInt() == 5,
+            QStringLiteral("migrated documents serialize as schema version 5"));
+    }
+
+    {
+        // Runtime definitions asset: presets -> JSON -> parse round trip plus
+        // file save/load and schema rejection.
+        const auto definitionPresets = Pbr::surfaceStatePresets();
+        check(definitionPresets[0].respectsShelter && definitionPresets[1].respectsShelter && definitionPresets[2].respectsShelter
+            && !definitionPresets[3].respectsShelter && !definitionPresets[4].respectsShelter,
+            QStringLiteral("weather-driven presets respect shelter; heat and blood do not"));
+        const QJsonObject definitionsJson = Pbr::surfaceStateDefinitionsToJson(definitionPresets);
+        check(definitionsJson.value(QStringLiteral("schema")).toString() == QStringLiteral("FO4.PBRM.SurfaceStateDefinitions")
+            && definitionsJson.value(QStringLiteral("states")).toArray().size() == definitionPresets.size(),
+            QStringLiteral("definitions JSON carries the schema id and every state"));
+        check(!definitionsJson.value(QStringLiteral("states")).toArray().first().toObject().contains(QStringLiteral("maskChannel")),
+            QStringLiteral("definitions never serialize the material-side mask binding"));
+        QString definitionsError;
+        const auto parsedDefinitions = Pbr::surfaceStateDefinitionsFromJson(definitionsJson, &definitionsError);
+        check(parsedDefinitions.size() == definitionPresets.size() && parsedDefinitions[0].name == definitionPresets[0].name
+            && qFuzzyCompare(parsedDefinitions[0].roughnessTarget + 1.0, definitionPresets[0].roughnessTarget + 1.0)
+            && parsedDefinitions[4].tagViscous && parsedDefinitions[0].respectsShelter,
+            QStringLiteral("definitions JSON round-trips the full profile: %1").arg(definitionsError));
+        const QString definitionsFile = directory.filePath(QStringLiteral("SurfaceStates.json"));
+        check(Pbr::saveSurfaceStateDefinitions(definitionsFile, definitionPresets, &definitionsError),
+            QStringLiteral("definitions save to disk: %1").arg(definitionsError));
+        QVector<Pbr::SurfaceStateSpec> reloadedDefinitions;
+        check(Pbr::loadSurfaceStateDefinitions(definitionsFile, &reloadedDefinitions, &definitionsError)
+            && reloadedDefinitions.size() == definitionPresets.size(),
+            QStringLiteral("definitions load from disk: %1").arg(definitionsError));
+        QString rejection;
+        check(Pbr::surfaceStateDefinitionsFromJson(QJsonObject{{QStringLiteral("schema"), QStringLiteral("Nope")}}, &rejection).isEmpty()
+            && !rejection.isEmpty(),
+            QStringLiteral("unknown definitions schemas are rejected"));
+    }
+
+    {
+        // Packer mip discipline: plain mean-preserving averages for packed
+        // data channels, and Toksvig variance folding into the roughness mips.
+        QImage packed(8, 8, QImage::Format_RGBA8888);
+        QImage toksvigNormals(8, 8, QImage::Format_RGBA8888);
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) {
+                // R roughness 0.2 everywhere; A splits 64/192 so the mip mean
+                // must stay 128 (the curvature mean-preservation rule).
+                packed.setPixelColor(x, y, QColor(51, 128, 255, x < 4 ? 64 : 192));
+                // Left half flat; right half alternates +X/-X normals so the
+                // averaged vector collapses and Toksvig must raise roughness.
+                const bool tilt = x >= 4 && ((x + y) & 1);
+                toksvigNormals.setPixelColor(x, y, tilt ? QColor(255, 128, 128) : (x >= 4 ? QColor(0, 128, 128) : QColor(128, 128, 255)));
+            }
+        const QString ddsFile = directory.filePath(QStringLiteral("toksvig.dds"));
+        QString ddsError;
+        check(TextureWriter::saveDds(packed, ddsFile, TextureWriter::DdsFormat::Rgba8, true, &ddsError, toksvigNormals),
+            QStringLiteral("uncompressed DDS with Toksvig mips saves: %1").arg(ddsError));
+        QFile ddsIn(ddsFile);
+        check(ddsIn.open(QIODevice::ReadOnly), QStringLiteral("packed DDS reopens"));
+        const QByteArray dds = ddsIn.readAll();
+        // Legacy 128-byte header, then mip0 (8x8x4); mip1 (4x4x4) follows.
+        const int mip1 = 128 + 8 * 8 * 4;
+        check(dds.size() >= mip1 + 4 * 4 * 4, QStringLiteral("DDS carries the generated mip chain"));
+        double alphaSum = 0, flatRough = 0, noisyRough = 0;
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 4; ++x) {
+                const uchar* texel = reinterpret_cast<const uchar*>(dds.constData()) + mip1 + (y * 4 + x) * 4;
+                alphaSum += texel[3];
+                if (x < 2) flatRough += texel[0]; else noisyRough += texel[0];
+            }
+        check(std::abs(alphaSum / 16.0 - 128.0) <= 2.0,
+            QStringLiteral("packed alpha (curvature) mips stay mean-preserving"));
+        check(flatRough / 8.0 <= 52.0 && noisyRough / 8.0 >= 90.0,
+            QStringLiteral("Toksvig raises roughness only where normal variance was averaged away"));
     }
 
     const QStringList goldenNames = {

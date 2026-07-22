@@ -290,6 +290,37 @@ void MainWindow::buildMenus()
     settings->addAction(tr("Batch Operations…"), this, &MainWindow::showBatchOperations);
     settings->addAction(tr("Preview Cubemaps…"), this, &MainWindow::showEditorSettings);
     settings->addAction(tr("Texture Browser…"), this, [this] { TextureBrowserDialog(m_textureRoot, this).exec(); });
+    // Runtime-owned surface state definitions: export the built-in defaults
+    // as the starter JSON asset, or preview a modded definitions file.
+    auto* stateDefinitions = settings->addMenu(tr("Surface State Definitions"));
+    stateDefinitions->addAction(tr("Export Starter Definitions…"), this, [this] {
+        const QString fileName = QFileDialog::getSaveFileName(this, tr("Export Surface State Definitions"),
+            QStringLiteral("SurfaceStates.json"), tr("Surface State Definitions (*.json)"));
+        if (fileName.isEmpty()) return;
+        QString error;
+        if (!Pbr::saveSurfaceStateDefinitions(fileName, Pbr::surfaceStatePresets(), &error))
+            QMessageBox::warning(this, tr("Export failed"), error);
+        else statusBar()->showMessage(tr("Exported built-in state definitions to %1").arg(fileName), 5000);
+    });
+    stateDefinitions->addAction(tr("Load Definitions…"), this, [this] {
+        const QString fileName = QFileDialog::getOpenFileName(this, tr("Load Surface State Definitions"),
+            QString(), tr("Surface State Definitions (*.json)"));
+        if (fileName.isEmpty()) return;
+        QVector<Pbr::SurfaceStateSpec> states;
+        QString error;
+        if (!Pbr::loadSurfaceStateDefinitions(fileName, &states, &error)) {
+            QMessageBox::warning(this, tr("Load failed"), error);
+            return;
+        }
+        QSettings().setValue(QStringLiteral("surfaceStates/definitionsPath"), fileName);
+        m_preview->setMaterial(m_document);
+        statusBar()->showMessage(tr("Previewing %1 state definition(s) from %2").arg(states.size()).arg(fileName), 5000);
+    });
+    stateDefinitions->addAction(tr("Use Built-in Defaults"), this, [this] {
+        QSettings().remove(QStringLiteral("surfaceStates/definitionsPath"));
+        m_preview->setMaterial(m_document);
+        statusBar()->showMessage(tr("Previewing the built-in surface state definitions"), 5000);
+    });
     settings->addSeparator();
     auto* interfaceMode = settings->addMenu(tr("Interface Mode"));
     auto* modeGroup = new QActionGroup(interfaceMode);
@@ -333,7 +364,7 @@ void MainWindow::buildMenus()
             tr("FO4 PBR Material Editor\n\nIndependent C++20/Qt 6 implementation for authoring experimental PBRM materials and future NifSkope integration.\n\nDeveloped by Bungo + Claude"));
     });
 
-    auto* version = new QLabel(tr("C++ / Qt • PBRM V4"), this);
+    auto* version = new QLabel(tr("C++ / Qt • PBRM V5"), this);
     version->setObjectName(QStringLiteral("VersionBadge"));
     version->setToolTip(tr("Independent C++/Qt PBRM version 4 editor."));
     statusBar()->addPermanentWidget(version);
@@ -688,7 +719,8 @@ void MainWindow::showBatchOperations()
     operation->addItem(tr("Repair broken texture paths (by filename)"));
     operation->addItem(tr("Set a setting key"));
     operation->addItem(tr("Re-save (normalize legacy fields)"));
-    operation->addItem(tr("Migrate legacy surface states to generic slots"));
+    operation->addItem(tr("Extract legacy surface states to definitions JSON"));
+    operation->addItem(tr("Strip legacy surface state data"));
     form->addRow(tr("Operation"), operation);
     auto* sectionEdit = new QLineEdit(&dialog);
     sectionEdit->setPlaceholderText(tr("e.g. Shading/Core"));
@@ -777,68 +809,81 @@ void MainWindow::showBatchOperations()
             } else if (operation->currentIndex() == 1) {
                 document.setSetting(sectionEdit->text().trimmed(), keyEdit->text().trimmed(), settingValue);
             } else if (operation->currentIndex() == 3) {
+                // Extract: materialize this material's legacy per-material
+                // states as a standalone definitions JSON beside the file, so
+                // the authored tuning survives the strip.
                 bool legacy = false;
                 for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")})
                     legacy = legacy || !document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty();
+                for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot)
+                    legacy = legacy || !document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty();
                 if (legacy) {
-                    const auto channelName = [](int channel) {
-                        return channel == 0 ? QStringLiteral("R") : channel == 1 ? QStringLiteral("G")
-                            : channel == 2 ? QStringLiteral("B") : channel == 3 ? QStringLiteral("A") : QStringLiteral("None");
-                    };
-                    // Resolution folds the legacy constants into the presets;
-                    // materialize that as State0..N groups, then drop the
-                    // legacy groups.
+                    const QFileInfo info(file);
+                    const QString target = info.absolutePath() + QLatin1Char('/') + info.completeBaseName() + QStringLiteral(".SurfaceStates.json");
                     const auto resolvedStates = Pbr::resolveSurfaceStates(document);
-                    for (const auto& state : resolvedStates) {
-                        const QString section = QStringLiteral("SurfaceStates/State%1").arg(state.slot);
-                        document.setSetting(section, QStringLiteral("enabled"), state.enabled);
-                        document.setSetting(section, QStringLiteral("name"), state.name);
-                        document.setSetting(section, QStringLiteral("tagLiquid"), state.tagLiquid);
-                        document.setSetting(section, QStringLiteral("tagParticulate"), state.tagParticulate);
-                        document.setSetting(section, QStringLiteral("tagFrozen"), state.tagFrozen);
-                        document.setSetting(section, QStringLiteral("tagThermal"), state.tagThermal);
-                        document.setSetting(section, QStringLiteral("tagViscous"), state.tagViscous);
-                        document.setSetting(section, QStringLiteral("resistance"), state.resistance);
-                        document.setSetting(section, QStringLiteral("gainRate"), state.gainRate);
-                        document.setSetting(section, QStringLiteral("dryRate"), state.dryRate);
-                        document.setSetting(section, QStringLiteral("retention"), state.retention);
-                        document.setSetting(section, QStringLiteral("color"), state.color);
-                        document.setSetting(section, QStringLiteral("blendMode"), state.blendMode == 0 ? QStringLiteral("Darken") : (state.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint")));
-                        document.setSetting(section, QStringLiteral("desaturation"), state.desaturation);
-                        document.setSetting(section, QStringLiteral("porosityInfluence"), state.porosityInfluence);
-                        document.setSetting(section, QStringLiteral("roughnessTarget"), state.roughnessTarget);
-                        document.setSetting(section, QStringLiteral("roughnessWeight"), state.roughnessWeight);
-                        document.setSetting(section, QStringLiteral("roughnessMode"), state.roughnessMode == 1 ? QStringLiteral("Additive Raise") : QStringLiteral("Toward Target"));
-                        document.setSetting(section, QStringLiteral("f0Target"), state.f0Target);
-                        document.setSetting(section, QStringLiteral("f0Weight"), state.f0Weight);
-                        document.setSetting(section, QStringLiteral("filmF0"), state.filmF0);
-                        document.setSetting(section, QStringLiteral("killMetallic"), state.killMetallic);
-                        document.setSetting(section, QStringLiteral("sparkle"), state.sparkle);
-                        document.setSetting(section, QStringLiteral("glowIntensity"), state.glowIntensity);
-                        document.setSetting(section, QStringLiteral("cavityBias"), state.cavityBias);
-                        document.setSetting(section, QStringLiteral("aoBias"), state.aoBias);
-                        document.setSetting(section, QStringLiteral("heightBias"), state.heightBias);
-                        document.setSetting(section, QStringLiteral("roughnessBias"), state.roughnessBias);
-                        document.setSetting(section, QStringLiteral("metalSeal"), state.metalSeal);
-                        document.setSetting(section, QStringLiteral("emissiveDry"), state.emissiveDry);
-                        document.setSetting(section, QStringLiteral("threshold"), state.threshold);
-                        document.setSetting(section, QStringLiteral("softness"), state.softness);
-                        document.setSetting(section, QStringLiteral("directionality"), state.directionality);
-                        document.setSetting(section, QStringLiteral("streaking"), state.streaking);
-                        document.setSetting(section, QStringLiteral("edgeShedding"), state.edgeShedding);
-                        document.setSetting(section, QStringLiteral("ripples"), state.ripples);
-                        document.setSetting(section, QStringLiteral("maskChannel"), channelName(state.maskChannel));
-                        document.setSetting(section, QStringLiteral("shelterChannel"), channelName(state.shelterChannel));
+                    if (apply) {
+                        if (Pbr::saveSurfaceStateDefinitions(target, resolvedStates, &error))
+                            notes << tr("extracted %1 state(s) to %2").arg(resolvedStates.size()).arg(target);
+                        else
+                            notes << tr("extraction FAILED: %1").arg(error);
+                    } else {
+                        notes << tr("would extract %1 state(s) to %2").arg(resolvedStates.size()).arg(target);
                     }
-                    for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")})
-                        document.clearSettingGroup(QStringLiteral("SurfaceStates/") + legacyName);
-                    notes << tr("migrated legacy surface state groups into SurfaceStates/State0..%1").arg(resolvedStates.isEmpty() ? 0 : resolvedStates.last().slot);
                 }
+            } else if (operation->currentIndex() == 4) {
+                // Strip: remove legacy state groups, retired response slots,
+                // and retired layer-mask keys. Constants were already folded
+                // into their v5 homes by the load-time migration.
+                int removed = 0;
+                for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")}) {
+                    if (document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty()) continue;
+                    document.clearSettingGroup(QStringLiteral("SurfaceStates/") + legacyName);
+                    ++removed;
+                }
+                for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot) {
+                    if (document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty()) continue;
+                    document.clearSettingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot));
+                    ++removed;
+                }
+                for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
+                    QJsonObject set = document.textureSet(setName);
+                    QStringList slotKeys;
+                    for (auto slotIt = set.constBegin(); slotIt != set.constEnd(); ++slotIt) slotKeys << slotIt.key();
+                    bool setChanged = false;
+                    for (const QString& slotKey : slotKeys) {
+                        if (slotKey.endsWith(QStringLiteral("SurfaceStateResponse"))) {
+                            set.remove(slotKey);
+                            setChanged = true;
+                            ++removed;
+                            continue;
+                        }
+                        if (!slotKey.endsWith(QStringLiteral("Normal"))) continue;
+                        QJsonObject slotObject = set.value(slotKey).toObject();
+                        QJsonObject values = slotObject.value(QStringLiteral("values")).toObject();
+                        bool valuesChanged = false;
+                        for (const QString& retired : {QStringLiteral("layerMaskInAlpha"), QStringLiteral("overrideLayerMask"), QStringLiteral("layerMask")}) {
+                            if (!values.contains(retired)) continue;
+                            values.remove(retired);
+                            valuesChanged = true;
+                        }
+                        if (valuesChanged) {
+                            slotObject.insert(QStringLiteral("values"), values);
+                            set.insert(slotKey, slotObject);
+                            setChanged = true;
+                            ++removed;
+                        }
+                    }
+                    if (setChanged) document.setTextureSet(setName, set);
+                }
+                if (removed > 0) notes << tr("stripped %1 legacy surface item(s)").arg(removed);
             }
             const bool wouldChange = document.toJson() != before;
-            if (!wouldChange && operation->currentIndex() != 2) continue;
+            // Extraction writes a sidecar JSON, never the material itself.
+            const bool reportOnly = operation->currentIndex() == 3;
+            if (reportOnly && notes.isEmpty()) continue;
+            if (!reportOnly && !wouldChange && operation->currentIndex() != 2) continue;
             ++changed;
-            if (apply) {
+            if (apply && !reportOnly) {
                 if (!document.save(file, &error)) {
                     report->appendPlainText(tr("%1: save failed: %2").arg(file, error));
                     ++failed; --changed;
@@ -942,7 +987,7 @@ void MainWindow::rebuildWorkspace(const QString& preferredPage)
     if (mode == Pbr::ShaderMode::UnlitEffect || mode == Pbr::ShaderMode::SimpleLitEffect || mode == Pbr::ShaderMode::PhysicallyLitEffect || all)
         addPage(QStringLiteral("Particles"), createParticlesPage());
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || mode == Pbr::ShaderMode::VegetationSurface || all)
-        addPage(QStringLiteral("Surface States"), createSurfaceStatesPage());
+        addPage(QStringLiteral("Surface Response"), createSurfaceResponsePage());
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || all) addPage(QStringLiteral("Dynamic Normals"), createDynamicNormalsPage());
     if (mode == Pbr::ShaderMode::StandardSurface || all) addPage(QStringLiteral("Decals"), createDecalsPage());
     if (landscape || all) addPage(QStringLiteral("Landscape"), createLandscapePage());
@@ -1017,7 +1062,7 @@ void MainWindow::rebuildNavigation()
     }
     addNavigationSection(tr("MATERIAL"));
     addNavigationPage(QStringLiteral("Shading"));
-    for (const QString& name : {QStringLiteral("Particles"), QStringLiteral("Surface States"), QStringLiteral("Vegetation"), QStringLiteral("Landscape")})
+    for (const QString& name : {QStringLiteral("Particles"), QStringLiteral("Surface Response"), QStringLiteral("Vegetation"), QStringLiteral("Landscape")})
         if (m_pageByName.contains(name)) addNavigationPage(name);
     addNavigationPage(QStringLiteral("Transparency"));
     if (m_pageByName.contains(QStringLiteral("Environment"))) addNavigationPage(QStringLiteral("Environment"));

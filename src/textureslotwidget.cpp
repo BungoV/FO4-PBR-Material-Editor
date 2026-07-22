@@ -350,8 +350,12 @@ bool TextureSlotWidget::channelOverrideApplicable(const FieldSpec& field, const 
     };
     if (field.key == QStringLiteral("overrideHeight") && m_fieldEditors.contains(QStringLiteral("heightInBlue")))
         return values.value(QStringLiteral("heightInBlue")).toBool(fieldDefault(QStringLiteral("heightInBlue"), false));
-    if (field.key == QStringLiteral("overrideLayerMask") && m_fieldEditors.contains(QStringLiteral("layerMaskInAlpha")))
-        return values.value(QStringLiteral("layerMaskInAlpha")).toBool(fieldDefault(QStringLiteral("layerMaskInAlpha"), false));
+    // RMAOS alpha is dual-duty: the F0 channel toggle only applies while the
+    // alpha actually carries F0. (Porosity's constant toggle is deliberately
+    // not a channel source at all — unchecked with no texture porosity means
+    // the derived roughness/metallic heuristic, never a forced constant.)
+    if (field.key == QStringLiteral("overrideF0") && m_fieldEditors.contains(QStringLiteral("alphaCarries")))
+        return values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Dielectric F0");
     return true;
 }
 
@@ -864,6 +868,27 @@ void TextureSlotWidget::exportPackedTexture()
     mipsCheck->setChecked(true);
     form->addRow(tr("Format"), formatCombo);
     form->addRow(QString(), mipsCheck);
+    // RMAOS exports can fold the paired normal map's per-mip variance into the
+    // roughness chain (Toksvig), so minified speculars stop aliasing where the
+    // normal detail mips away. Offline and physically correct — the runtime
+    // keeps only its screen-space specular AA.
+    QLineEdit* toksvigEdit = nullptr;
+    if (m_spec.key.contains(QStringLiteral("Rmaos"), Qt::CaseInsensitive)) {
+        auto* toksvigRow = new QWidget(&dialog);
+        auto* toksvigLayout = new QHBoxLayout(toksvigRow);
+        toksvigLayout->setContentsMargins(0, 0, 0, 0);
+        toksvigEdit = new QLineEdit(toksvigRow);
+        toksvigEdit->setPlaceholderText(tr("Optional: paired normal map for roughness-mip variance"));
+        auto* toksvigBrowse = new QPushButton(tr("Browse…"), toksvigRow);
+        toksvigLayout->addWidget(toksvigEdit, 1);
+        toksvigLayout->addWidget(toksvigBrowse);
+        connect(toksvigBrowse, &QPushButton::clicked, &dialog, [&dialog, toksvigEdit] {
+            const QString file = QFileDialog::getOpenFileName(&dialog, tr("Select paired normal map"), QString(),
+                tr("Textures (*.dds *.png *.tga *.jpg);;All files (*.*)"));
+            if (!file.isEmpty()) toksvigEdit->setText(file);
+        });
+        form->addRow(tr("Toksvig normal"), toksvigRow);
+    }
     outer->addLayout(form);
     auto* note = new QLabel(tr("The baked file becomes this input's texture path and the channel sources are cleared."), &dialog);
     note->setWordWrap(true);
@@ -895,8 +920,18 @@ void TextureSlotWidget::exportPackedTexture()
         if (!saved) error = tr("The PNG could not be written.");
     } else {
         if (!fileName.endsWith(QStringLiteral(".dds"), Qt::CaseInsensitive)) fileName += QStringLiteral(".dds");
+        QImage toksvigNormal;
+        if (toksvigEdit && !toksvigEdit->text().trimmed().isEmpty()) {
+            QString toksvigError;
+            toksvigNormal = TextureImage::load(toksvigEdit->text().trimmed(), m_textureRoot, &toksvigError);
+            if (toksvigNormal.isNull()) {
+                QMessageBox::critical(this, tr("Export Packed Texture"),
+                    tr("The Toksvig normal map could not be loaded: %1").arg(toksvigError));
+                return;
+            }
+        }
         saved = TextureWriter::saveDds(composite, fileName,
-            TextureWriter::DdsFormat(formatCombo->currentData().toInt()), mipsCheck->isChecked(), &error);
+            TextureWriter::DdsFormat(formatCombo->currentData().toInt()), mipsCheck->isChecked(), &error, toksvigNormal);
     }
     if (!saved) {
         QMessageBox::critical(this, tr("Export Packed Texture"), error);

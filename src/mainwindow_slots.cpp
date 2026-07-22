@@ -165,31 +165,33 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
     }
 
     if (mode != Pbr::ShaderMode::LandscapeSurface || all) {
-        add(slot(prefix + "Normal", secondary ? tr("%1 Normal + Height").arg(layerName) : tr("Normal + Height"), "NRM", "Linear • RG normal / B optional height / A layer modulation", QColor(112, 112, 202), true,
+        add(slot(prefix + "Normal", secondary ? tr("%1 Normal + Height").arg(layerName) : tr("Normal + Height"), "NRM", "Linear • RG normal / B optional height / A signed curvature", QColor(112, 112, 202), true,
             QString(),
-            "Tangent-space normal. Blue may contain parallax height; alpha may modulate layered coverage.", {
+            "Tangent-space normal. Blue may contain parallax height; alpha may carry signed curvature baked with the normal (0.5 neutral, below = convex edges, above = concave cavities).", {
                 toggleField("overrideNormal", "RG • Tangent normal", true, "Checked replaces the sampled tangent normal with a constant."),
                 colorField("normal", "Normal override", "#8080FF", "Constant tangent-space normal; neutral is #8080FF."),
                 toggleField("overrideHeight", "B • Height", true, "Checked replaces packed height with a constant when B contains height is enabled."),
                 numberField("height", "Height override", 0.5, 0.0, 1.0, 0.005, "Constant packed height."),
-                toggleField("overrideLayerMask", "A • Layer modulation", true, "Checked replaces sampled layer modulation with a constant."),
-                numberField("layerMask", "Layer modulation override", 1.0, 0.0, 1.0, 0.005, "Constant layer-modulation mask."),
                 numberField("strength", "Normal strength", 1.0, 0.0, 8.0, 0.01, "Scales the tangent-space normal."),
                 toggleField("heightInBlue", "B contains height", false, "Checked treats blue as packed height. Unchecked ignores blue for height and reconstructs the normal from RG."),
-                toggleField("layerMaskInAlpha", "Layer modulation in Alpha", secondary, "Uses alpha as high-frequency breakup for UV layer blending.")
+                toggleField("curvatureInAlpha", "A contains curvature", false, "Checked treats alpha as signed curvature from the same bake as the normal. Guides surface states (edge shedding, cavity collection), occludes direct specular in seams, and broadens subsurface scattering. Curvature has no constant: it is map-authored or derived from AO."),
+                numberField("cavitySpecOcclusion", "Cavity specular occlusion", 1.0, 0.0, 1.0, 0.005, "Concave curvature occludes direct-light specular so highlights break inside seams and pores. Only active with authored curvature — the AO-derived fallback must never touch direct light.")
             }));
         add(slot(prefix + "Rmaos", secondary ? tr("%1 Roughness + Metallic + Ambient Occlusion + Specular").arg(layerName) : tr("Roughness + Metallic + Ambient Occlusion + Specular"),
-            "RMAOS", "Linear • R roughness / G metallic / B AO / A dielectric F0", QColor(108, 136, 111), true,
+            "RMAOS", "Linear • R roughness / G metallic / B AO / A dielectric F0 or porosity", QColor(108, 136, 111), true,
             QString(),
-            "Packed physical material properties. Every channel can use the texture or a constant fallback.", {
+            "Packed physical material properties. Alpha carries dielectric F0 or porosity: dielectrics (cloth, leather) rarely author F0 but are exactly where porosity varies, while metals are sealed — the two uses almost never collide.", {
                 toggleField("overrideRoughness", "R • Roughness", true, "Checked uses the constant roughness override."),
                 numberField("roughness", "Roughness override", 0.5, 0.0, 1.0, 0.005, "Microsurface roughness used when texture R is overridden."),
                 toggleField("overrideMetallic", "G • Metallic", true, "Checked uses the constant metallic override."),
                 numberField("metallic", "Metallic override", 0.0, 0.0, 1.0, 0.005, "Metallic response used when texture G is overridden."),
                 toggleField("overrideAo", "B • Ambient Occlusion", true, "Checked uses the constant AO override."),
                 numberField("ao", "AO override", 1.0, 0.0, 1.0, 0.005, "Indirect-occlusion strength used when texture B is overridden."),
+                choiceField("alphaCarries", "A carries", "Dielectric F0", {"Dielectric F0", "Porosity"}, "What the texture's alpha channel stores. The property not carried by alpha uses its constant (or the derived porosity fallback)."),
                 toggleField("overrideF0", "A • Specular", true, "Checked uses the constant dielectric F0 override."),
-                numberField("f0", "Specular F0 override", 0.04, 0.0, 1.0, 0.001, "Dielectric reflectance used when texture A is overridden or absent.")
+                numberField("f0", "Specular F0 override", 0.04, 0.0, 1.0, 0.001, "Dielectric reflectance used when texture A is overridden, absent, or carrying porosity."),
+                toggleField("overridePorosity", "Porosity constant", false, "Checked pins porosity to the constant. Unchecked samples alpha when it carries porosity, otherwise derives saturate(roughness × (1 − metallic)) — the standard engine heuristic, so most materials need no porosity authoring at all."),
+                numberField("porosity", "Porosity override", 0.5, 0.0, 1.0, 0.005, "How much fluid soaks in: 1 darkens like cloth, 0 beads like sealed metal.")
             }));
     }
 
@@ -222,22 +224,13 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
             }));
     }
 
-    if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || mode == Pbr::ShaderMode::VegetationSurface || all) {
-        add(slot(prefix + "SurfaceStateResponse", tr("Surface State Response"), "STATE", "Linear • R porosity / G adhesion / B cavity / A variation", QColor(96, 148, 154), false, {},
-            "How this surface reacts to runtime states such as rain wetness, dust, frost, heat, and blood. One map serves every active state simultaneously; each state's look is tuned on the Surface States page.", {
-                toggleField("overridePorosity", "R • Porosity", true, "Checked uses the constant porosity override."),
-                numberField("porosity", "Porosity override", 0.5, 0.0, 1.0, 0.005, "How much fluid soaks in: 1 darkens like cloth, 0 beads like sealed metal."),
-                toggleField("overrideAdhesion", "G • Adhesion", true, "Checked uses the constant adhesion override."),
-                numberField("adhesion", "Adhesion override", 1.0, 0.0, 1.0, 0.005, "Where states can settle at all; treated surfaces shed everything."),
-                toggleField("overrideCavity", "B • Cavity", true, "Checked uses the constant cavity override."),
-                numberField("cavity", "Cavity override", 0.5, 0.0, 1.0, 0.005, "Authored micro-cavity: dust and frost collect here first, water pools and dries last."),
-                toggleField("overrideVariation", "A • Variation", true, "Checked uses the constant variation override."),
-                numberField("variation", "Variation override", 0.5, 0.0, 1.0, 0.005, "Dissolve-style reveal threshold so coverage grows in patches instead of a uniform fade.")
-            }));
-        if (prefix == QLatin1String("primary")) {
-            add(slot(prefix + "StateMasks", tr("Surface State Masks"), "SMASK", "Linear • R/G/B/A dedicated per-state masks", QColor(96, 148, 154), false, {},
-                "Optional hand-authored placement masks. A surface state that selects one of these channels on the Surface States page uses it instead of the shared response map's accumulation — e.g. authored blood splatter or hero-asset snow.", {}));
-        }
+    if ((mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || mode == Pbr::ShaderMode::VegetationSurface || all)
+        && prefix == QLatin1String("primary")) {
+        // Surface state behavior is runtime-owned as of PBRM v5; the material
+        // contributes physical maps (porosity in RMAOS.A, curvature in
+        // Normal.A) plus these optional hand-authored placement masks.
+        add(slot(prefix + "StateMasks", tr("Surface State Masks"), "SMASK", "Linear • R/G/B/A dedicated per-state masks", QColor(96, 148, 154), false, {},
+            "Optional hand-authored placement masks. A runtime surface state bound to one of these channels on the Surface Response page uses it instead of map-guided accumulation — e.g. authored blood splatter or hero-asset snow.", {}));
     }
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || all) {
         add(slot(prefix + "BentNormal", tr("Bent Normal"), "BENT", "Linear • RG bent normal / B occlusion cone / A mask", QColor(104, 128, 158), false, {},

@@ -209,9 +209,13 @@ Third-party source and licenses are in `third_party/ufbx/`,
 
 ## PBRM format
 
-See [docs/PBRM-v4.md](docs/PBRM-v4.md). Version 4 deliberately invalidates
-the earlier prototype format so the schema can evolve cleanly before runtime
-integration.
+See [docs/PBRM-v5.md](docs/PBRM-v5.md). Version 5 moves surface state
+behavior out of materials into runtime-owned definitions
+([docs/SurfaceStates-Architecture.md](docs/SurfaceStates-Architecture.md)):
+materials carry physical maps — porosity in RMAOS alpha, signed curvature in
+Normal alpha — and v4 files load through an in-memory migration. The
+prototype-format license continues: breaking changes remain possible before
+runtime integration.
 
 ## License
 

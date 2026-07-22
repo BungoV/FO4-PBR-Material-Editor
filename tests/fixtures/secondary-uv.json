@@ -1,6 +1,6 @@
 {
   "schema": "FO4.PBRM.Material",
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "shader": "Standard",
   "secondaryUvEnabled": true,
   "primaryUv": {},
@@ -21,8 +21,7 @@
       "path": "textures\\pbr\\golden_layer_n.dds",
       "values": {
         "strength": 0.75,
-        "heightInBlue": false,
-        "layerMaskInAlpha": true
+        "heightInBlue": true
       }
     },
     "secondaryRmaos": {
@@ -56,7 +55,7 @@
     "UV1/Composition": {
       "coverageMode": "Multiply",
       "vertexChannel": "Red",
-      "pattern": "Primary Normal Alpha",
+      "pattern": "Constant",
       "bias": 0.0,
       "contrast": 1.0,
       "edgeSoftness": 0.1,

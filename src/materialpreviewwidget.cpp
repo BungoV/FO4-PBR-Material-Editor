@@ -467,6 +467,16 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     m_useMetallic = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideMetallic"), !m_hasRmaos);
     m_useAo = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideAo"), !m_hasRmaos);
     m_useF0 = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideF0"), !m_hasRmaos);
+    // v5 alpha duty: RMAOS.A carries dielectric F0 or porosity. F0 samples the
+    // channel only while it owns it; porosity resolves alpha -> constant ->
+    // derived saturate(rough * (1 - metal)).
+    m_rmaosAlphaPorosity = rmaos.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Porosity");
+    m_useF0 = m_useF0 && !m_rmaosAlphaPorosity;
+    m_porosityOverride = boolValue(rmaos.values, QStringLiteral("overridePorosity"), false);
+    m_porosityConstant = numberValue(rmaos.values, QStringLiteral("porosity"), .5f);
+    // Signed curvature rides the primary normal alpha; it has no constant.
+    m_curvatureInAlpha = m_hasNormal && boolValue(normal.values, QStringLiteral("curvatureInAlpha"), false);
+    m_cavitySpecOcclusion = numberValue(normal.values, QStringLiteral("cavitySpecOcclusion"), 1.0f);
     const QColor emission(emissive.values.value(QStringLiteral("color")).toString(QStringLiteral("#FFFFFF")));
     m_emissiveColor = emission.isValid() ? emission : Qt::white;
     m_overrideEmissiveColor = boolValue(emissive.values, QStringLiteral("overrideColor"), !m_hasEmissive);
@@ -537,9 +547,12 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     const QString coverageMode = layer.value(QStringLiteral("coverageMode")).toString(QStringLiteral("Multiply"));
     m_coverageMode = coverageMode == QStringLiteral("Vertex Only") ? 0
         : coverageMode == QStringLiteral("Pattern Reveal") ? 2 : (coverageMode == QStringLiteral("Height Blend") ? 3 : 1);
-    const QString pattern = layer.value(QStringLiteral("pattern")).toString(QStringLiteral("Primary Normal Alpha"));
+    // v5: the Primary Normal Alpha source is gone (Normal.A carries signed
+    // curvature); unknown/legacy values resolve to Constant, which matches
+    // what a BC5-era normal alpha read as (1.0).
+    const QString pattern = layer.value(QStringLiteral("pattern")).toString(QStringLiteral("Constant"));
     m_patternSource = pattern == QStringLiteral("Layer Coverage R") ? 1
-        : pattern == QStringLiteral("Secondary Base Alpha") ? 2 : (pattern == QStringLiteral("Constant") ? 3 : 0);
+        : pattern == QStringLiteral("Secondary Base Alpha") ? 2 : 3;
     m_constantCoverage = float(layer.value(QStringLiteral("constantCoverage")).toDouble(1.0));
     m_coverageBias = float(layer.value(QStringLiteral("bias")).toDouble(0.0));
     m_coverageContrast = float(layer.value(QStringLiteral("contrast")).toDouble(1.0));
@@ -586,9 +599,9 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     const QString tCoverageMode = tertiaryLayer.value(QStringLiteral("coverageMode")).toString(QStringLiteral("Multiply"));
     m_tCoverageMode = tCoverageMode == QStringLiteral("Vertex Only") ? 0
         : tCoverageMode == QStringLiteral("Pattern Reveal") ? 2 : (tCoverageMode == QStringLiteral("Height Blend") ? 3 : 1);
-    const QString tPattern = tertiaryLayer.value(QStringLiteral("pattern")).toString(QStringLiteral("Primary Normal Alpha"));
+    const QString tPattern = tertiaryLayer.value(QStringLiteral("pattern")).toString(QStringLiteral("Constant"));
     m_tPatternSource = tPattern == QStringLiteral("Layer Coverage R") ? 1
-        : tPattern == QStringLiteral("Tertiary Base Alpha") ? 2 : (tPattern == QStringLiteral("Constant") ? 3 : 0);
+        : tPattern == QStringLiteral("Tertiary Base Alpha") ? 2 : 3;
     m_tConstantCoverage = float(tertiaryLayer.value(QStringLiteral("constantCoverage")).toDouble(1.0));
     m_tCoverageBias = float(tertiaryLayer.value(QStringLiteral("bias")).toDouble(0.0));
     m_tCoverageContrast = float(tertiaryLayer.value(QStringLiteral("contrast")).toDouble(1.0));
@@ -674,6 +687,10 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     {
         const auto state=stateFor(QStringLiteral("Subsurface"));const QVector3D color=jsonColor(state.values,"scatterTint","#FFFFFF");const float useColor=used(state.values,"overrideScatterTint");
         addSpecial(SubsurfaceLayer,QStringLiteral("Subsurface"),QVector4D(color,numberValue(state.values,"thicknessValue",1)),QVector4D(useColor,useColor,useColor,used(state.values,"overrideThicknessValue")));
+        // Authored SSS thickness always wins; the convex-curvature proxy only
+        // stands in when the alpha is not texture-authored.
+        m_sssAlphaAuthored=state.enabled&&!state.path.trimmed().isEmpty()
+            &&!boolValue(state.values,QStringLiteral("overrideThicknessValue"),false);
     }
     {
         const auto state=stateFor(QStringLiteral("HairDirection"));const QVector3D flow=jsonColor(state.values,"flow","#808000");const float useFlow=used(state.values,"overrideFlow");
@@ -746,13 +763,26 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
             QVector4D(useNormal,useNormal,used(state.values,"overrideRoughVariation"),used(state.values,"overrideMask")));
     }
     {
-        const auto state=stateFor(QStringLiteral("SurfaceStateResponse"));
-        addSpecial(SurfaceStateLayer,QStringLiteral("SurfaceStateResponse"),
-            QVector4D(numberValue(state.values,"porosity",.5f),numberValue(state.values,"adhesion",1),numberValue(state.values,"cavity",.5f),numberValue(state.values,"variation",.5f)),
-            QVector4D(used(state.values,"overridePorosity"),used(state.values,"overrideAdhesion"),used(state.values,"overrideCavity"),used(state.values,"overrideVariation")));
         // Dedicated per-state masks are per-material and live on the primary set.
         addSpecial(StateMasksLayer,QStringLiteral("StateMasks"),QVector4D(0,0,0,0),QVector4D(1,1,1,1),QStringLiteral("UV0"),QStringLiteral("primary"));
-        m_surfaceStates=Pbr::resolveSurfaceStates(document);
+        // v5: state behavior comes from the runtime-owned definitions, never
+        // the material. The material contributes only the SurfaceResponse
+        // bindings: adhesion constant, shelter vertex channel, and StateMasks
+        // channel-name bindings matched against definition state names.
+        m_surfaceStates=Pbr::activeSurfaceStateDefinitions();
+        const QJsonObject response=document.settingGroup(QStringLiteral("SurfaceResponse"));
+        m_stateAdhesion=float(response.value(QStringLiteral("adhesion")).toDouble(1.0));
+        const QString shelter=response.value(QStringLiteral("shelterChannel")).toString(QStringLiteral("None"));
+        m_shelterChannel=shelter==QLatin1String("Red")?0:shelter==QLatin1String("Green")?1
+            :shelter==QLatin1String("Blue")?2:shelter==QLatin1String("Alpha")?3:-1;
+        const QString maskNames[4]={
+            response.value(QStringLiteral("maskR")).toString(),response.value(QStringLiteral("maskG")).toString(),
+            response.value(QStringLiteral("maskB")).toString(),response.value(QStringLiteral("maskA")).toString()};
+        for(auto& state:m_surfaceStates){
+            state.maskChannel=-1;
+            for(int channel=0;channel<4;++channel)
+                if(!maskNames[channel].isEmpty()&&maskNames[channel].compare(state.name,Qt::CaseInsensitive)==0){state.maskChannel=channel;break;}
+        }
         m_stateAmounts.resize(m_surfaceStates.size());
     }
     {
@@ -1014,6 +1044,16 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
     m_program->setUniformValue("uDisplacementEnabled", false);
     m_program->setUniformValue("uVegetationEnabled", false);
     m_program->setUniformValue("uSubsurfaceMode", 0);
+    // Companions still weather (states are definition-driven), but through the
+    // neutral physical inputs: derived porosity, AO-derived curvature, no
+    // lighting-side curvature consumers.
+    m_program->setUniformValue("uCurvatureInAlpha", false);
+    m_program->setUniformValue("uCavitySpecOcclusion", 0.0f);
+    m_program->setUniformValue("uRmaosAlphaPorosity", false);
+    m_program->setUniformValue("uPorosityOverride", false);
+    m_program->setUniformValue("uSssCurvatureThickness", false);
+    m_program->setUniformValue("uStateAdhesion", 1.0f);
+    m_program->setUniformValue("uShelterChannel", -1);
     m_program->setUniformValue("uSheenStrength", 0.0f);
     m_program->setUniformValue("uGlintIntensity", 0.0f);
     m_program->setUniformValue("uIridescenceStrength", 0.0f);
@@ -1328,14 +1368,16 @@ void PbrPreviewGL::initializeGL()
         uniform float uSpecularAaStrength,uRetroStrength,uRetroWidth;
         uniform bool uAntiTiling;
         uniform float uAntiTileScale,uAntiTileContrast;
-        uniform int uSurfaceStateLayer,uStateMasksLayer;
+        uniform int uStateMasksLayer,uShelterChannel;
         // Generic surface state slots: amounts arrive with interaction physics
         // already applied on the CPU; each slot's profile lives in these arrays.
         uniform float uStateAmount[8],uStateDesat[8],uStatePorosityInfluence[8],uStateRoughTarget[8],uStateRoughWeight[8];
         uniform float uStateF0Target[8],uStateF0Weight[8],uStateFilmF0[8],uStateSparkle[8],uStateGlowIntensity[8];
         uniform float uStateCavityBias[8],uStateThreshold[8],uStateSoftness[8],uStateDirectionality[8],uStateStreaking[8],uStateRetention[8];
         uniform float uStateAoBias[8],uStateHeightBias[8],uStateRoughBias[8],uStateMetalSeal[8],uStateEmissiveDry[8];
-        uniform int uStateBlendMode[8],uStateRoughMode[8],uStateKillMetallic[8],uStateRipples[8],uStateMaskChannel[8],uStateShelterChannel[8];
+        uniform int uStateBlendMode[8],uStateRoughMode[8],uStateKillMetallic[8],uStateRipples[8],uStateMaskChannel[8],uStateRespectsShelter[8];
+        uniform bool uCurvatureInAlpha,uRmaosAlphaPorosity,uPorosityOverride,uSssCurvatureThickness;
+        uniform float uCavitySpecOcclusion,uPorosityConstant,uStateAdhesion;
         uniform vec3 uStateColor[8];
         uniform bool uMeshHasVertexColors;
         uniform samplerCube uInterior;
@@ -1794,9 +1836,8 @@ void PbrPreviewGL::initializeGL()
             }
             float layerCoverage=0.0;
             if(uSecondaryLayerActive&&!defaults&&(!uParticleActive||uLayerRole[1]==0)){
-                float pattern=uPatternSource==0?texture(uNormal,uv0).a
-                    :(uPatternSource==1?((uHasLayerCoverage&&!uOverrideLayerCoverage)?texture(uLayerCoverage,uv1).r:uLayerCoverageFallback)
-                    :(uPatternSource==2?(uHasSecondaryBase?texture(uSecondaryBase,uv1).a:uSecondaryOpacity):uConstantCoverage));
+                float pattern=uPatternSource==1?((uHasLayerCoverage&&!uOverrideLayerCoverage)?texture(uLayerCoverage,uv1).r:uLayerCoverageFallback)
+                    :(uPatternSource==2?(uHasSecondaryBase?texture(uSecondaryBase,uv1).a:uSecondaryOpacity):uConstantCoverage);
                 if(uPatternSource==1){if(uInvertLayerCoverage)pattern=1.0-pattern;pattern=clamp((pattern-.5)*uLayerCoverageSlotContrast+.5+uLayerCoverageSlotBias,0.0,1.0);}
                 pattern=clamp((pattern-.5)*uCoverageContrast+.5+uCoverageBias,0.0,1.0);
                 if(uCoverageMode==0)layerCoverage=1.0;
@@ -1812,9 +1853,8 @@ void PbrPreviewGL::initializeGL()
             }
             float tertiaryCoverage=0.0;
             if(uTertiaryLayerActive&&!defaults&&(!uParticleActive||uLayerRole[2]==0)){
-                float pattern=uTPatternSource==0?texture(uNormal,uv0).a
-                    :(uTPatternSource==1?((uHasTertiaryCoverage&&!uOverrideTertiaryCoverage)?texture(uTertiaryCoverage,uv2).r:uTertiaryCoverageFallback)
-                    :(uTPatternSource==2?(uHasTertiaryBase?texture(uTertiaryBase,uv2).a:uTertiaryOpacity):uTConstantCoverage));
+                float pattern=uTPatternSource==1?((uHasTertiaryCoverage&&!uOverrideTertiaryCoverage)?texture(uTertiaryCoverage,uv2).r:uTertiaryCoverageFallback)
+                    :(uTPatternSource==2?(uHasTertiaryBase?texture(uTertiaryBase,uv2).a:uTertiaryOpacity):uTConstantCoverage);
                 if(uTPatternSource==1){if(uInvertTertiaryCoverage)pattern=1.0-pattern;pattern=clamp((pattern-.5)*uTertiaryCoverageSlotContrast+.5+uTertiaryCoverageSlotBias,0.0,1.0);}
                 pattern=clamp((pattern-.5)*uTCoverageContrast+.5+uTCoverageBias,0.0,1.0);
                 if(uTCoverageMode==0)tertiaryCoverage=1.0;
@@ -1996,20 +2036,29 @@ void PbrPreviewGL::initializeGL()
                 // B carries micro roughness breakup at the same detail scale.
                 rough=clamp(rough+(detail.b-.5)*2.0*uDetailRoughVariation*detailMask,0.0,1.0);
             }
+            // Signed curvature: authored in the primary normal alpha (0.5
+            // neutral, <0.5 convex edge, >0.5 concave cavity) or derived
+            // concave-only from AO. The derived half stays at or above the
+            // signed neutral so open surfaces never register as shedding
+            // edges, and it feeds STATES ONLY — every lighting-side consumer
+            // requires the authored map.
+            bool curvatureAuthored=uCurvatureInAlpha&&uHasNormal&&!defaults;
+            float curvature=curvatureAuthored?layer0Sample(uNormal,uv).a:(.5+(1.0-ao)*.5);
             vec3 stateHeatGlow=vec3(0.0);
             float stateSparkle=0.0;
             bool anyState=false;
             for(int i=0;i<8;++i)if(uStateAmount[i]>0.0)anyState=true;
             if(anyState&&!defaults){
-                // Auto-response fallback when no map is authored: AO stands in
-                // for cavity, a hash supplies the dissolve variation. Landscape
-                // reads per-layer porosity from the normal array's alpha.
-                float fallbackPorosity=uShaderMode==7?(uLandscapeUsePorosityTexture?texture(uNormal,uv).a:uLandscapePorosity):.5;
-                // Derived curvature stays at or above the .5 signed neutral so
-                // open surfaces never register as shedding edges.
-                vec4 response=hasSpecial(uSurfaceStateLayer)?specialSample(uSurfaceStateLayer,uv)
-                    :vec4(fallbackPorosity,1.0,.5+(1.0-ao)*.5,clamp(vnoise3(vWorldPosition*9.0)*.7+.15,0.0,1.0));
-                float porosity=response.r,adhesion=response.g,cavity=response.b,variation=response.a;
+                // v5 response resolution — physical inputs only, no response
+                // map: porosity from RMAOS alpha / constant / the standard
+                // saturate(rough * (1 - metal)) heuristic (landscape keeps its
+                // array-alpha porosity), cavity from signed curvature, adhesion
+                // from the material constant, variation from world noise.
+                float porosity=uPorosityOverride?uPorosityConstant
+                    :(uShaderMode==7?(uLandscapeUsePorosityTexture?texture(uNormal,uv).a:uLandscapePorosity)
+                    :(uRmaosAlphaPorosity?channelData.a:clamp(rough*(1.0-metal),0.0,1.0)));
+                float adhesion=uStateAdhesion,cavity=curvature;
+                float variation=clamp(vnoise3(vWorldPosition*9.0)*.7+.15,0.0,1.0);
                 float upness=clamp(N.y*.5+.5,0.0,1.0);
                 // Rain only lands on genuinely up-facing surfaces; undersides
                 // never ripple.
@@ -2057,8 +2106,8 @@ void PbrPreviewGL::initializeGL()
                     // Signed-curvature edge shedding: response B below 0.5 marks
                     // exposed edges that shed accumulation (worn corners stay clean).
                     cover*=1.0-uStateEdgeShedding[i]*max(0.0,1.0-cavity*2.0);
-                    if(uStateShelterChannel[i]>=0&&uMeshHasVertexColors){
-                        float shelter=uStateShelterChannel[i]==0?vColor.r:(uStateShelterChannel[i]==1?vColor.g:(uStateShelterChannel[i]==2?vColor.b:vColor.a));
+                    if(uStateRespectsShelter[i]==1&&uShelterChannel>=0&&uMeshHasVertexColors){
+                        float shelter=uShelterChannel==0?vColor.r:(uShelterChannel==1?vColor.g:(uShelterChannel==2?vColor.b:vColor.a));
                         cover*=1.0-shelter;
                     }
                     // Drips wet their trails even where base accumulation is low.
@@ -2181,6 +2230,13 @@ void PbrPreviewGL::initializeGL()
                     anisoBentN=normalize(mix(N,-grainN,anisoAmount*.5));
                 }
             }
+            if(curvatureAuthored&&uCavitySpecOcclusion>0.0){
+                // Cavity specular occlusion: direct-light highlights break and
+                // die inside seams and pores — meso-features far below
+                // shadow-map resolution. Authored curvature only: the
+                // AO-derived fallback would sneak AO onto direct light.
+                spec*=1.0-clamp((curvature-.5)*2.0,0.0,1.0)*uCavitySpecOcclusion;
+            }
             vec3 diffuse=(1.0-F)*(1.0-metal)*base/PI;
             float heightVisibility=(uParallaxMode==3&&!defaults)?parallaxShadow(uv,hitDepth,normalize(worldToTangent*L)):1.0;
             float keyShadow=shadowVisibility(vWorldPosition,N);
@@ -2254,7 +2310,18 @@ void PbrPreviewGL::initializeGL()
             if(hasSpecial(3)&&uSubsurfaceMode>0&&!defaults){
                 vec4 subsurface=specialSample(3,uv);vec3 scatterTint=subsurface.rgb*uSubsurfaceProfileColor;
                 if(hasSpecial(10)){vec4 detail=specialSample(10,uv);scatterTint*=mix(vec3(1.0),vec3(1.15,.72,.58),detail.g*detail.a);rough=clamp(rough-detail.b*detail.a*.2,.035,1.0);}
-                float thickness=subsurface.a*uSubsurfaceThickness,wrapped=max((dot(N,L)+.45)/1.45,0.0);
+                // Pre-integrated-style scatter broadening: curvature widens the
+                // diffusion falloff so ears, noses, and creases bleed across
+                // the terminator while flat areas stay crisp. The geometric
+                // term comes free from screen-space derivatives; the authored
+                // map adds meso detail the derivatives cannot see.
+                float geomCurv=clamp(length(fwidth(N))/max(length(fwidth(vWorldPosition)),1e-4)*.15,0.0,1.0);
+                float scatterCurv=clamp(geomCurv+(curvatureAuthored?abs(curvature-.5)*2.0:0.0),0.0,1.0);
+                float wrap=.45+scatterCurv*.4;
+                float thickness=subsurface.a*uSubsurfaceThickness,wrapped=max((dot(N,L)+wrap)/(1.0+wrap),0.0);
+                // Convex-curvature thickness proxy: thin edges (leaf rims, ear
+                // cartilage) transmit when no authored thickness exists.
+                if(uSssCurvatureThickness)thickness*=mix(.35,1.0,clamp((.5-curvature)*2.0,0.0,1.0));
                 if(uSubsurfaceMode==1||uSubsurfaceMode==3)color+=base*scatterTint*uSubsurfaceWeight*max(wrapped-NoL,0.0)*uKeyColor*uKeyIntensity;
                 if(uSubsurfaceMode==2||uSubsurfaceMode==3){float back=max(dot(-N,L),0.0);color+=base*scatterTint*pow(max(uTransmissionTint,vec3(.001)),vec3(2.2))*uSubsurfaceTransmission*back*thickness*uKeyColor*uKeyIntensity;}
             }
@@ -2938,17 +3005,25 @@ void PbrPreviewGL::paintGL()
     const QJsonObject vegetationProfile=m_document.settingGroup(QStringLiteral("Vegetation/Profile")),vegetationMotion=m_document.settingGroup(QStringLiteral("Vegetation/Motion"));m_program->setUniformValue("uVegetationEnabled",shaderMode==int(Pbr::ShaderMode::VegetationSurface));m_program->setUniformValue("uWindDirection",float(vegetationProfile.value(QStringLiteral("direction")).toDouble(35)));m_program->setUniformValue("uWindStrength",float(vegetationProfile.value(QStringLiteral("strength")).toDouble(1)));m_program->setUniformValue("uWindTimeScale",float(vegetationProfile.value(QStringLiteral("timeScale")).toDouble(1)));m_program->setUniformValue("uSwayAmount",float(vegetationMotion.value(QStringLiteral("swayAmount")).toDouble(1)));m_program->setUniformValue("uSwaySpeed",float(vegetationMotion.value(QStringLiteral("swaySpeed")).toDouble(1)));m_program->setUniformValue("uBranchAmount",float(vegetationMotion.value(QStringLiteral("branchAmount")).toDouble(.35)));m_program->setUniformValue("uFlutterAmount",float(vegetationMotion.value(QStringLiteral("flutterAmount")).toDouble(.2)));m_program->setUniformValue("uFlutterSpeed",float(vegetationMotion.value(QStringLiteral("flutterSpeed")).toDouble(4)));m_program->setUniformValue("uGustStrength",float(vegetationMotion.value(QStringLiteral("gustStrength")).toDouble(.4)));m_program->setUniformValue("uTurbulence",float(vegetationMotion.value(QStringLiteral("turbulence")).toDouble(.5)));
     const auto landscapeMacro=m_document.textureSlot(QStringLiteral("Landscape"),QStringLiteral("macroVariation"));m_program->setUniformValue("uLandscapeMacroScale",numberValue(landscapeMacro.values,QStringLiteral("scale"),2048));m_program->setUniformValue("uLandscapeMacroColorStrength",numberValue(landscapeMacro.values,QStringLiteral("colorStrength"),.15f));m_program->setUniformValue("uLandscapeMacroRoughnessStrength",numberValue(landscapeMacro.values,QStringLiteral("roughnessStrength"),.1f));
     m_program->setUniformValue("uAntiTiling",settingBool(QStringLiteral("Landscape/AntiTiling"),QStringLiteral("enabled"),false));m_program->setUniformValue("uAntiTileScale",settingNumber(QStringLiteral("Landscape/AntiTiling"),QStringLiteral("patchScale"),4.0f));m_program->setUniformValue("uAntiTileContrast",settingNumber(QStringLiteral("Landscape/AntiTiling"),QStringLiteral("blendContrast"),4.0f));
-    m_program->setUniformValue("uSurfaceStateLayer",int(SurfaceStateLayer));
     m_program->setUniformValue("uStateMasksLayer",int(StateMasksLayer));
+    // v5 material-side surface response: physical inputs and bindings only.
+    m_program->setUniformValue("uStateAdhesion",m_stateAdhesion);
+    m_program->setUniformValue("uShelterChannel",m_shelterChannel);
+    m_program->setUniformValue("uCurvatureInAlpha",m_curvatureInAlpha);
+    m_program->setUniformValue("uCavitySpecOcclusion",m_cavitySpecOcclusion);
+    m_program->setUniformValue("uRmaosAlphaPorosity",m_rmaosAlphaPorosity&&m_hasRmaos);
+    m_program->setUniformValue("uPorosityOverride",m_porosityOverride);
+    m_program->setUniformValue("uPorosityConstant",m_porosityConstant);
+    m_program->setUniformValue("uSssCurvatureThickness",m_curvatureInAlpha&&!m_sssAlphaAuthored);
     {
         constexpr int MaxStates=Pbr::MaxSurfaceStates;
         GLfloat amount[MaxStates]={},desat[MaxStates]={},porosityInfluence[MaxStates]={},roughTarget[MaxStates]={},roughWeight[MaxStates]={};
         GLfloat f0Target[MaxStates]={},f0Weight[MaxStates]={},filmF0[MaxStates]={},sparkle[MaxStates]={},glowIntensity[MaxStates]={};
         GLfloat cavityBias[MaxStates]={},threshold[MaxStates]={},softness[MaxStates]={},directionality[MaxStates]={},streaking[MaxStates]={},edgeShedding[MaxStates]={},retention[MaxStates]={};
         GLfloat aoBias[MaxStates]={},heightBias[MaxStates]={},roughBias[MaxStates]={},metalSeal[MaxStates]={},emissiveDry[MaxStates]={};
-        GLint blendMode[MaxStates]={},roughMode[MaxStates]={},killMetallic[MaxStates]={},ripples[MaxStates]={},maskChannel[MaxStates],shelterChannel[MaxStates];
+        GLint blendMode[MaxStates]={},roughMode[MaxStates]={},killMetallic[MaxStates]={},ripples[MaxStates]={},maskChannel[MaxStates],respectsShelter[MaxStates]={};
         QVector3D color[MaxStates];
-        for(int i=0;i<MaxStates;++i){maskChannel[i]=-1;shelterChannel[i]=-1;}
+        for(int i=0;i<MaxStates;++i)maskChannel[i]=-1;
         for(int i=0;i<m_surfaceStates.size()&&i<MaxStates;++i){
             const auto& state=m_surfaceStates[i];
             amount[i]=i<m_stateAmounts.size()?std::clamp(m_stateAmounts[i],0.0f,1.0f):0.0f;
@@ -2961,7 +3036,7 @@ void PbrPreviewGL::paintGL()
             cavityBias[i]=float(state.cavityBias);threshold[i]=float(state.threshold);softness[i]=float(state.softness);
             directionality[i]=float(state.directionality);streaking[i]=float(state.streaking);edgeShedding[i]=float(state.edgeShedding);retention[i]=float(state.retention);ripples[i]=state.ripples?1:0;
             aoBias[i]=float(state.aoBias);heightBias[i]=float(state.heightBias);roughBias[i]=float(state.roughnessBias);metalSeal[i]=float(state.metalSeal);emissiveDry[i]=float(state.emissiveDry);
-            maskChannel[i]=state.maskChannel;shelterChannel[i]=state.shelterChannel;
+            maskChannel[i]=state.maskChannel;respectsShelter[i]=state.respectsShelter?1:0;
         }
         m_program->setUniformValueArray("uStateAmount",amount,MaxStates,1);
         m_program->setUniformValueArray("uStateDesat",desat,MaxStates,1);
@@ -2990,7 +3065,7 @@ void PbrPreviewGL::paintGL()
         m_program->setUniformValueArray("uStateKillMetallic",killMetallic,MaxStates);
         m_program->setUniformValueArray("uStateRipples",ripples,MaxStates);
         m_program->setUniformValueArray("uStateMaskChannel",maskChannel,MaxStates);
-        m_program->setUniformValueArray("uStateShelterChannel",shelterChannel,MaxStates);
+        m_program->setUniformValueArray("uStateRespectsShelter",respectsShelter,MaxStates);
         m_program->setUniformValueArray("uStateColor",color,MaxStates);
     }
     {
@@ -3659,7 +3734,9 @@ void MaterialPreviewWidget::setMaterial(const Pbr::MaterialDocument& document){m
 
 void MaterialPreviewWidget::rebuildStateControls()
 {
-    const QVector<Pbr::SurfaceStateSpec> resolved=Pbr::resolveSurfaceStates(m_document);
+    // v5: the simulator runs the active runtime definitions (built-in defaults
+    // or a user-loaded definitions JSON), never material-authored states.
+    const QVector<Pbr::SurfaceStateSpec> resolved=Pbr::activeSurfaceStateDefinitions();
     // Preserve simulated amounts across material edits by state name.
     QHash<QString,double> previous;
     for(int i=0;i<m_resolvedStates.size()&&i<m_stateFields.size();++i)

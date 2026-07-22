@@ -39,7 +39,12 @@ struct TextureSlotState {
 class MaterialDocument {
 public:
     static constexpr quint32 Magic = 0x4D524250u;
-    static constexpr quint32 Version = 4u;
+    // v5: surface state behavior moved out of the material into runtime-owned
+    // definitions; the material keeps physical maps (porosity in RMAOS.A,
+    // signed curvature in Normal.A) plus the small SurfaceResponse bindings.
+    // v4 files load with an in-memory migration and save as v5.
+    static constexpr quint32 Version = 5u;
+    static constexpr quint32 LegacyVersion = 4u;
 
     MaterialDocument();
 
@@ -96,11 +101,11 @@ private:
     bool m_modified = false;
 };
 
-// Generic surface state slots (SurfaceStates/State0..7). Each state carries a
-// name (the runtime binding ID), behavior tags for the interaction physics,
-// and a generic response profile. Legacy named groups (SurfaceStates/Wetness,
-// Dust, Frost, Heat, Blood) resolve to preset-derived slots at read time —
-// the document itself is never mutated, so old files stay byte-identical.
+// Surface state behavior definitions. As of PBRM v5 these are runtime-owned
+// (FO4.PBRM.SurfaceStateDefinitions JSON shipped with the engine), never
+// authored per material; the editor previews and simulates them. Materials
+// contribute only physical maps plus the SurfaceResponse bindings (adhesion
+// constant, shelter vertex channel, StateMasks channel-name bindings).
 constexpr int MaxSurfaceStates = 8;
 
 struct SurfaceStateSpec {
@@ -117,7 +122,7 @@ struct SurfaceStateSpec {
     QString color = QStringLiteral("#FFFFFF");
     int blendMode = 1;                  // 0 darken (raw multiplier), 1 tint, 2 coat
     double desaturation = 0;
-    double porosityInfluence = 0;       // how much response porosity modulates the state
+    double porosityInfluence = 0;       // how much surface porosity modulates the state
     double roughnessTarget = .5, roughnessWeight = 1;
     int roughnessMode = 0;              // 0 toward target, 1 additive raise
     double f0Target = .04, f0Weight = 0;
@@ -132,16 +137,32 @@ struct SurfaceStateSpec {
     double emissiveDry = 0;             // glowing-hot areas suppress the state (rain steams off the forge)
     double directionality = 0;          // accumulation weight toward up-facing surfaces
     double streaking = 0;               // gravity-elongated accumulation on vertical surfaces
-    double edgeShedding = 0;            // exposed edges (response B < 0.5) shed accumulation
+    double edgeShedding = 0;            // exposed edges (signed curvature < 0.5) shed accumulation
     bool ripples = false;               // animated liquid detail on up-facing surfaces
-    int maskChannel = -1;               // dedicated StateMasks channel, -1 = shared response map
+    bool respectsShelter = false;       // material shelter vertex data suppresses this state (weather yes, blood no)
+    // Legacy v4 per-material fields, kept only so the extraction/migration
+    // tooling can read pre-v5 documents. Definitions never carry them.
+    int maskChannel = -1;               // dedicated StateMasks channel, -1 = shared accumulation
     int shelterChannel = -1;            // vertex-color channel that keeps areas clean, -1 = off
 };
 
 QVector<SurfaceStateSpec> surfaceStatePresets();
+// Legacy v4 reader: resolves the per-material SurfaceStates/* groups (used by
+// the extract-to-definitions migration tooling; the preview no longer reads
+// material-authored states).
 QVector<SurfaceStateSpec> resolveSurfaceStates(const MaterialDocument& document);
 // Applies the tag interaction physics to raw runtime amounts, returning
 // effective amounts (same order as the specs).
 QVector<float> surfaceStateInteractions(const QVector<SurfaceStateSpec>& states, const QVector<float>& amounts);
+
+// FO4.PBRM.SurfaceStateDefinitions v1 — the runtime-owned definitions asset.
+QJsonObject surfaceStateDefinitionsToJson(const QVector<SurfaceStateSpec>& states);
+QVector<SurfaceStateSpec> surfaceStateDefinitionsFromJson(const QJsonObject& object, QString* error = nullptr);
+bool saveSurfaceStateDefinitions(const QString& fileName, const QVector<SurfaceStateSpec>& states, QString* error = nullptr);
+bool loadSurfaceStateDefinitions(const QString& fileName, QVector<SurfaceStateSpec>* states, QString* error = nullptr);
+// The definitions the editor previews with: the user-loaded definitions file
+// (surfaceStates/definitionsPath in QSettings) when set and readable,
+// otherwise the built-in defaults from surfaceStatePresets().
+QVector<SurfaceStateSpec> activeSurfaceStateDefinitions(QString* sourcePath = nullptr);
 
 } // namespace Pbr

@@ -77,8 +77,7 @@ private:
     QWidget* createDynamicNormalsPage();
     QWidget* createVegetationPage();
     QWidget* createParticlesPage();
-    QWidget* createSurfaceStatesPage();
-    void addStatePresetRow(QFrame* card, int slot);
+    QWidget* createSurfaceResponsePage();
     QWidget* createDecalsPage();
     QWidget* createLandscapePage();
     QWidget* createTransparencyPage();

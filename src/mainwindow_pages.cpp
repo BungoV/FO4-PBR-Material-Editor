@@ -102,7 +102,7 @@ QWidget* MainWindow::createMaterialInfoPage()
             tr("Author terrain resources entirely in Landscape. LAND weights choose LTEX/TXST layers; texture arrays supply base color, normal/height, and RMAOS. Primary and Secondary UV are intentionally hidden."));
     } else {
         addInfoCard(page.content, tr("Authoring workflow"),
-            tr("1. Author the base material in Primary UV.\n2. Optionally enable Secondary UV for overlays, detail, clearcoat, or independent animation.\n3. Tune the selected shader behavior.\n4. Open Validation before saving PBRM V4."));
+            tr("1. Author the base material in Primary UV.\n2. Optionally enable Secondary UV for overlays, detail, clearcoat, or independent animation.\n3. Tune the selected shader behavior.\n4. Open Validation before saving PBRM V5."));
     }
     if (m_document.shaderMode() == Pbr::ShaderMode::AllFeatures) {
         addInfoCard(page.content, tr("Advanced warning"),
@@ -342,14 +342,14 @@ QWidget* MainWindow::createUvMappingPage()
         addSettingsCard(page.content, uvSet + QStringLiteral("/Composition"), tr("%1 layer composition & culling").arg(layerName), {
             choiceField("coverageMode", "Coverage mode", "Multiply", {"Vertex Only", "Multiply", "Pattern Reveal", "Height Blend"}, "Combines broad vertex-painted coverage with texture-authored breakup. Height Blend compares the layers' Normal+Height blue channels so the overlay settles into recesses first; enable \"B contains height\" on the participating Normal inputs. Without height data it behaves like Multiply."),
             choiceField("vertexChannel", "Vertex paint channel", "Red", {"Red", "Green", "Blue", "Alpha", "None"}, QStringLiteral("Vertex-color channel carrying broad %1 UV coverage.").arg(layerName)),
-            choiceField("pattern", "Pattern source", "Primary Normal Alpha", {"Primary Normal Alpha", "Layer Coverage R", baseAlphaSource, "Constant"}, "High-frequency pattern used to reveal or break up the layer."),
+            choiceField("pattern", "Pattern source", "Constant", {"Layer Coverage R", baseAlphaSource, "Constant"}, "High-frequency pattern used to reveal or break up the layer. Height Blend coverage is the physically-motivated default breakup; use a dedicated Layer Coverage texture for art-directed patterns height cannot express."),
             numberField("constantCoverage", "Constant pattern", 1.0, 0.0, 1.0, 0.005, "Pattern coverage used when Pattern source is Constant."),
             numberField("bias", "Pattern bias", 0.0, -1.0, 1.0, 0.002, "Moves the reveal threshold."),
             numberField("contrast", "Pattern contrast", 1.0, 0.0, 16.0, 0.01, "Sharpens or softens the pattern."),
             numberField("edgeSoftness", "Edge softness", 0.1, 0.0, 1.0, 0.005, "Controls the transition width between layers."),
             toggleField("sparseSampling", "Skip empty regions", true, QStringLiteral("Allows coherent zero-coverage areas to avoid %1 UV texture samples.").arg(layerName))
         });
-        const QString patternSource = m_document.setting(uvSet + QStringLiteral("/Composition"), QStringLiteral("pattern"), QStringLiteral("Primary Normal Alpha")).toString();
+        const QString patternSource = m_document.setting(uvSet + QStringLiteral("/Composition"), QStringLiteral("pattern"), QStringLiteral("Constant")).toString();
         setSettingEditorsEnabled(page.page, uvSet + QStringLiteral("/Composition"),
             {QStringLiteral("constantCoverage")}, patternSource == QStringLiteral("Constant"));
     };
@@ -912,152 +912,38 @@ QWidget* MainWindow::createParticlesPage()
     return page.page;
 }
 
-QWidget* MainWindow::createSurfaceStatesPage()
+QWidget* MainWindow::createSurfaceResponsePage()
 {
-    auto page = createPage(tr("Surface States"), tr("Generic surface state slots. Each state has a name the runtime binds by, behavior tags for the interaction physics, and a response profile. All active states read one shared response map; a state can instead select a dedicated Surface State Masks channel."));
+    auto page = createPage(tr("Surface Response"), tr("How this surface responds to runtime states (rain, dust, frost, heat, blood). State behavior is runtime-owned and defined once globally; the material contributes physical maps — porosity in RMAOS alpha, signed curvature in Normal alpha, plus AO, height, and roughness — and the few bindings below."));
     addInfoCard(page.content, tr("Runtime ownership"),
-        tr("State amounts (how wet, how dusty) are computed by the runtime and bound by state name. Use the preview's States tab to simulate them. Tag physics: liquids wash particulates, thermal dries liquids and melts frozen into liquid, viscous states resist suppression."));
-    const QVector<Pbr::SurfaceStateSpec> resolved = Pbr::resolveSurfaceStates(m_document);
-    const QVector<Pbr::SurfaceStateSpec> presets = Pbr::surfaceStatePresets();
-    const auto channelName = [](int channel) {
-        return channel == 0 ? QStringLiteral("R") : channel == 1 ? QStringLiteral("G")
-            : channel == 2 ? QStringLiteral("B") : channel == 3 ? QStringLiteral("A") : QStringLiteral("None");
-    };
-    const QStringList channelChoices{QStringLiteral("None"), QStringLiteral("R"), QStringLiteral("G"), QStringLiteral("B"), QStringLiteral("A")};
-    for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot) {
-        Pbr::SurfaceStateSpec def;
-        if (slot < presets.size()) def = presets[slot];
-        else { def.enabled = false; def.name = tr("State %1").arg(slot + 1); }
-        for (const auto& state : resolved) if (state.slot == slot) { def = state; break; }
-        const QString section = QStringLiteral("SurfaceStates/State%1").arg(slot);
-        // Disabled slots render as a compact card (enable, name, preset); the
-        // full profile appears once the slot is switched on.
-        if (!def.enabled) {
-            auto* compactCard = addSettingsCard(page.content, section, tr("State %1 — %2").arg(slot + 1).arg(def.name), {
-                withRebuild(toggleField("enabled", "Enabled", def.enabled, "Enable to author this state's full response profile.")),
-                withRebuild(textField("name", "Name", def.name, "Runtime binding ID: the engine drives this state's amount by this name."))
-            });
-            addStatePresetRow(compactCard, slot);
-            continue;
-        }
-        auto* card = addSettingsCard(page.content, section, tr("State %1 — %2").arg(slot + 1).arg(def.name), {
-            withRebuild(toggleField("enabled", "Enabled", def.enabled, "Disabled states are ignored entirely by preview and runtime.")),
-            withRebuild(textField("name", "Name", def.name, "Runtime binding ID: the engine drives this state's amount by this name.")),
-            toggleField("tagLiquid", "Tag: liquid", def.tagLiquid, "Liquids wash particulate states and are dried by thermal states."),
-            toggleField("tagParticulate", "Tag: particulate", def.tagParticulate, "Particulates (dust, ash, pollen) are washed away by liquids."),
-            toggleField("tagFrozen", "Tag: frozen", def.tagFrozen, "Frozen states are melted by thermal states, yielding liquid."),
-            toggleField("tagThermal", "Tag: thermal", def.tagThermal, "Thermal states dry liquids and melt frozen states."),
-            toggleField("tagViscous", "Tag: viscous", def.tagViscous, "Viscous states strongly resist washing and drying."),
-            numberField("resistance", "Resistance", def.resistance, 0.0, 1.0, 0.005, "How hard the state is to suppress through the tag physics."),
-            numberField("gainRate", "Gain rate", def.gainRate, 0.05, 10.0, 0.01, "Multiplier on the runtime's accumulation speed — how fast this material takes the state on (cloth soaks fast, sealed metal beads instantly)."),
-            numberField("dryRate", "Dry rate", def.dryRate, 0.05, 10.0, 0.01, "Multiplier on the runtime's decay speed — low values stay wet/dusty long after the source stops. The preview's weather simulation honors both rates."),
-            colorField("color", "Color", def.color, "State color. Darken blend multiplies the surface toward this raw color; Tint and Coat treat it as an sRGB overlay."),
-            withRebuild(choiceField("blendMode", "Albedo blend", def.blendMode == 0 ? "Darken" : (def.blendMode == 2 ? "Coat" : "Tint"), {"Darken", "Tint", "Coat"}, "Darken multiplies (wetness, char), Tint layers a dusty film, Coat replaces toward the state color (frost, blood).")),
-            numberField("desaturation", "Desaturation", def.desaturation, 0.0, 1.0, 0.005, "Tint blend only: washes out the underlying color."),
-            numberField("porosityInfluence", "Porosity influence", def.porosityInfluence, 0.0, 1.0, 0.005, "How much the response map's porosity modulates this state (absorption darkening, film suppression)."),
-            numberField("roughnessTarget", "Roughness target", def.roughnessTarget, 0.0, 1.0, 0.005, "Roughness value (or raise amount in Additive mode) applied under full coverage."),
-            numberField("roughnessWeight", "Roughness weight", def.roughnessWeight, 0.0, 1.0, 0.005, "Blend weight of the roughness response."),
-            choiceField("roughnessMode", "Roughness mode", def.roughnessMode == 1 ? "Additive Raise" : "Toward Target", {"Toward Target", "Additive Raise"}, "Toward Target trends to an absolute value (liquid film); Additive Raise adds on top (settled particulate)."),
-            numberField("f0Target", "F0 target", def.f0Target, 0.0, 0.2, 0.001, "Dielectric reflectance blended in with the F0 weight (ice lowers F0)."),
-            numberField("f0Weight", "F0 weight", def.f0Weight, 0.0, 1.0, 0.005, "Blend weight of the F0 target."),
-            numberField("filmF0", "Film F0", def.filmF0, 0.0, 0.08, 0.001, "Max-style liquid film reflectance on sealed areas."),
-            toggleField("killMetallic", "Suppress metallic", def.killMetallic, "Full coverage hides the metallic response (opaque crusts like frost)."),
-            numberField("sparkle", "Sparkle", def.sparkle, 0.0, 4.0, 0.01, "Crystal glinting through the procedural glint machinery."),
-            numberField("glowIntensity", "Glow intensity", def.glowIntensity, 0.0, 64.0, 0.05, "Peak emissive energy of the blackbody ramp driven by the state amount."),
-            numberField("cavityBias", "Cavity bias", def.cavityBias, 0.0, 1.0, 0.005, "How strongly the response map's cavity channel pulls accumulation in first."),
-            numberField("aoBias", "AO accumulation", def.aoBias, 0.0, 1.0, 0.005, "Free guidance from the RMAOS AO channel: occluded crevices collect this state. Works with or without a response map."),
-            numberField("heightBias", "Height pooling", def.heightBias, 0.0, 1.0, 0.005, "Free guidance from the height map: low areas pool the state first and dry last (puddles)."),
-            numberField("roughnessBias", "Roughness grip", def.roughnessBias, 0.0, 1.0, 0.005, "Free guidance from the roughness channel: rough areas grip the state, polished areas shed it."),
-            numberField("metalSeal", "Metal sealing", def.metalSeal, 0.0, 1.0, 0.005, "Metallic areas suppress porous absorption for this state — wet metal beads and glosses but never soak-darkens."),
-            numberField("emissiveDry", "Emissive drying", def.emissiveDry, 0.0, 1.0, 0.005, "Glowing-hot areas suppress this state per texel — frost never forms on the reactor vents."),
-            numberField("threshold", "Threshold", def.threshold, 0.0, 1.0, 0.005, "Amount required before coverage starts to appear."),
-            numberField("softness", "Reveal softness", def.softness, 0.01, 1.0, 0.005, "Width of the dissolve-style reveal around the variation channel."),
-            numberField("retention", "Porous retention", def.retention, 0.0, 1.0, 0.005, "Biases accumulation by the response map's porosity: porous areas collect the state first and are the last to dry."),
-            numberField("directionality", "Directionality", def.directionality, 0.0, 1.0, 0.005, "Weights accumulation toward up-facing surfaces (snow, dust settling)."),
-            numberField("streaking", "Streaking", def.streaking, 0.0, 1.0, 0.005, "Gravity-elongated accumulation on vertical surfaces (rain streaks, drips)."),
-            numberField("edgeShedding", "Edge shedding", def.edgeShedding, 0.0, 1.0, 0.005, "Exposed edges (response map B below 0.5 as signed curvature) shed this state — worn corners stay clean."),
-            toggleField("ripples", "Ripples & drips", def.ripples, "Animated liquid detail while the state is active: rain ripples on up-facing surfaces and droplets dripping down vertical ones with wet trails."),
-            choiceField("maskChannel", "Dedicated mask", channelName(def.maskChannel), channelChoices, "Selects a Surface State Masks channel to replace the shared response accumulation with hand-authored placement."),
-            choiceField("shelterChannel", "Shelter channel", channelName(def.shelterChannel), channelChoices, "Vertex-color channel that keeps areas clean (under armor plates, interiors); 1 = fully sheltered.")
-        });
-        // Blend-mode-dependent fields grey out when irrelevant, matching the
-        // Transparency page's gating pattern.
-        setSettingEditorsEnabled(page.page, section, {QStringLiteral("desaturation")}, def.blendMode == 1);
-        setSettingEditorsEnabled(page.page, section, {QStringLiteral("porosityInfluence")}, def.blendMode != 1);
-        addStatePresetRow(card, slot);
-    }
+        tr("Response profiles and state amounts live in the engine's surface state definitions (FO4.PBRM.SurfaceStateDefinitions), never in the material. Use the preview's States tab to simulate them; Settings > Surface State Definitions… selects the previewed set."));
+    // Read-only summary of the effective physical inputs, with pointers at
+    // the slots that own them.
+    const auto rmaos = m_document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos"));
+    const auto normal = m_document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal"));
+    const bool alphaPorosity = rmaos.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Porosity");
+    const bool porosityOverride = rmaos.values.value(QStringLiteral("overridePorosity")).toBool(false);
+    const QString porositySource = porosityOverride
+        ? tr("constant %1").arg(rmaos.values.value(QStringLiteral("porosity")).toDouble(.5))
+        : (alphaPorosity && !rmaos.path.trimmed().isEmpty()
+            ? tr("RMAOS alpha — %1").arg(rmaos.path)
+            : tr("derived — saturate(roughness × (1 − metallic))"));
+    const bool curvatureAuthored = normal.values.value(QStringLiteral("curvatureInAlpha")).toBool(false) && !normal.path.trimmed().isEmpty();
+    const QString curvatureSource = curvatureAuthored
+        ? tr("Normal alpha — %1").arg(normal.path)
+        : tr("derived from AO (concave only: no edge shedding, no cavity specular occlusion)");
+    addInfoCard(page.content, tr("Effective physical inputs"),
+        tr("Porosity: %1\nCurvature: %2\nConfigure both on the Primary UV Textures page (RMAOS and Normal + Height inputs).").arg(porositySource, curvatureSource));
+    addSettingsCard(page.content, QStringLiteral("SurfaceResponse"), tr("Response bindings"), {
+        numberField("adhesion", "Adhesion", 1.0, 0.0, 1.0, 0.005, "Where states can settle at all: 1 = ordinary surface, 0 = treated surface that sheds everything (oiled machinery, force fields)."),
+        choiceField("shelterChannel", "Shelter vertex channel", "None", {"None", "Red", "Green", "Blue", "Alpha"}, "Vertex-color channel painted 1 where geometry shelters the surface (under awnings, inside collars). Which states respect shelter is part of the runtime definitions."),
+        textField("maskR", "Mask R binds state", "", "Runtime state name (e.g. Blood) placed by the Surface State Masks texture's R channel instead of map-guided accumulation."),
+        textField("maskG", "Mask G binds state", "", "State name bound to the Surface State Masks G channel."),
+        textField("maskB", "Mask B binds state", "", "State name bound to the Surface State Masks B channel."),
+        textField("maskA", "Mask A binds state", "", "State name bound to the Surface State Masks A channel.")
+    });
     page.content->addStretch();
     return page.page;
-}
-
-void MainWindow::addStatePresetRow(QFrame* card, int slot)
-{
-    const QVector<Pbr::SurfaceStateSpec> presets = Pbr::surfaceStatePresets();
-    auto* presetRow = new QHBoxLayout();
-    auto* presetLabel = new QLabel(tr("Preset"), card);
-    presetLabel->setObjectName(QStringLiteral("Muted"));
-    presetRow->addWidget(presetLabel);
-    auto* presetCombo = new QComboBox(card);
-    WheelFocusGuard::install(presetCombo);
-    for (const auto& preset : presets) presetCombo->addItem(preset.name);
-    presetRow->addWidget(presetCombo, 1);
-    auto* presetApply = new QPushButton(tr("Apply"), card);
-    presetApply->setToolTip(tr("Writes this factory preset's full profile into the slot, replacing its current values."));
-    presetRow->addWidget(presetApply);
-    static_cast<QVBoxLayout*>(card->layout())->addLayout(presetRow);
-    connect(presetApply, &QPushButton::clicked, this, [this, slot, presetCombo] {
-        const auto channelName = [](int channel) {
-            return channel == 0 ? QStringLiteral("R") : channel == 1 ? QStringLiteral("G")
-                : channel == 2 ? QStringLiteral("B") : channel == 3 ? QStringLiteral("A") : QStringLiteral("None");
-        };
-        const QVector<Pbr::SurfaceStateSpec> allPresets = Pbr::surfaceStatePresets();
-        const int presetIndex = presetCombo->currentIndex();
-        if (presetIndex < 0 || presetIndex >= allPresets.size()) return;
-        const Pbr::SurfaceStateSpec preset = allPresets[presetIndex];
-        const QString presetSection = QStringLiteral("SurfaceStates/State%1").arg(slot);
-        applyDocumentChange(tr("Apply %1 preset to state %2").arg(preset.name).arg(slot + 1), [&] {
-                m_document.setSetting(presetSection, QStringLiteral("enabled"), true);
-                m_document.setSetting(presetSection, QStringLiteral("name"), preset.name);
-                m_document.setSetting(presetSection, QStringLiteral("tagLiquid"), preset.tagLiquid);
-                m_document.setSetting(presetSection, QStringLiteral("tagParticulate"), preset.tagParticulate);
-                m_document.setSetting(presetSection, QStringLiteral("tagFrozen"), preset.tagFrozen);
-                m_document.setSetting(presetSection, QStringLiteral("tagThermal"), preset.tagThermal);
-                m_document.setSetting(presetSection, QStringLiteral("tagViscous"), preset.tagViscous);
-                m_document.setSetting(presetSection, QStringLiteral("resistance"), preset.resistance);
-                m_document.setSetting(presetSection, QStringLiteral("gainRate"), preset.gainRate);
-                m_document.setSetting(presetSection, QStringLiteral("dryRate"), preset.dryRate);
-                m_document.setSetting(presetSection, QStringLiteral("retention"), preset.retention);
-                m_document.setSetting(presetSection, QStringLiteral("color"), preset.color);
-                m_document.setSetting(presetSection, QStringLiteral("blendMode"), preset.blendMode == 0 ? QStringLiteral("Darken") : (preset.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint")));
-                m_document.setSetting(presetSection, QStringLiteral("desaturation"), preset.desaturation);
-                m_document.setSetting(presetSection, QStringLiteral("porosityInfluence"), preset.porosityInfluence);
-                m_document.setSetting(presetSection, QStringLiteral("roughnessTarget"), preset.roughnessTarget);
-                m_document.setSetting(presetSection, QStringLiteral("roughnessWeight"), preset.roughnessWeight);
-                m_document.setSetting(presetSection, QStringLiteral("roughnessMode"), preset.roughnessMode == 1 ? QStringLiteral("Additive Raise") : QStringLiteral("Toward Target"));
-                m_document.setSetting(presetSection, QStringLiteral("f0Target"), preset.f0Target);
-                m_document.setSetting(presetSection, QStringLiteral("f0Weight"), preset.f0Weight);
-                m_document.setSetting(presetSection, QStringLiteral("filmF0"), preset.filmF0);
-                m_document.setSetting(presetSection, QStringLiteral("killMetallic"), preset.killMetallic);
-                m_document.setSetting(presetSection, QStringLiteral("sparkle"), preset.sparkle);
-                m_document.setSetting(presetSection, QStringLiteral("glowIntensity"), preset.glowIntensity);
-                m_document.setSetting(presetSection, QStringLiteral("cavityBias"), preset.cavityBias);
-                m_document.setSetting(presetSection, QStringLiteral("aoBias"), preset.aoBias);
-                m_document.setSetting(presetSection, QStringLiteral("heightBias"), preset.heightBias);
-                m_document.setSetting(presetSection, QStringLiteral("roughnessBias"), preset.roughnessBias);
-                m_document.setSetting(presetSection, QStringLiteral("metalSeal"), preset.metalSeal);
-                m_document.setSetting(presetSection, QStringLiteral("emissiveDry"), preset.emissiveDry);
-                m_document.setSetting(presetSection, QStringLiteral("threshold"), preset.threshold);
-                m_document.setSetting(presetSection, QStringLiteral("softness"), preset.softness);
-                m_document.setSetting(presetSection, QStringLiteral("directionality"), preset.directionality);
-                m_document.setSetting(presetSection, QStringLiteral("streaking"), preset.streaking);
-                m_document.setSetting(presetSection, QStringLiteral("edgeShedding"), preset.edgeShedding);
-                m_document.setSetting(presetSection, QStringLiteral("ripples"), preset.ripples);
-                m_document.setSetting(presetSection, QStringLiteral("maskChannel"), channelName(preset.maskChannel));
-                m_document.setSetting(presetSection, QStringLiteral("shelterChannel"), channelName(preset.shelterChannel));
-            });
-        // Refresh the visible editors and the card title with the new values.
-        QTimer::singleShot(0, this, [this] { rebuildWorkspace(m_currentPage); });
-    });
 }
 
 QWidget* MainWindow::createLandscapePage()
@@ -1253,10 +1139,18 @@ QWidget* MainWindow::createValidationPage()
                 else if (!height && info.format != QStringLiteral("BC5") && info.format != QStringLiteral("BC7"))
                     warnings << tr("%1/%2 should use BC5 or BC7.").arg(setName, spec.name);
             }
-            if (spec.key.contains(QStringLiteral("Rmaos"), Qt::CaseInsensitive)
-                && !state.values.value(QStringLiteral("overrideF0")).toBool(true)
-                && !info.channels.contains(QStringLiteral("A")))
-                errors << tr("%1/%2 samples dielectric F0 but the texture has no alpha channel.").arg(setName, spec.name);
+            if (spec.key.contains(QStringLiteral("Rmaos"), Qt::CaseInsensitive)) {
+                const bool alphaPorosity = state.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Porosity");
+                if (!alphaPorosity && !state.values.value(QStringLiteral("overrideF0")).toBool(true)
+                    && !info.channels.contains(QStringLiteral("A")))
+                    errors << tr("%1/%2 samples dielectric F0 but the texture has no alpha channel.").arg(setName, spec.name);
+                if (alphaPorosity && !state.values.value(QStringLiteral("overridePorosity")).toBool(false)
+                    && !info.channels.contains(QStringLiteral("A")))
+                    errors << tr("%1/%2 declares alpha as porosity but the texture has no alpha channel.").arg(setName, spec.name);
+                if (alphaPorosity && state.values.value(QStringLiteral("overrideMetallic")).toBool(true)
+                    && state.values.value(QStringLiteral("metallic")).toDouble(0.0) > .5)
+                    warnings << tr("%1/%2 dedicates alpha to porosity on a strongly metallic material; sealed metal has no meaningful porosity and F0 authoring is sacrificed.").arg(setName, spec.name);
+            }
             if (spec.channels.size() == 1 && info.channels.size() > 1 && info.format != QStringLiteral("BC4"))
                 warnings << tr("%1/%2 only samples one channel but the texture carries %3; a single-channel BC4 bake would save memory.")
                     .arg(setName, spec.name).arg(info.channels.join(QString()));
@@ -1266,15 +1160,19 @@ QWidget* MainWindow::createValidationPage()
                 && info.format != QStringLiteral("BC1")
                 && m_document.setting(QStringLiteral("Transparency/Composition"), QStringLiteral("mode"), QStringLiteral("Opaque")).toString() == QStringLiteral("Opaque"))
                 warnings << tr("%1/%2 carries an alpha channel that Opaque composition never samples; BC1 would halve the memory.").arg(setName, spec.name);
-            bool hasLayerMaskToggle = false;
-            for (const FieldSpec& field : spec.fields) hasLayerMaskToggle = hasLayerMaskToggle || field.key == QStringLiteral("layerMaskInAlpha");
-            if (hasLayerMaskToggle
-                && !state.values.value(QStringLiteral("heightInBlue")).toBool(false)
-                && !state.values.value(QStringLiteral("layerMaskInAlpha")).toBool(setName != QStringLiteral("UV0"))
-                && (info.channels.contains(QStringLiteral("B")) || info.channels.contains(QStringLiteral("A")))
-                && info.format != QStringLiteral("BC5"))
-                warnings << tr("%1/%2 only samples RG (height and layer modulation are off) but the texture carries %3; BC5 would halve the memory.")
-                    .arg(setName, spec.name).arg(info.channels.join(QString()));
+            if (spec.key.contains(QStringLiteral("Normal"), Qt::CaseInsensitive) && !spec.key.contains(QStringLiteral("Dynamic"), Qt::CaseInsensitive)) {
+                if (state.values.value(QStringLiteral("curvatureInAlpha")).toBool(false)
+                    && !info.channels.contains(QStringLiteral("A")))
+                    errors << tr("%1/%2 enables \"A contains curvature\" but the texture has no alpha channel.").arg(setName, spec.name);
+                if (state.values.value(QStringLiteral("layerMaskInAlpha")).toBool(false))
+                    warnings << tr("%1/%2 carries the retired layer-modulation-in-alpha flag; Normal alpha now carries signed curvature. Repack the old mask into a Layer Coverage texture or switch the layer to Height Blend coverage, then strip legacy surface data via Batch Operations.").arg(setName, spec.name);
+                if (!state.values.value(QStringLiteral("heightInBlue")).toBool(false)
+                    && !state.values.value(QStringLiteral("curvatureInAlpha")).toBool(false)
+                    && (info.channels.contains(QStringLiteral("B")) || info.channels.contains(QStringLiteral("A")))
+                    && info.format != QStringLiteral("BC5"))
+                    warnings << tr("%1/%2 only samples RG (height and curvature are off) but the texture carries %3; BC5 would halve the memory.")
+                        .arg(setName, spec.name).arg(info.channels.join(QString()));
+            }
             QStringList overrideToggles;
             bool allOverridden = true;
             for (const FieldSpec& field : spec.fields) {
@@ -1366,23 +1264,37 @@ QWidget* MainWindow::createValidationPage()
     if (m_document.setting(QStringLiteral("Advanced/Expert"), QStringLiteral("expertMode"), false).toBool())
         warnings << tr("Expert Mode is enabled. Verify any manual shader variant override before export.");
     {
-        const Pbr::TextureSlotState stateMasks = m_document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryStateMasks"));
+        // v5: surface state behavior is runtime-owned. Per-material state
+        // groups and the response slot are legacy data; the SurfaceResponse
+        // bindings are checked against the previewed definitions.
         bool legacyGroups = false;
         for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")})
             legacyGroups = legacyGroups || !m_document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty();
-        bool slotGroups = false;
         for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot)
-            slotGroups = slotGroups || !m_document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty();
-        if (legacyGroups && slotGroups)
-            warnings << tr("Both legacy named surface state groups and generic state slots are authored; the slots take precedence. Use Batch Operations to migrate and drop the legacy groups.");
-        for (const auto& state : Pbr::resolveSurfaceStates(m_document)) {
-            if (state.tagFrozen && state.tagThermal)
-                warnings << tr("Surface state '%1' is tagged both frozen and thermal; it would melt itself.").arg(state.name);
-            if (state.maskChannel >= 0 && (!stateMasks.enabled || stateMasks.path.trimmed().isEmpty()))
-                warnings << tr("Surface state '%1' selects a dedicated mask channel but no Surface State Masks texture is assigned.").arg(state.name);
-            if (state.shelterChannel >= 0 && state.maskChannel == state.shelterChannel && state.maskChannel >= 0)
-                warnings << tr("Surface state '%1' uses the same channel for mask and shelter; verify that is intentional.").arg(state.name);
+            legacyGroups = legacyGroups || !m_document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty();
+        if (legacyGroups)
+            errors << tr("Legacy per-material surface state groups are authored; state behavior is runtime-owned as of PBRM v5. Use Batch Operations to extract them to a definitions JSON and strip them.");
+        for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
+            const QJsonObject set = m_document.textureSet(setName);
+            for (auto it = set.constBegin(); it != set.constEnd(); ++it)
+                if (it.key().endsWith(QStringLiteral("SurfaceStateResponse")))
+                    errors << tr("%1 carries the retired Surface State Response input. Repack R into RMAOS alpha (porosity) and B into Normal alpha (curvature) with the channel packer, then strip legacy surface data via Batch Operations.").arg(setName);
         }
+        const Pbr::TextureSlotState stateMasks = m_document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryStateMasks"));
+        const QJsonObject response = m_document.settingGroup(QStringLiteral("SurfaceResponse"));
+        const QVector<Pbr::SurfaceStateSpec> definitions = Pbr::activeSurfaceStateDefinitions();
+        QStringList boundNames;
+        for (const QString& key : {QStringLiteral("maskR"), QStringLiteral("maskG"), QStringLiteral("maskB"), QStringLiteral("maskA")}) {
+            const QString name = response.value(key).toString().trimmed();
+            if (name.isEmpty()) continue;
+            boundNames << name;
+            bool known = false;
+            for (const auto& state : definitions) known = known || state.name.compare(name, Qt::CaseInsensitive) == 0;
+            if (!known)
+                warnings << tr("Surface response binding %1 names state '%2', which is not in the previewed definitions; it may still exist in the shipped runtime set — verify the spelling.").arg(key, name);
+        }
+        if (!boundNames.isEmpty() && (!stateMasks.enabled || stateMasks.path.trimmed().isEmpty()))
+            warnings << tr("Surface state mask bindings are authored but no Surface State Masks texture is assigned.");
     }
 
     addInfoCard(page.content, errors.isEmpty() ? tr("No blocking errors") : tr("Blocking errors"),

@@ -230,6 +230,11 @@ private:
     bool m_overrideBaseColor = true, m_overrideOpacity = true, m_overrideNormal = true;
     bool m_overrideEmissiveColor = true, m_overrideEmissiveMask = true;
     bool m_useRoughness = false, m_useMetallic = false, m_useAo = false, m_useF0 = false;
+    // v5 surface response: porosity rides RMAOS.A, signed curvature rides
+    // Normal.A, adhesion/shelter/mask bindings come from SurfaceResponse.
+    bool m_rmaosAlphaPorosity = false, m_porosityOverride = false, m_curvatureInAlpha = false, m_sssAlphaAuthored = false;
+    float m_porosityConstant = .5f, m_cavitySpecOcclusion = 1.0f, m_stateAdhesion = 1.0f;
+    int m_shelterChannel = -1;
     QColor m_secondaryBaseColor = Qt::white, m_secondaryTint = Qt::white;
     QColor m_secondaryNormalColor = QColor(QStringLiteral("#8080FF")), m_secondaryEmissiveColor = Qt::white;
     float m_secondaryOpacity = 1, m_secondaryColorScale = 1, m_secondaryNormalStrength = 1;
@@ -240,7 +245,7 @@ private:
     bool m_overrideSecondaryBaseColor = true, m_overrideSecondaryOpacity = true, m_overrideSecondaryNormal = true;
     bool m_overrideSecondaryEmissiveColor = true, m_overrideSecondaryEmissiveMask = true;
     bool m_useSecondaryRoughness = false, m_useSecondaryMetallic = false, m_useSecondaryAo = false, m_useSecondaryF0 = false;
-    int m_secondaryBlendMode = 0, m_coverageMode = 1, m_patternSource = 0;
+    int m_secondaryBlendMode = 0, m_coverageMode = 1, m_patternSource = 3;
     float m_coverageBias = 0, m_coverageContrast = 1, m_coverageSoftness = .1f;
     float m_layerCoverageFallback = 1, m_layerCoverageSlotBias = 0, m_layerCoverageSlotContrast = 1;
     // Tertiary (UV2) overlay state — mirrors the secondary members above.
@@ -254,7 +259,7 @@ private:
     bool m_overrideTertiaryBaseColor = true, m_overrideTertiaryOpacity = true, m_overrideTertiaryNormal = true;
     bool m_overrideTertiaryEmissiveColor = true, m_overrideTertiaryEmissiveMask = true;
     bool m_useTertiaryRoughness = false, m_useTertiaryMetallic = false, m_useTertiaryAo = false, m_useTertiaryF0 = false;
-    int m_tertiaryBlendMode = 0, m_tCoverageMode = 1, m_tPatternSource = 0;
+    int m_tertiaryBlendMode = 0, m_tCoverageMode = 1, m_tPatternSource = 3;
     float m_tCoverageBias = 0, m_tCoverageContrast = 1, m_tCoverageSoftness = .1f;
     float m_tertiaryCoverageFallback = 1, m_tertiaryCoverageSlotBias = 0, m_tertiaryCoverageSlotContrast = 1;
     bool m_secondaryLayerActive = false, m_tertiaryLayerActive = false;

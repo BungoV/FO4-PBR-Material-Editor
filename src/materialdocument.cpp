@@ -2,8 +2,10 @@
 
 #include <QDataStream>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QSaveFile>
+#include <QSettings>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -100,6 +102,81 @@ QJsonObject migrateOverridesRecursively(QJsonObject object)
     return object;
 }
 
+// v4 -> v5: surface state behavior left the material for runtime-owned
+// definitions. Fold the physical constants of the deleted Surface State
+// Response slot into their new homes (porosity -> RMAOS values, adhesion ->
+// SurfaceResponse) and lift per-state mask/shelter selections into the
+// SurfaceResponse bindings. Legacy SurfaceStates/* groups and response slots
+// that still carry an assigned map are preserved inert so validation and the
+// batch tools can surface them; nothing is destroyed silently. Idempotent.
+void migrateV4SurfaceData(QJsonObject* uv0, QJsonObject* uv1, QJsonObject* uv2, QJsonObject* settings)
+{
+    QJsonObject response = settings->value(QStringLiteral("SurfaceResponse")).toObject();
+    const auto foldSet = [&response](QJsonObject* set, const QString& prefix) {
+        const QString key = prefix + QStringLiteral("SurfaceStateResponse");
+        if (!set->contains(key)) return;
+        const QJsonObject slot = set->value(key).toObject();
+        const QJsonObject values = slot.value(QStringLiteral("values")).toObject();
+        if (values.contains(QStringLiteral("porosity"))) {
+            const QString rmaosKey = prefix + QStringLiteral("Rmaos");
+            QJsonObject rmaos = set->value(rmaosKey).toObject();
+            QJsonObject rmaosValues = rmaos.value(QStringLiteral("values")).toObject();
+            if (!rmaosValues.contains(QStringLiteral("porosity"))) {
+                rmaosValues.insert(QStringLiteral("porosity"), values.value(QStringLiteral("porosity")));
+                rmaosValues.insert(QStringLiteral("overridePorosity"), values.value(QStringLiteral("overridePorosity")).toBool(true));
+                rmaos.insert(QStringLiteral("values"), rmaosValues);
+                set->insert(rmaosKey, rmaos);
+            }
+        }
+        if (prefix == QLatin1String("primary")
+            && values.contains(QStringLiteral("adhesion")) && !response.contains(QStringLiteral("adhesion")))
+            response.insert(QStringLiteral("adhesion"), values.value(QStringLiteral("adhesion")));
+        // Constants are folded; a pathless slot has nothing left to say. A slot
+        // with an assigned map keeps its data for validation and repacking.
+        if (slot.value(QStringLiteral("path")).toString().trimmed().isEmpty())
+            set->remove(key);
+    };
+    foldSet(uv0, QStringLiteral("primary"));
+    foldSet(uv1, QStringLiteral("secondary"));
+    foldSet(uv2, QStringLiteral("tertiary"));
+
+    const auto maskKey = [](const QString& channel) {
+        return channel == QLatin1String("R") ? QStringLiteral("maskR")
+            : channel == QLatin1String("G") ? QStringLiteral("maskG")
+            : channel == QLatin1String("B") ? QStringLiteral("maskB")
+            : channel == QLatin1String("A") ? QStringLiteral("maskA") : QString();
+    };
+    const auto shelterName = [](const QString& channel) {
+        return channel == QLatin1String("R") ? QStringLiteral("Red")
+            : channel == QLatin1String("G") ? QStringLiteral("Green")
+            : channel == QLatin1String("B") ? QStringLiteral("Blue")
+            : channel == QLatin1String("A") ? QStringLiteral("Alpha") : QString();
+    };
+    for (int slot = 0; slot < MaxSurfaceStates; ++slot) {
+        const QJsonObject group = settings->value(QStringLiteral("SurfaceStates/State%1").arg(slot)).toObject();
+        if (group.isEmpty()) continue;
+        const QString name = group.value(QStringLiteral("name")).toString();
+        const QString binding = maskKey(group.value(QStringLiteral("maskChannel")).toString());
+        if (!binding.isEmpty() && !name.isEmpty() && !response.contains(binding))
+            response.insert(binding, name);
+        const QString shelter = shelterName(group.value(QStringLiteral("shelterChannel")).toString());
+        if (!shelter.isEmpty() && !response.contains(QStringLiteral("shelterChannel")))
+            response.insert(QStringLiteral("shelterChannel"), shelter);
+    }
+    if (!response.isEmpty()) settings->insert(QStringLiteral("SurfaceResponse"), response);
+
+    // The Primary Normal Alpha layer-mask pattern source is gone; a BC5-era
+    // normal alpha read as constant 1.0, so Constant is the exact replacement.
+    // Materials that really packed a mask get a validation pointer instead.
+    for (const QString& section : {QStringLiteral("UV1/Composition"), QStringLiteral("UV2/Composition")}) {
+        QJsonObject composition = settings->value(section).toObject();
+        if (composition.value(QStringLiteral("pattern")).toString() == QLatin1String("Primary Normal Alpha")) {
+            composition.insert(QStringLiteral("pattern"), QStringLiteral("Constant"));
+            settings->insert(section, composition);
+        }
+    }
+}
+
 } // namespace
 
 QString shaderModeName(ShaderMode mode)
@@ -192,8 +269,8 @@ bool MaterialDocument::load(const QString& fileName, QString* error)
         if (error) *error = QStringLiteral("Not a PBRM material (invalid signature).");
         return false;
     }
-    if (version != Version) {
-        if (error) *error = QStringLiteral("Unsupported PBRM version %1; this editor writes version %2.").arg(version).arg(Version);
+    if (version != Version && version != LegacyVersion) {
+        if (error) *error = QStringLiteral("Unsupported PBRM version %1; this editor reads versions %2-%3.").arg(version).arg(LegacyVersion).arg(Version);
         return false;
     }
     constexpr quint32 MaximumPayloadSize = 64u * 1024u * 1024u;
@@ -381,7 +458,8 @@ bool MaterialDocument::fromJson(const QJsonObject& object, QString* error)
         if (error) *error = QStringLiteral("The PBRM payload schema is not recognized.");
         return false;
     }
-    if (object.value(QStringLiteral("schemaVersion")).toInt(-1) != static_cast<int>(Version)) {
+    const int schemaVersion = object.value(QStringLiteral("schemaVersion")).toInt(-1);
+    if (schemaVersion != static_cast<int>(Version) && schemaVersion != static_cast<int>(LegacyVersion)) {
         if (error) *error = QStringLiteral("The PBRM JSON schema version is not supported.");
         return false;
     }
@@ -443,6 +521,7 @@ bool MaterialDocument::fromJson(const QJsonObject& object, QString* error)
     if (environment.isEmpty()) m_resources.remove(QStringLiteral("Environment"));
     else m_resources.insert(QStringLiteral("Environment"), environment);
     m_settings = object.value(QStringLiteral("settings")).toObject();
+    migrateV4SurfaceData(&m_uv0, &m_uv1, &m_uv2, &m_settings);
 	m_unknownRoot = object;
 	for (const QString& known : {
 	         QStringLiteral("schema"), QStringLiteral("schemaVersion"), QStringLiteral("shader"),
@@ -474,6 +553,7 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     wetness.gainRate = 1.5; wetness.dryRate = .3; wetness.retention = .3;
     wetness.aoBias = .15; wetness.heightBias = .3; wetness.roughnessBias = .1;
     wetness.metalSeal = .8; wetness.emissiveDry = .4;
+    wetness.respectsShelter = true;
 
     SurfaceStateSpec dust;
     dust.slot = 1; dust.name = QStringLiteral("Dust");
@@ -486,6 +566,7 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     dust.edgeShedding = .35;
     dust.gainRate = .7; dust.dryRate = .2;
     dust.aoBias = .35; dust.heightBias = .1; dust.roughnessBias = .25; dust.emissiveDry = .3;
+    dust.respectsShelter = true;
 
     SurfaceStateSpec frost;
     frost.slot = 2; frost.name = QStringLiteral("Frost");
@@ -500,6 +581,7 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     frost.edgeShedding = .25;
     frost.gainRate = .8; frost.dryRate = .5;
     frost.aoBias = .2; frost.heightBias = .15; frost.roughnessBias = .15; frost.emissiveDry = .7;
+    frost.respectsShelter = true;
 
     SurfaceStateSpec heat;
     heat.slot = 3; heat.name = QStringLiteral("Heat");
@@ -525,16 +607,117 @@ QVector<SurfaceStateSpec> surfaceStatePresets()
     return {wetness, dust, frost, heat, blood};
 }
 
+namespace {
+
+int stateChannelIndex(const QString& value)
+{
+    return value == QStringLiteral("R") ? 0 : value == QStringLiteral("G") ? 1
+        : value == QStringLiteral("B") ? 2 : value == QStringLiteral("A") ? 3 : -1;
+}
+
+QString stateChannelName(int channel)
+{
+    return channel == 0 ? QStringLiteral("R") : channel == 1 ? QStringLiteral("G")
+        : channel == 2 ? QStringLiteral("B") : channel == 3 ? QStringLiteral("A") : QStringLiteral("None");
+}
+
+// Applies sparse JSON keys over the spec's current values. Shared between the
+// legacy per-material group reader and the definitions-asset reader.
+void applyStateJson(SurfaceStateSpec& state, const QJsonObject& group)
+{
+    state.enabled = group.value(QStringLiteral("enabled")).toBool(state.enabled);
+    state.name = group.value(QStringLiteral("name")).toString(state.name);
+    state.tagLiquid = group.value(QStringLiteral("tagLiquid")).toBool(state.tagLiquid);
+    state.tagParticulate = group.value(QStringLiteral("tagParticulate")).toBool(state.tagParticulate);
+    state.tagFrozen = group.value(QStringLiteral("tagFrozen")).toBool(state.tagFrozen);
+    state.tagThermal = group.value(QStringLiteral("tagThermal")).toBool(state.tagThermal);
+    state.tagViscous = group.value(QStringLiteral("tagViscous")).toBool(state.tagViscous);
+    state.resistance = group.value(QStringLiteral("resistance")).toDouble(state.resistance);
+    state.gainRate = group.value(QStringLiteral("gainRate")).toDouble(state.gainRate);
+    state.dryRate = group.value(QStringLiteral("dryRate")).toDouble(state.dryRate);
+    state.retention = group.value(QStringLiteral("retention")).toDouble(state.retention);
+    state.color = group.value(QStringLiteral("color")).toString(state.color);
+    const QString defaultBlend = state.blendMode == 0 ? QStringLiteral("Darken") : (state.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint"));
+    const QString blend = group.value(QStringLiteral("blendMode")).toString(defaultBlend);
+    state.blendMode = blend == QStringLiteral("Darken") ? 0 : (blend == QStringLiteral("Coat") ? 2 : 1);
+    state.desaturation = group.value(QStringLiteral("desaturation")).toDouble(state.desaturation);
+    state.porosityInfluence = group.value(QStringLiteral("porosityInfluence")).toDouble(state.porosityInfluence);
+    state.roughnessTarget = group.value(QStringLiteral("roughnessTarget")).toDouble(state.roughnessTarget);
+    state.roughnessWeight = group.value(QStringLiteral("roughnessWeight")).toDouble(state.roughnessWeight);
+    const QString defaultRoughMode = state.roughnessMode == 1 ? QStringLiteral("Additive Raise") : QStringLiteral("Toward Target");
+    state.roughnessMode = group.value(QStringLiteral("roughnessMode")).toString(defaultRoughMode) == QStringLiteral("Additive Raise") ? 1 : 0;
+    state.f0Target = group.value(QStringLiteral("f0Target")).toDouble(state.f0Target);
+    state.f0Weight = group.value(QStringLiteral("f0Weight")).toDouble(state.f0Weight);
+    state.filmF0 = group.value(QStringLiteral("filmF0")).toDouble(state.filmF0);
+    state.killMetallic = group.value(QStringLiteral("killMetallic")).toBool(state.killMetallic);
+    state.sparkle = group.value(QStringLiteral("sparkle")).toDouble(state.sparkle);
+    state.glowIntensity = group.value(QStringLiteral("glowIntensity")).toDouble(state.glowIntensity);
+    state.cavityBias = group.value(QStringLiteral("cavityBias")).toDouble(state.cavityBias);
+    state.aoBias = group.value(QStringLiteral("aoBias")).toDouble(state.aoBias);
+    state.heightBias = group.value(QStringLiteral("heightBias")).toDouble(state.heightBias);
+    state.roughnessBias = group.value(QStringLiteral("roughnessBias")).toDouble(state.roughnessBias);
+    state.metalSeal = group.value(QStringLiteral("metalSeal")).toDouble(state.metalSeal);
+    state.emissiveDry = group.value(QStringLiteral("emissiveDry")).toDouble(state.emissiveDry);
+    state.threshold = group.value(QStringLiteral("threshold")).toDouble(state.threshold);
+    state.softness = group.value(QStringLiteral("softness")).toDouble(state.softness);
+    state.directionality = group.value(QStringLiteral("directionality")).toDouble(state.directionality);
+    state.streaking = group.value(QStringLiteral("streaking")).toDouble(state.streaking);
+    state.edgeShedding = group.value(QStringLiteral("edgeShedding")).toDouble(state.edgeShedding);
+    state.ripples = group.value(QStringLiteral("ripples")).toBool(state.ripples);
+    state.respectsShelter = group.value(QStringLiteral("respectsShelter")).toBool(state.respectsShelter);
+    state.maskChannel = stateChannelIndex(group.value(QStringLiteral("maskChannel")).toString(stateChannelName(state.maskChannel)));
+    state.shelterChannel = stateChannelIndex(group.value(QStringLiteral("shelterChannel")).toString(stateChannelName(state.shelterChannel)));
+}
+
+// Serializes the definition-facing profile (never the legacy per-material
+// mask/shelter fields — those are material bindings in v5).
+QJsonObject stateToDefinitionJson(const SurfaceStateSpec& state)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("enabled"), state.enabled);
+    object.insert(QStringLiteral("name"), state.name);
+    object.insert(QStringLiteral("tagLiquid"), state.tagLiquid);
+    object.insert(QStringLiteral("tagParticulate"), state.tagParticulate);
+    object.insert(QStringLiteral("tagFrozen"), state.tagFrozen);
+    object.insert(QStringLiteral("tagThermal"), state.tagThermal);
+    object.insert(QStringLiteral("tagViscous"), state.tagViscous);
+    object.insert(QStringLiteral("resistance"), state.resistance);
+    object.insert(QStringLiteral("gainRate"), state.gainRate);
+    object.insert(QStringLiteral("dryRate"), state.dryRate);
+    object.insert(QStringLiteral("retention"), state.retention);
+    object.insert(QStringLiteral("color"), state.color);
+    object.insert(QStringLiteral("blendMode"), state.blendMode == 0 ? QStringLiteral("Darken") : (state.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint")));
+    object.insert(QStringLiteral("desaturation"), state.desaturation);
+    object.insert(QStringLiteral("porosityInfluence"), state.porosityInfluence);
+    object.insert(QStringLiteral("roughnessTarget"), state.roughnessTarget);
+    object.insert(QStringLiteral("roughnessWeight"), state.roughnessWeight);
+    object.insert(QStringLiteral("roughnessMode"), state.roughnessMode == 1 ? QStringLiteral("Additive Raise") : QStringLiteral("Toward Target"));
+    object.insert(QStringLiteral("f0Target"), state.f0Target);
+    object.insert(QStringLiteral("f0Weight"), state.f0Weight);
+    object.insert(QStringLiteral("filmF0"), state.filmF0);
+    object.insert(QStringLiteral("killMetallic"), state.killMetallic);
+    object.insert(QStringLiteral("sparkle"), state.sparkle);
+    object.insert(QStringLiteral("glowIntensity"), state.glowIntensity);
+    object.insert(QStringLiteral("cavityBias"), state.cavityBias);
+    object.insert(QStringLiteral("aoBias"), state.aoBias);
+    object.insert(QStringLiteral("heightBias"), state.heightBias);
+    object.insert(QStringLiteral("roughnessBias"), state.roughnessBias);
+    object.insert(QStringLiteral("metalSeal"), state.metalSeal);
+    object.insert(QStringLiteral("emissiveDry"), state.emissiveDry);
+    object.insert(QStringLiteral("threshold"), state.threshold);
+    object.insert(QStringLiteral("softness"), state.softness);
+    object.insert(QStringLiteral("directionality"), state.directionality);
+    object.insert(QStringLiteral("streaking"), state.streaking);
+    object.insert(QStringLiteral("edgeShedding"), state.edgeShedding);
+    object.insert(QStringLiteral("ripples"), state.ripples);
+    object.insert(QStringLiteral("respectsShelter"), state.respectsShelter);
+    return object;
+}
+
+} // namespace
+
 QVector<SurfaceStateSpec> resolveSurfaceStates(const MaterialDocument& document)
 {
-    const auto channelIndex = [](const QString& value) {
-        return value == QStringLiteral("R") ? 0 : value == QStringLiteral("G") ? 1
-            : value == QStringLiteral("B") ? 2 : value == QStringLiteral("A") ? 3 : -1;
-    };
-    const auto channelName = [](int channel) {
-        return channel == 0 ? QStringLiteral("R") : channel == 1 ? QStringLiteral("G")
-            : channel == 2 ? QStringLiteral("B") : channel == 3 ? QStringLiteral("A") : QStringLiteral("None");
-    };
     // Slots 0-4 default to the factory presets (overridden by any legacy
     // named-group constants, so pre-redesign documents keep their exact look);
     // slots 5-7 default to disabled blanks. Authored SurfaceStates/StateN keys
@@ -592,49 +775,7 @@ QVector<SurfaceStateSpec> resolveSurfaceStates(const MaterialDocument& document)
         else { state.enabled = false; state.name = QStringLiteral("State %1").arg(slot + 1); }
         state.slot = slot;
         const QJsonObject group = document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot));
-        if (!group.isEmpty()) {
-            state.enabled = group.value(QStringLiteral("enabled")).toBool(state.enabled);
-            state.name = group.value(QStringLiteral("name")).toString(state.name);
-            state.tagLiquid = group.value(QStringLiteral("tagLiquid")).toBool(state.tagLiquid);
-            state.tagParticulate = group.value(QStringLiteral("tagParticulate")).toBool(state.tagParticulate);
-            state.tagFrozen = group.value(QStringLiteral("tagFrozen")).toBool(state.tagFrozen);
-            state.tagThermal = group.value(QStringLiteral("tagThermal")).toBool(state.tagThermal);
-            state.tagViscous = group.value(QStringLiteral("tagViscous")).toBool(state.tagViscous);
-            state.resistance = group.value(QStringLiteral("resistance")).toDouble(state.resistance);
-            state.gainRate = group.value(QStringLiteral("gainRate")).toDouble(state.gainRate);
-            state.dryRate = group.value(QStringLiteral("dryRate")).toDouble(state.dryRate);
-            state.retention = group.value(QStringLiteral("retention")).toDouble(state.retention);
-            state.color = group.value(QStringLiteral("color")).toString(state.color);
-            const QString defaultBlend = state.blendMode == 0 ? QStringLiteral("Darken") : (state.blendMode == 2 ? QStringLiteral("Coat") : QStringLiteral("Tint"));
-            const QString blend = group.value(QStringLiteral("blendMode")).toString(defaultBlend);
-            state.blendMode = blend == QStringLiteral("Darken") ? 0 : (blend == QStringLiteral("Coat") ? 2 : 1);
-            state.desaturation = group.value(QStringLiteral("desaturation")).toDouble(state.desaturation);
-            state.porosityInfluence = group.value(QStringLiteral("porosityInfluence")).toDouble(state.porosityInfluence);
-            state.roughnessTarget = group.value(QStringLiteral("roughnessTarget")).toDouble(state.roughnessTarget);
-            state.roughnessWeight = group.value(QStringLiteral("roughnessWeight")).toDouble(state.roughnessWeight);
-            const QString defaultRoughMode = state.roughnessMode == 1 ? QStringLiteral("Additive Raise") : QStringLiteral("Toward Target");
-            state.roughnessMode = group.value(QStringLiteral("roughnessMode")).toString(defaultRoughMode) == QStringLiteral("Additive Raise") ? 1 : 0;
-            state.f0Target = group.value(QStringLiteral("f0Target")).toDouble(state.f0Target);
-            state.f0Weight = group.value(QStringLiteral("f0Weight")).toDouble(state.f0Weight);
-            state.filmF0 = group.value(QStringLiteral("filmF0")).toDouble(state.filmF0);
-            state.killMetallic = group.value(QStringLiteral("killMetallic")).toBool(state.killMetallic);
-            state.sparkle = group.value(QStringLiteral("sparkle")).toDouble(state.sparkle);
-            state.glowIntensity = group.value(QStringLiteral("glowIntensity")).toDouble(state.glowIntensity);
-            state.cavityBias = group.value(QStringLiteral("cavityBias")).toDouble(state.cavityBias);
-            state.aoBias = group.value(QStringLiteral("aoBias")).toDouble(state.aoBias);
-            state.heightBias = group.value(QStringLiteral("heightBias")).toDouble(state.heightBias);
-            state.roughnessBias = group.value(QStringLiteral("roughnessBias")).toDouble(state.roughnessBias);
-            state.metalSeal = group.value(QStringLiteral("metalSeal")).toDouble(state.metalSeal);
-            state.emissiveDry = group.value(QStringLiteral("emissiveDry")).toDouble(state.emissiveDry);
-            state.threshold = group.value(QStringLiteral("threshold")).toDouble(state.threshold);
-            state.softness = group.value(QStringLiteral("softness")).toDouble(state.softness);
-            state.directionality = group.value(QStringLiteral("directionality")).toDouble(state.directionality);
-            state.streaking = group.value(QStringLiteral("streaking")).toDouble(state.streaking);
-            state.edgeShedding = group.value(QStringLiteral("edgeShedding")).toDouble(state.edgeShedding);
-            state.ripples = group.value(QStringLiteral("ripples")).toBool(state.ripples);
-            state.maskChannel = channelIndex(group.value(QStringLiteral("maskChannel")).toString(channelName(state.maskChannel)));
-            state.shelterChannel = channelIndex(group.value(QStringLiteral("shelterChannel")).toString(channelName(state.shelterChannel)));
-        }
+        if (!group.isEmpty()) applyStateJson(state, group);
         if (state.enabled) states.append(state);
     }
     return states;
@@ -679,6 +820,101 @@ QVector<float> surfaceStateInteractions(const QVector<SurfaceStateSpec>& states,
         effective[i] = clamp01(effective[i]);
     }
     return effective;
+}
+
+QJsonObject surfaceStateDefinitionsToJson(const QVector<SurfaceStateSpec>& states)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("schema"), QStringLiteral("FO4.PBRM.SurfaceStateDefinitions"));
+    object.insert(QStringLiteral("schemaVersion"), 1);
+    QJsonArray array;
+    for (const auto& state : states) array.append(stateToDefinitionJson(state));
+    object.insert(QStringLiteral("states"), array);
+    return object;
+}
+
+QVector<SurfaceStateSpec> surfaceStateDefinitionsFromJson(const QJsonObject& object, QString* error)
+{
+    if (object.value(QStringLiteral("schema")).toString() != QStringLiteral("FO4.PBRM.SurfaceStateDefinitions")) {
+        if (error) *error = QStringLiteral("Not a FO4.PBRM.SurfaceStateDefinitions document.");
+        return {};
+    }
+    if (object.value(QStringLiteral("schemaVersion")).toInt(-1) != 1) {
+        if (error) *error = QStringLiteral("Unsupported surface state definitions schema version.");
+        return {};
+    }
+    if (!object.value(QStringLiteral("states")).isArray()) {
+        if (error) *error = QStringLiteral("The definitions 'states' field must be an array.");
+        return {};
+    }
+    QVector<SurfaceStateSpec> states;
+    const QJsonArray array = object.value(QStringLiteral("states")).toArray();
+    for (const QJsonValue& value : array) {
+        SurfaceStateSpec state;
+        state.slot = states.size();
+        state.name = QStringLiteral("State %1").arg(states.size() + 1);
+        applyStateJson(state, value.toObject());
+        states.append(state);
+    }
+    return states;
+}
+
+bool saveSurfaceStateDefinitions(const QString& fileName, const QVector<SurfaceStateSpec>& states, QString* error)
+{
+    QSaveFile file(fileName);
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    // Indented: this asset is meant to be hand-edited and diffed by modders.
+    const QByteArray payload = QJsonDocument(surfaceStateDefinitionsToJson(states)).toJson(QJsonDocument::Indented);
+    if (file.write(payload) != payload.size() || !file.commit()) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    return true;
+}
+
+bool loadSurfaceStateDefinitions(const QString& fileName, QVector<SurfaceStateSpec>* states, QString* error)
+{
+    QFile file(fileName);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument json = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !json.isObject()) {
+        if (error) *error = QStringLiteral("Invalid definitions JSON: %1").arg(parseError.errorString());
+        return false;
+    }
+    QString parseFailure;
+    const QVector<SurfaceStateSpec> parsed = surfaceStateDefinitionsFromJson(json.object(), &parseFailure);
+    if (parsed.isEmpty() && !parseFailure.isEmpty()) {
+        if (error) *error = parseFailure;
+        return false;
+    }
+    if (states) *states = parsed;
+    return true;
+}
+
+QVector<SurfaceStateSpec> activeSurfaceStateDefinitions(QString* sourcePath)
+{
+    if (sourcePath) sourcePath->clear();
+    const QString path = QSettings().value(QStringLiteral("surfaceStates/definitionsPath")).toString();
+    if (!path.trimmed().isEmpty()) {
+        QVector<SurfaceStateSpec> loaded;
+        if (loadSurfaceStateDefinitions(path, &loaded) && !loaded.isEmpty()) {
+            QVector<SurfaceStateSpec> enabled;
+            for (const auto& state : loaded)
+                if (state.enabled && enabled.size() < MaxSurfaceStates) enabled.append(state);
+            if (!enabled.isEmpty()) {
+                if (sourcePath) *sourcePath = path;
+                return enabled;
+            }
+        }
+    }
+    return surfaceStatePresets();
 }
 
 } // namespace Pbr

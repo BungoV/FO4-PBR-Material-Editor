@@ -1,6 +1,6 @@
 {
   "schema": "FO4.PBRM.Material",
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "shader": "Standard",
   "secondaryUvEnabled": true,
   "tertiaryUvEnabled": true,

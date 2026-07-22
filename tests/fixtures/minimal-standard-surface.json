@@ -1,6 +1,6 @@
 {
   "schema": "FO4.PBRM.Material",
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "shader": "Standard",
   "secondaryUvEnabled": false,
   "primaryUv": {
@@ -20,8 +20,7 @@
       "path": "textures\\pbr\\golden_n.dds",
       "values": {
         "strength": 1.0,
-        "heightInBlue": false,
-        "layerMaskInAlpha": false
+        "heightInBlue": false
       }
     },
     "primaryRmaos": {

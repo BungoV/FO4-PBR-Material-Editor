@@ -1,13 +1,20 @@
-# PBRM version 4
+# PBRM version 5
 
-PBRM v4 is a compact binary envelope around a UTF-8 JSON authoring document.
+PBRM v5 is a compact binary envelope around a UTF-8 JSON authoring document.
 `src/materialdocument.h` and `src/materialdocument.cpp` are authoritative for
 the editor. All integer fields are unsigned little-endian values.
+
+v5's semantic change: surface state behavior moved out of the material into
+runtime-owned definitions (`FO4.PBRM.SurfaceStateDefinitions`); the material
+carries physical maps only — porosity in RMAOS alpha, signed curvature in
+Normal alpha — plus the small `SurfaceResponse` bindings. See
+`docs/SurfaceStates-Architecture.md` for the design. The editor reads v4 with
+an in-memory migration and always writes v5.
 
 | Offset | Type | Meaning |
 | ---: | --- | --- |
 | 0 | `char[4]` | ASCII `PBRM` |
-| 4 | `uint32` | Envelope version (`4`) |
+| 4 | `uint32` | Envelope version (`5`; `4` accepted on read) |
 | 8 | `uint32` | JSON payload size in bytes |
 | 12 | `byte[]` | Compact UTF-8 JSON payload |
 
@@ -23,7 +30,7 @@ The editor writes the core root fields and empty authoring collections.
 ```json
 {
   "schema": "FO4.PBRM.Material",
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "shader": "Standard",
   "secondaryUvEnabled": false,
   "primaryUv": {},
@@ -73,48 +80,43 @@ composites them for preview and thumbnails, and validation warns until they
 are baked to a real packed texture, because a runtime always samples the one
 authored path.
 
-The `SurfaceStateResponse` socket (prefixes `primary`/`secondary`/`tertiary`)
-and the `SurfaceStates/*` setting groups are additive members describing how a
-material responds to runtime surface states. The response map packs R
-porosity, G adhesion, B cavity bias, and A accumulation variation; one map is
-read by every active state simultaneously. State amounts themselves are
-runtime data and are never serialized.
+Surface state behavior is runtime-owned as of v5: the response profiles
+(blend modes, roughness/F0 responses, gain/dry rates, map-guidance weights,
+ripples) live in a `FO4.PBRM.SurfaceStateDefinitions` version-1 JSON asset
+shipped with the runtime, and state amounts are runtime data bound by state
+name. Neither is ever serialized into a material. The material contributes
+physical inputs that the definitions read:
 
-States are generic slots: `SurfaceStates/State0..7` groups each carry a
-`name` (the runtime binding ID), behavior tags (`tagLiquid`,
-`tagParticulate`, `tagFrozen`, `tagThermal`, `tagViscous`) driving fixed
-interaction physics (liquids wash particulates, thermal dries liquids and
-melts frozen into liquid, viscous resists, per-state `resistance` tunes it),
-and a generic response profile (albedo blend mode/color/desaturation,
-roughness target/weight/mode, F0 target/weight, film F0, metallic
-suppression, sparkle, blackbody glow, accumulation cavity bias / threshold /
-softness, up-facing `directionality`, vertical `streaking`, animated
-`ripples` — rain rings on up-facing surfaces plus droplets dripping down
-vertical ones — optional dedicated `maskChannel` into the
-`primaryStateMasks` RGBA socket, and a vertex-color `shelterChannel`).
-Temporal constants: `gainRate` and `dryRate` multiply the runtime's global
-accumulation and decay speeds (cloth soaks fast and dries slowly), and
-`retention` biases accumulation by response-map porosity so porous areas
-collect first and dry last.
+- **Porosity** — RMAOS alpha when the slot's `alphaCarries` is `Porosity`,
+  else the `overridePorosity`/`porosity` constant when checked, else derived
+  as `saturate(roughness × (1 − metallic))`. Landscape keeps per-layer
+  porosity in the `normalHeightArray` alpha.
+- **Signed curvature** — Normal alpha when `curvatureInAlpha` is true
+  (`0.5` neutral, below = convex edges that shed, above = concave cavities
+  that collect). There is no curvature constant; without the map the concave
+  half derives from AO (`0.5 + (1 − ao) × 0.5`), which feeds states only —
+  lighting-side consumers (cavity specular occlusion via the slot's
+  `cavitySpecOcclusion` weight, subsurface scatter broadening, the convex
+  thickness fallback) require the authored map.
+- **`SurfaceResponse` settings group** — `adhesion` (0..1 constant; 0 sheds
+  every state), `shelterChannel` (`None`/`Red`/`Green`/`Blue`/`Alpha`
+  vertex-color channel painted 1 where geometry shelters the surface; which
+  states respect it is part of the definitions), and `maskR`/`maskG`/
+  `maskB`/`maskA` (runtime state names placed by the `primaryStateMasks`
+  RGBA socket instead of map-guided accumulation).
+- **AO, height, roughness, metallic, emissive** — read directly by the
+  definitions' map-guidance weights at zero extra cost.
 
-Map-guided accumulation reuses channels every material already carries, at
-zero extra cost: `aoBias` (occluded crevices collect), `heightBias` (low
-height-map areas pool and dry last), `roughnessBias` (rough areas grip,
-polished areas shed), `metalSeal` (metallic suppresses porous absorption —
-wet metal beads and glosses but never soak-darkens), and `emissiveDry`
-(glowing-hot texels suppress the state). The authored response map remains
-the hero-asset override on top of these free signals. Slot keys are sparse
-overrides of per-slot defaults: slots 0-4 default to the factory Wetness /
-Dust / Frost / Heat / Blood presets, slots 5-7 to disabled blanks. The
-pre-redesign named groups (`SurfaceStates/Wetness` … `Blood`) remain
-readable: their constants fold into the preset defaults at read time, so
-legacy documents keep their exact look without being rewritten. Consumers
-should resolve states the same way; a batch operation exists to migrate
-legacy groups into slots explicitly.
+v4 documents migrate on load: the retired `SurfaceStateResponse` socket's
+porosity constant folds onto RMAOS, its adhesion constant into
+`SurfaceResponse`, per-state `maskChannel`/`shelterChannel` selections lift
+into the `SurfaceResponse` bindings, and the retired `Primary Normal Alpha`
+layer-pattern source becomes `Constant`. Legacy `SurfaceStates/*` groups and
+response sockets that still carry an assigned map are preserved inert;
+validation flags them and Batch Operations can extract them to a definitions
+JSON and strip them.
 
-Response-map B is signed curvature: `.5` is neutral, above collects
-(cavity), below marks exposed edges that shed accumulation through each
-state's `edgeShedding` weight. Additional additive channel semantics:
+Additional additive channel semantics:
 `BentNormal` B carries the baked occlusion-cone openness (1 = open);
 `SixWayB` A is an emissive fire mask driven by the slot's `fireIntensity`;
 `SixWayA` supports `overrideOpacity`/`opacity` (default: sample texture A);
@@ -206,15 +208,19 @@ and these Primary UV socket keys:
 | Socket | Texture data | Missing-value defaults |
 | --- | --- | --- |
 | `primaryBaseColor` | sRGB RGB color, A opacity/coverage | `overrideColor=true`, color `#FFFFFF`; `overrideOpacity=true`, opacity `1.0`; tint `#FFFFFF`, scale `1.0`, blend `Base` |
-| `primaryNormal` | linear RG tangent normal, optional B height, A layer modulation | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `layerMaskInAlpha=false` |
-| `primaryRmaos` | linear R roughness, G metallic, B AO, A dielectric F0 | all `override*` fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, F0 `0.04` |
+| `primaryNormal` | linear RG tangent normal, optional B height, A signed curvature | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `curvatureInAlpha=false`, `cavitySpecOcclusion=1.0` |
+| `primaryRmaos` | linear R roughness, G metallic, B AO, A dielectric F0 or porosity | `override*` channel fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, F0 `0.04`; `alphaCarries="Dielectric F0"`, `overridePorosity=false`, porosity `0.5` |
 | `primaryEmissive` | sRGB RGB radiance, A intensity mask | color `#FFFFFF`, intensity `0.0` |
 
 A texture is sampled only when its slot has `enabled=true`, a non-empty valid
 runtime path, and the corresponding positive `override*` flag is false.
 Otherwise the constant applies. Missing or unavailable texture channels force
-their positive overrides on. RMAOS alpha must never be sampled unless
-`overrideF0=false`; its default remains `0.04`.
+their positive overrides on, with one documented exemption: `overridePorosity`
+defaults false and is never auto-forced, because an absent porosity source has
+a meaningful derived value (the roughness/metallic heuristic). RMAOS alpha is
+sampled as F0 only while `alphaCarries` is `Dielectric F0` and
+`overrideF0=false`; while alpha carries porosity, F0 always uses its constant
+(default `0.04`).
 
 The runtime feature mask is derived rather than serialized. The initial bit
 assignments are:
@@ -228,8 +234,10 @@ assignments are:
 | 4 | `RmaosRoughness` | bit 3 and `overrideRoughness=false` |
 | 5 | `RmaosMetallic` | bit 3 and `overrideMetallic=false` |
 | 6 | `RmaosAo` | bit 3 and `overrideAo=false` |
-| 7 | `RmaosF0` | bit 3 and `overrideF0=false` |
+| 7 | `RmaosF0` | bit 3, `overrideF0=false`, and `alphaCarries="Dielectric F0"` |
 | 8 | `EmissiveTexture` | enabled, valid `primaryEmissive` path |
+| 9 | `NormalCurvature` | bit 1 and `curvatureInAlpha=true` |
+| 10 | `RmaosPorosity` | bit 3 and `alphaCarries="Porosity"` |
 
 These are parser/cache feature bits, not the older BGSM CB2 sentinel. Secondary
 UV, specialized shaders, and other sockets remain parseable authoring data but
@@ -257,16 +265,18 @@ does not make the whole PBRM envelope unparsable.
 
 ## Errors, fallback, and migration
 
-Invalid magic, either version not equal to `4`, an invalid payload size,
-malformed/non-object JSON, an unknown schema, an empty shader name, wrong root
-field types, and malformed requirement versions are hard parse errors. An
-unknown non-empty shader name is valid but runtime-unsupported.
+Invalid magic, an envelope/schema version other than `4` or `5`, an invalid
+payload size, malformed/non-object JSON, an unknown schema, an empty shader
+name, wrong root field types, and malformed requirement versions are hard
+parse errors. An unknown non-empty shader name is valid but
+runtime-unsupported.
 
-There is no implicit migration from PBRM versions 1-3 and no best-effort read of
-future versions. Additive optional fields, slots, and requirements remain v4.
-Existing names, channel meanings, and defaults are stable. Only an incompatible
-semantic or structural change may use a new envelope/schema version (v5), and
-that change requires an explicit migrator.
+v4 reads through the in-memory migration described above and saves as v5.
+There is no implicit migration from PBRM versions 1-3 and no best-effort read
+of future versions. Additive optional fields, slots, and requirements remain
+v5. Existing names, channel meanings, and defaults are stable. Only an
+incompatible semantic or structural change may use a new envelope/schema
+version (v6), and that change requires an explicit migrator.
 
 PBRM is standalone. A NIF directly references its `.pbrm`; no same-name BGSM or
 BGEM is consulted. An invalid, unsupported, or requirements-incompatible PBRM
@@ -286,7 +296,7 @@ The exact typed JSON contracts used by tests live in:
 - `tests/fixtures/secondary-uv.json`
 - `tests/fixtures/landscape.json`
 
-The test suite wraps each JSON fixture in the v4 binary envelope, parses it,
+The test suite wraps each JSON fixture in the v5 binary envelope, parses it,
 compares the complete typed JSON object, saves it again, and compares the exact
 compact payload. The JSON files are text-form golden sources so format changes
 remain reviewable.
