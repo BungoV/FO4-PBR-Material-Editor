@@ -1004,6 +1004,32 @@ int main(int argc, char* argv[])
         const Converter::JobResult dry = Converter::convertMaterial(buildConvMaterial(QStringLiteral("conv3.bgsm")), dryOptions, &dryCache);
         check(dry.converted && QDir(dryOut.path()).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty(),
             QStringLiteral("dry run reports the conversion without writing"));
+
+        // Texture-free BGEM (editor markers, colored glass): a constants-only
+        // sibling, not a failure — the FO76 effects sweep is full of these.
+        MaterialBuilder markerBuilder;
+        markerBuilder.header(BgemSig, 2, false, 1.0f);
+        for (int i = 0; i < 5; ++i) markerBuilder.str(QString()); // v2: base/greyscale/envmap/normal/envmapMask
+        markerBuilder.boolean(false); markerBuilder.boolean(false);
+        markerBuilder.boolean(false); markerBuilder.boolean(false); markerBuilder.boolean(false); markerBuilder.boolean(false);
+        markerBuilder.color(.2f, .5f, .9f); markerBuilder.f32(2.0f);
+        markerBuilder.f32(0); markerBuilder.f32(0); markerBuilder.f32(0); markerBuilder.f32(0);
+        markerBuilder.f32(0); markerBuilder.u8(0); markerBuilder.f32(0);
+        const QString markerPath = QDir(convRoot.path()).filePath(QStringLiteral("materials/armor/marker.bgem"));
+        QFile markerFile(markerPath);
+        markerFile.open(QIODevice::WriteOnly);
+        markerFile.write(markerBuilder.data);
+        markerFile.close();
+        const Converter::JobResult marker = Converter::convertMaterial(markerPath, jobOptions, &textureCache);
+        check(marker.converted && marker.errors.isEmpty(),
+            QStringLiteral("texture-free BGEM converts: %1").arg(marker.errors.join(QStringLiteral("; "))));
+        Pbr::MaterialDocument markerDoc;
+        const Pbr::TextureSlotState markerBase = markerDoc.load(marker.pbrmPath, nullptr)
+            ? markerDoc.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryBaseColor")) : Pbr::TextureSlotState{};
+        check(markerBase.enabled && markerBase.path.isEmpty()
+            && markerBase.values.value(QStringLiteral("overrideColor")).toBool(false)
+            && QColor(markerBase.values.value(QStringLiteral("color")).toString()).blue() > 200,
+            QStringLiteral("constants-only sibling carries the effect color with no texture"));
     }
 
     {

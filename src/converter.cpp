@@ -206,6 +206,32 @@ JobResult convertMaterial(const QString& materialPath, const JobOptions& options
     bool missingCritical = false;
     const QImage diffuse = loadSource(diffusePath, options.textureRoot, &result.notes, QStringLiteral("diffuse"), &missingCritical);
     if (diffuse.isNull()) {
+        if (bgem && diffusePath.trimmed().isEmpty()) {
+            // Texture-free effect material (editor markers, colored glass):
+            // the whole appearance is the constant color — a constants-only
+            // sibling is the correct conversion, not a failure.
+            Pbr::MaterialDocument document;
+            mapParameters(material, &document, &result.notes);
+            Pbr::TextureSlotState base;
+            base.enabled = true;
+            base.expanded = false;
+            base.values = QJsonObject{
+                {QStringLiteral("overrideColor"), true},
+                {QStringLiteral("color"), QColor::fromRgbF(material.baseColor.x(), material.baseColor.y(), material.baseColor.z()).name()},
+                {QStringLiteral("overrideOpacity"), true},
+                {QStringLiteral("opacity"), double(material.alpha)}};
+            document.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primaryBaseColor"), base);
+            result.notes.append(QStringLiteral("texture-free effect material: constants-only sibling"));
+            if (!options.dryRun) {
+                QDir().mkpath(QFileInfo(result.pbrmPath).absolutePath());
+                if (!document.save(result.pbrmPath, &error)) {
+                    result.errors.append(QStringLiteral("sibling save failed: ") + error);
+                    return result;
+                }
+            }
+            result.converted = true;
+            return result;
+        }
         result.errors.append(QStringLiteral("no usable diffuse/base texture"));
         result.flagged = true;
         return result;
