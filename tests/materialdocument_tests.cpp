@@ -2,6 +2,7 @@
 #include "converter.h"
 #include "convertercore.h"
 #include "normalderive.h"
+#include "geometryao.h"
 #include "maskpaint.h"
 #include "materialdocument.h"
 #include "disclosureicon.h"
@@ -1126,6 +1127,49 @@ int main(int argc, char* argv[])
             check(masked.converted && masked.metalCoverage < 0.05f && first.metalCoverage > 0.9f,
                 QStringLiteral("correction mask forces the inferred metal to dielectric (%1 -> %2)")
                     .arg(first.metalCoverage).arg(masked.metalCoverage));
+        }
+
+        // ---- Geometry AO: a plate under a lid reads occluded; alone it
+        // reads open. (CPU depth-map bake, docs/FO4-Conversion.md.)
+        {
+            const auto plate = [](float y, bool facingUp, float uMin, float uMax) {
+                QVector<PreviewVertex> vertices;
+                for (int corner = 0; corner < 4; ++corner) {
+                    PreviewVertex vertex;
+                    const float x = (corner == 1 || corner == 2) ? 1.0f : -1.0f;
+                    const float z = (corner >= 2) ? 1.0f : -1.0f;
+                    vertex.position = QVector3D(x, y, z);
+                    vertex.normal = QVector3D(0, facingUp ? 1.0f : -1.0f, 0);
+                    vertex.uv0 = QVector2D(uMin + (x * 0.5f + 0.5f) * (uMax - uMin), z * 0.5f + 0.5f);
+                    vertices.append(vertex);
+                }
+                return vertices;
+            };
+            const auto addPlate = [](PreviewMesh& mesh, const QVector<PreviewVertex>& vertices, bool flip) {
+                const quint32 base = quint32(mesh.vertices.size());
+                mesh.vertices += vertices;
+                const quint32 order[6] = {0, 1, 2, 0, 2, 3};
+                const quint32 flipped[6] = {0, 2, 1, 0, 3, 2};
+                for (quint32 index : (flip ? flipped : order)) mesh.indices.append(base + index);
+            };
+            GeometryAO::Options aoOptions;
+            aoOptions.mapSize = 64;
+            aoOptions.depthSize = 128;
+            aoOptions.directions = 48;
+            aoOptions.dilate = 0;
+
+            PreviewMesh lone;
+            addPlate(lone, plate(0.0f, true, 0.05f, 0.45f), false);
+            lone.radius = 1.5f;
+            const QImage loneAo = GeometryAO::bake(lone, aoOptions);
+            check(!loneAo.isNull() && qGray(loneAo.pixel(16, 32)) > 215,
+                QStringLiteral("a lone plate bakes open geometry AO (%1)").arg(qGray(loneAo.pixel(16, 32))));
+
+            PreviewMesh covered = lone;
+            addPlate(covered, plate(0.35f, false, 0.55f, 0.95f), true); // lid close above, facing down
+            const QImage coveredAo = GeometryAO::bake(covered, aoOptions);
+            check(!coveredAo.isNull() && qGray(coveredAo.pixel(16, 32)) < 160,
+                QStringLiteral("a lid above the plate darkens its geometry AO (%1)").arg(qGray(coveredAo.pixel(16, 32))));
         }
     }
 

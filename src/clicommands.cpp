@@ -1,6 +1,7 @@
 #include "clicommands.h"
 
 #include "converter.h"
+#include "geometryao.h"
 #include "materialdocument.h"
 #include "texturearchive.h"
 #include "texturecache.h"
@@ -455,6 +456,45 @@ int runPack(const QStringList& args)
     return 0;
 }
 
+int runBakeAo(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--mesh"), QStringLiteral("--out"),
+        QStringLiteral("--size"), QStringLiteral("--directions"), QStringLiteral("--strength")});
+    const QString meshPath = options.value(QStringLiteral("--mesh"));
+    const QString outPath = options.value(QStringLiteral("--out"));
+    if (meshPath.isEmpty() || outPath.isEmpty()) {
+        out() << "usage: pbrm bake-ao --mesh <nif or fbx> --out <image> [--size <px>]\n"
+                 "                    [--directions <n>] [--strength <exp>]\n" << Qt::flush;
+        return 2;
+    }
+    QString error;
+    PreviewMesh mesh = meshPath.endsWith(QStringLiteral(".fbx"), Qt::CaseInsensitive)
+        ? PreviewMeshes::loadStaticFbx(meshPath, &error)
+        : PreviewMeshes::loadStaticNif(meshPath, &error);
+    if (!mesh.isValid()) {
+        out() << meshPath << ": error: " << (error.isEmpty() ? QStringLiteral("mesh invalid") : error) << "\n" << Qt::flush;
+        return 1;
+    }
+    GeometryAO::Options aoOptions;
+    if (options.has(QStringLiteral("--size"))) aoOptions.mapSize = options.value(QStringLiteral("--size")).toInt();
+    if (options.has(QStringLiteral("--directions"))) aoOptions.directions = options.value(QStringLiteral("--directions")).toInt();
+    if (options.has(QStringLiteral("--strength"))) aoOptions.strength = options.value(QStringLiteral("--strength")).toFloat();
+    QStringList notes;
+    const QImage baked = GeometryAO::bake(mesh, aoOptions, &notes);
+    if (baked.isNull()) {
+        out() << meshPath << ": error: bake produced no image\n" << Qt::flush;
+        return 1;
+    }
+    QDir().mkpath(QFileInfo(outPath).absolutePath());
+    if (!baked.save(outPath)) {
+        out() << outPath << ": error: could not write the AO image\n" << Qt::flush;
+        return 1;
+    }
+    for (const QString& note : notes) out() << note << "\n";
+    out() << "wrote " << outPath << "\n" << Qt::flush;
+    return 0;
+}
+
 int runMaterialInfo(const QStringList& args)
 {
     const Options options = parseOptions(args, {});
@@ -798,6 +838,7 @@ QString helpText()
         "  convert             convert FO4/FO76 .bgsm/.bgem materials + textures to PBR\n"
         "                      (incremental via the manifest; --force re-runs, --clean rolls back)\n"
         "  material-info       dump parsed .bgsm/.bgem fields (textures, scalars, flags)\n"
+        "  bake-ao             bake geometry AO from a reference mesh to an image\n"
         "\n"
         "common options: --json (machine-readable reports), --dry-run (report only),\n"
         "  --texture-root <dir> (explicit source root; editor settings are the fallback)\n");
@@ -817,6 +858,7 @@ int runVerb(const QString& verb, const QStringList& args)
     if (verb == QLatin1String("inspect")) return runInspect(args);
     if (verb == QLatin1String("convert")) return runConvert(args);
     if (verb == QLatin1String("material-info")) return runMaterialInfo(args);
+    if (verb == QLatin1String("bake-ao")) return runBakeAo(args);
     out() << helpText() << Qt::flush;
     return verb == QLatin1String("help") || verb == QLatin1String("--help") ? 0 : 2;
 }

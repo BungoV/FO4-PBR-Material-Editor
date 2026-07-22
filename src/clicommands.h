@@ -25,6 +25,7 @@ int runPack(const QStringList& args);
 int runInspect(const QStringList& args);
 int runConvert(const QStringList& args);
 int runMaterialInfo(const QStringList& args);
+int runBakeAo(const QStringList& args);
 QString helpText();
 
 } // namespace PbrmCli

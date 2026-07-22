@@ -1,6 +1,7 @@
 #include "converter.h"
 
 #include "bgsmreader.h"
+#include "geometryao.h"
 #include "texturearchive.h"
 #include "textureimage.h"
 #include "texturewriter.h"
@@ -342,13 +343,35 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     // Detail AO joins RMAOS.B. FO76 ships baked AO in _l.G already; the
     // derived detail pass is FO4's (and an option elsewhere).
     QImage rmaos = converted.rmaos;
-    if (options.detailAo && !fallout76 && !derived.ao.isNull() && !rmaos.isNull()) {
-        const QImage ao = derived.ao.scaled(rmaos.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    const auto multiplyIntoAo = [&rmaos](const QImage& aoImage) {
+        if (aoImage.isNull() || rmaos.isNull()) return;
+        const QImage ao = aoImage.scaled(rmaos.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            .convertToFormat(QImage::Format_RGBA8888);
         for (int y = 0; y < rmaos.height(); ++y) {
             uchar* rmaosLine = rmaos.scanLine(y);
             const uchar* aoLine = ao.constScanLine(y);
             for (int x = 0; x < rmaos.width(); ++x)
                 rmaosLine[x * 4 + 2] = uchar(int(rmaosLine[x * 4 + 2]) * int(aoLine[x * 4]) / 255);
+        }
+    };
+    if (options.detailAo && !fallout76 && !derived.ao.isNull())
+        multiplyIntoAo(derived.ao);
+    // Geometry AO from the reference mesh applies to both titles: crevices
+    // the low-poly geometry casts are not in any shipped map.
+    if (!options.geometryNifPath.trimmed().isEmpty()) {
+        QString meshError;
+        PreviewMesh referenceMesh = options.geometryNifPath.endsWith(QStringLiteral(".fbx"), Qt::CaseInsensitive)
+            ? PreviewMeshes::loadStaticFbx(options.geometryNifPath, &meshError)
+            : PreviewMeshes::loadStaticNif(options.geometryNifPath, &meshError);
+        if (!referenceMesh.isValid()) {
+            result.notes.append(QStringLiteral("geometry AO skipped: ") + (meshError.isEmpty() ? QStringLiteral("mesh invalid") : meshError));
+            result.flagged = true;
+        } else {
+            GeometryAO::Options aoOptions;
+            aoOptions.directions = options.geometryAoDirections;
+            aoOptions.strength = options.geometryAoStrength;
+            const QImage geometryAo = GeometryAO::bake(referenceMesh, aoOptions, &result.notes);
+            multiplyIntoAo(geometryAo);
         }
     }
 
@@ -375,11 +398,13 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     // ---- Outputs (dedup'd, collision-safe) ----
     const QString portableDirectory = portableOutputDirectory(diffusePath, materialRelative);
     const QString baseName = baseNameForOutputs(diffusePath);
-    const QString optionsSignature = QStringLiteral("|rs%1|f%2|gc%3|em%4|sp%5|cm%6|")
+    const QString optionsSignature = QStringLiteral("|rs%1|f%2|gc%3|em%4|sp%5|cm%6|ga%7|")
         .arg(options.math.recoveryStrength).arg(fallout76).arg(options.math.glossCurve)
         .arg(material.environmentMappingMaskScale).arg(options.math.specNormalizePercentile)
         .arg(options.correctionMaskPath.isEmpty() ? QString()
-            : options.correctionMaskPath.toLower() + QString::number(QFileInfo(options.correctionMaskPath).lastModified().toSecsSinceEpoch()));
+            : options.correctionMaskPath.toLower() + QString::number(QFileInfo(options.correctionMaskPath).lastModified().toSecsSinceEpoch()))
+        .arg(options.geometryNifPath.isEmpty() ? QString()
+            : options.geometryNifPath.toLower() + QStringLiteral("~%1~%2").arg(options.geometryAoDirections).arg(options.geometryAoStrength));
     const QString pairSignature = diffusePath.toLower() + QLatin1Char('+')
         + (bgem ? QString() : material.smoothSpecTexture.toLower()) + QLatin1Char('+')
         + material.specularTexture.toLower() + QLatin1Char('+') + material.lightingTexture.toLower()

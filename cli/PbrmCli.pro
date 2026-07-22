@@ -13,6 +13,9 @@ SOURCES += main_cli.cpp \
     ../src/clicommands.cpp \
     ../src/converter.cpp \
     ../src/convertercore.cpp \
+    ../src/geometryao.cpp \
+    ../src/maskpaint.cpp \
+    ../src/previewmesh.cpp \
     ../src/normalderive.cpp \
     ../src/materialdocument.cpp \
     ../src/texturearchive.cpp \
@@ -29,3 +32,9 @@ SOURCES += ../third_party/detex/decompress-bptc.c ../third_party/detex/bits.c ..
 INCLUDEPATH += ../third_party/detex
 SOURCES += ../third_party/bc7enc/bc7enc.c
 INCLUDEPATH += ../third_party/bc7enc
+
+exists(../third_party/ufbx/ufbx.c) {
+    SOURCES += ../third_party/ufbx/ufbx.c
+    INCLUDEPATH += ../third_party/ufbx
+    DEFINES += PBRM_HAS_UFBX
+}

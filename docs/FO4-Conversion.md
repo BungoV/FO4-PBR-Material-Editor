@@ -404,7 +404,27 @@ signature + sibling exists) materials skip on re-run; `--force` overrides;
 `pbrm convert --out X --clean` removes exactly the recorded outputs (path
 containment enforced, foreign files untouched, empty dirs pruned).
 Texture-free constant-color BGEMs convert to constants-only siblings
-(overrideColor/opacity), not failures. Live-verified 2026-07-23 on FO76 (alien dielectric 0%,
+(overrideColor/opacity), not failures.
+
+**Shipped 2026-07-23 (items 1–4 of the campaign backlog):**
+- *Review loop*: Flagged ◀/▶ queue walk; per-material overrides (recovery,
+  gloss curve, spec clamp percentile) with Reconvert This.
+- *BA2-direct*: `convert` accepts `.ba2` targets (v1/v7/v8); textures
+  auto-resolve from `*.ba2` beside the texture root; root chains probe
+  archives; incremental skips key on the archive timestamp.
+- *Correction masking* (`src/maskpaint.*`): Load Reference NIF → Pick fills
+  (Triangle / position-welded Element / Submesh × Force Dielectric / Metal /
+  Back to Inferred) → Save Mask sidecar under `<out>/Masks/`, attached to
+  the material's conversions; CLI `--correction-mask`. CPU raycast picking
+  and amber fill highlight in the shared preview. Freehand projection
+  painting remains a later enhancement.
+- *Geometry AO* (`src/geometryao.*`): CPU depth-map bake (UV G-buffer +
+  sphere of ortho depth renders — the spec's algorithm without the GL
+  context, so it runs headless), UV-island analysis with stacked-duplicate
+  canonicalization, edge dilation; multiplies into RMAOS.B alongside detail
+  AO for both titles. `pbrm bake-ao` standalone; the workspace's loaded
+  reference mesh drives the bake on reconvert (x01 test mesh: 100 islands,
+  64 dirs, 512² in ~1 s). Live-verified 2026-07-23 on FO76 (alien dielectric 0%,
 gold Protectron 90% metal reconstructed warm from black diffuse), FO4 BGSM
 v1/v2 (X-02 metal trim + auto-denoise engagement + dangling-reference
 warnings surfaced honestly), and FO4 BGEM (Unlit Effect emission via

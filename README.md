@@ -218,6 +218,8 @@ pbrm convert --out <mod folder> [--texture-root <dir>] [--dry-run] [--json]
              <.bgsm/.bgem files or folders>   # FO4/FO76 -> PBR conversion
 pbrm convert --out <mod folder> --clean       # roll back exactly the recorded output
 pbrm material-info <.bgsm/.bgem files>        # parsed material field dump
+pbrm bake-ao --mesh <nif/fbx> --out <image>   # geometry AO from a reference mesh
+             [--size <px>] [--directions <n>] [--strength <exp>]
 ```
 
 `convert` writes `Materials/` + `Textures/` mirrors, same-name sibling

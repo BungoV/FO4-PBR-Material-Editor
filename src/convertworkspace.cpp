@@ -421,6 +421,9 @@ void ConvertWorkspace::startRun(bool dryRun, RunScope scope)
             rowJob.math.specNormalizePercentile = override->specPercentile;
             rowJob.correctionMaskPath = override->maskPath;
         }
+        // A loaded reference mesh also drives the geometry AO bake.
+        const auto maskState = m_masks.constFind(m_entries[row].materialPath.toLower());
+        if (maskState != m_masks.constEnd()) rowJob.geometryNifPath = maskState->nifPath;
         jobs.append(rowJob);
     }
 
