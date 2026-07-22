@@ -2,6 +2,7 @@
 #include "converter.h"
 #include "convertercore.h"
 #include "normalderive.h"
+#include "maskpaint.h"
 #include "materialdocument.h"
 #include "disclosureicon.h"
 #include "texturearchive.h"
@@ -1080,6 +1081,51 @@ int main(int argc, char* argv[])
                 && fromArchive.pbrmPath.endsWith(QStringLiteral("Materials/effects/ba2marker.pbrm")),
                 QStringLiteral("archive-direct conversion writes the materials-relative sibling: %1")
                     .arg(fromArchive.errors.join(QStringLiteral("; "))));
+        }
+
+        // ---- Correction-mask fills (docs/FO4-Conversion.md masking): two
+        // separate quads weld into two elements; a fill rasterizes only its
+        // own UV footprint; the saved mask forces the conversion's metallic.
+        {
+            PreviewMesh twoQuads;
+            const auto addQuad = [&twoQuads](float xOffset, float uOffset) {
+                const int base = int(twoQuads.vertices.size());
+                for (int corner = 0; corner < 4; ++corner) {
+                    PreviewVertex vertex;
+                    const float x = (corner == 1 || corner == 2) ? 1.0f : 0.0f;
+                    const float y = (corner >= 2) ? 1.0f : 0.0f;
+                    vertex.position = QVector3D(xOffset + x, y, 0);
+                    vertex.uv0 = QVector2D(uOffset + x * 0.4f, y);
+                    twoQuads.vertices.append(vertex);
+                }
+                for (quint32 index : {0u, 1u, 2u, 0u, 2u, 3u}) twoQuads.indices.append(quint32(base) + index);
+            };
+            addQuad(0.0f, 0.05f);   // left quad -> left UV half
+            addQuad(5.0f, 0.55f);   // right quad, far away -> right UV half
+            const QVector<int> elements = MaskPaint::triangleElements(twoQuads);
+            check(elements.size() == 4 && elements[0] == elements[1] && elements[2] == elements[3]
+                && elements[0] != elements[2],
+                QStringLiteral("position weld splits the quads into two elements"));
+            const QVector<quint32> leftTriangles = MaskPaint::trianglesInElement(twoQuads, elements, 0);
+            check(leftTriangles == QVector<quint32>({0u, 1u}),
+                QStringLiteral("element fill collects exactly the connected triangles"));
+            QImage mask = MaskPaint::neutralMask(128);
+            MaskPaint::rasterizeFill(mask, twoQuads, leftTriangles, 0.0f);
+            check(qGray(mask.pixel(32, 64)) < 40 && qGray(mask.pixel(96, 64)) > 100,
+                QStringLiteral("fill rasterizes its own UV footprint and leaves the rest neutral"));
+
+            // Full-dielectric mask over the synthetic metal: coverage collapses.
+            QImage forceDielectric = MaskPaint::neutralMask(64);
+            forceDielectric.fill(QColor(0, 0, 0, 255));
+            const QString maskPath = QDir(convRoot.path()).filePath(QStringLiteral("force_dielectric.png"));
+            forceDielectric.save(maskPath);
+            Converter::JobOptions maskedOptions = jobOptions;
+            maskedOptions.correctionMaskPath = maskPath;
+            const Converter::JobResult masked = Converter::convertMaterial(buildConvMaterial(QStringLiteral("conv4.bgsm")),
+                maskedOptions, &textureCache);
+            check(masked.converted && masked.metalCoverage < 0.05f && first.metalCoverage > 0.9f,
+                QStringLiteral("correction mask forces the inferred metal to dielectric (%1 -> %2)")
+                    .arg(first.metalCoverage).arg(masked.metalCoverage));
         }
     }
 

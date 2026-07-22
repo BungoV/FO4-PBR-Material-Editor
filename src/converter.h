@@ -20,6 +20,7 @@ struct JobOptions {
     NormalDerive::Options derive;
     QString outputRoot;        // the output mod folder (Materials/ + Textures/ grow inside)
     QString textureRoot;       // source resolution root; editor sources as fallback
+    QString correctionMaskPath; // 0.5-neutral metallic correction (R channel); loose path or absolute
     bool dryRun = false;
     bool detailAo = true;      // FO4 default on; FO76 keeps its shipped AO
     bool heightInBlue = false; // pack derived height into Normal.B

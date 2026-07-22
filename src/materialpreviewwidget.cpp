@@ -245,10 +245,10 @@ PbrPreviewGL::~PbrPreviewGL()
     m_prefilteredEnvironmentTexture.reset(); m_brdfLutTexture.reset();
     m_secondaryBaseTexture.reset(); m_secondaryNormalTexture.reset(); m_secondaryRmaosTexture.reset(); m_secondaryEmissiveTexture.reset(); m_layerCoverageTexture.reset(); m_gradientTexture.reset();m_specialTextureArray.reset();
     m_vertexBuffer.destroy(); m_indexBuffer.destroy(); m_groundVertexBuffer.destroy(); m_groundIndexBuffer.destroy();
-    m_gridBuffer.destroy();
+    m_gridBuffer.destroy(); m_highlightIndexBuffer.destroy();
     if (m_shadowDepthTexture) glDeleteTextures(1, &m_shadowDepthTexture);
     if (m_shadowFramebuffer) glDeleteFramebuffers(1, &m_shadowFramebuffer);
-    m_vao.reset(); m_groundVao.reset(); m_gridVao.reset(); m_lineProgram.reset(); m_program.reset(); m_backgroundProgram.reset();
+    m_vao.reset(); m_groundVao.reset(); m_gridVao.reset(); m_highlightVao.reset(); m_lineProgram.reset(); m_program.reset(); m_backgroundProgram.reset();
     m_environmentPrefilterProgram.reset(); m_brdfIntegrationProgram.reset(); m_shadowProgram.reset();
     doneCurrent();
 }
@@ -1307,8 +1307,10 @@ void PbrPreviewGL::initializeGL()
     m_lineProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, R"GLSL(
         #version 330 core
         in vec4 vColor;
+        uniform bool uUseConstant;
+        uniform vec4 uConstantColor;
         out vec4 fragColor;
-        void main(){fragColor=vColor;}
+        void main(){fragColor=uUseConstant?uConstantColor:vColor;}
     )GLSL");
     m_lineProgram->link();
     m_gridVao = std::make_unique<QOpenGLVertexArrayObject>(); m_gridVao->create();
@@ -2795,6 +2797,8 @@ void PbrPreviewGL::createBrdfLut()
 void PbrPreviewGL::uploadMesh()
 {
     if (!m_mesh.isValid() || !m_program || !m_program->isLinked()) return;
+    // A new mesh invalidates any correction-mask highlight indices.
+    m_highlightTriangles.clear(); m_highlightIndexCount = 0; m_highlightDirty = false;
     m_program->bind(); m_vao->bind();
     m_vertexBuffer.bind(); m_vertexBuffer.allocate(m_mesh.vertices.constData(), int(m_mesh.vertices.size()*sizeof(PreviewVertex)));
     m_indexBuffer.bind(); m_indexBuffer.allocate(m_mesh.indices.constData(), int(m_mesh.indices.size()*sizeof(quint32)));
@@ -2865,6 +2869,52 @@ void PbrPreviewGL::buildGridGeometry()
     m_gridVao->release();
 }
 
+void PbrPreviewGL::drawMaskHighlight()
+{
+    if(m_highlightTriangles.isEmpty()||!m_lineProgram||!m_lineProgram->isLinked()||!m_mesh.isValid())return;
+    if(m_highlightDirty){
+        QVector<quint32> indices;
+        indices.reserve(m_highlightTriangles.size()*3);
+        for(quint32 triangle:m_highlightTriangles){
+            const qsizetype base=qsizetype(triangle)*3;
+            if(base+2>=m_mesh.indices.size())continue;
+            indices.append(m_mesh.indices[base]);
+            indices.append(m_mesh.indices[base+1]);
+            indices.append(m_mesh.indices[base+2]);
+        }
+        if(!m_highlightVao){m_highlightVao=std::make_unique<QOpenGLVertexArrayObject>();m_highlightVao->create();}
+        if(!m_highlightIndexBuffer.isCreated())m_highlightIndexBuffer.create();
+        m_highlightVao->bind();
+        m_vertexBuffer.bind();
+        m_lineProgram->bind();
+        m_lineProgram->enableAttributeArray(0);
+        m_lineProgram->setAttributeBuffer(0,GL_FLOAT,offsetof(PreviewVertex,position),3,sizeof(PreviewVertex));
+        glDisableVertexAttribArray(1);
+        m_highlightIndexBuffer.bind();
+        m_highlightIndexBuffer.allocate(indices.constData(),int(indices.size()*sizeof(quint32)));
+        m_lineProgram->release();
+        m_highlightVao->release();
+        m_highlightIndexCount=int(indices.size());
+        m_highlightDirty=false;
+    }
+    if(!m_highlightIndexCount)return;
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_POLYGON_OFFSET_FILL);glPolygonOffset(-1.5f,-2.0f);
+    m_lineProgram->bind();
+    m_lineProgram->setUniformValue("uViewProjection",projectionMatrix()*viewMatrix()*objectModelMatrix());
+    m_lineProgram->setUniformValue("uUseConstant",true);
+    m_lineProgram->setUniformValue("uConstantColor",QVector4D(0.95f,0.55f,0.15f,0.35f)); // amber fill wash
+    m_highlightVao->bind();
+    glDrawElements(GL_TRIANGLES,m_highlightIndexCount,GL_UNSIGNED_INT,nullptr);
+    m_lineProgram->setUniformValue("uUseConstant",false);
+    m_highlightVao->release();
+    m_lineProgram->release();
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
 void PbrPreviewGL::drawGrid()
 {
     if(!m_gridEnabled||!m_lineProgram||!m_lineProgram->isLinked()||m_shape==Shape::Plane)return;
@@ -2872,6 +2922,7 @@ void PbrPreviewGL::drawGrid()
     glDepthMask(GL_FALSE);
     m_lineProgram->bind();
     m_lineProgram->setUniformValue("uViewProjection",projectionMatrix()*viewMatrix());
+    m_lineProgram->setUniformValue("uUseConstant",false);
     m_gridVao->bind();
     glDrawArrays(GL_LINES,0,m_gridVertexCount);
     m_gridVao->release();
@@ -3025,6 +3076,60 @@ void PbrPreviewGL::setGridEnabled(bool enabled)
 {
     if(m_gridEnabled==enabled)return;
     m_gridEnabled=enabled;update();
+}
+
+void PbrPreviewGL::setTrianglePickingEnabled(bool enabled)
+{
+    m_trianglePicking=enabled;
+    setCursor(enabled?Qt::CrossCursor:Qt::ArrowCursor);
+    if(!enabled)unsetCursor();
+}
+
+int PbrPreviewGL::pickTriangle(const QPointF& widgetPos) const
+{
+    if(!m_mesh.isValid())return -1;
+    // Widget point -> world ray, then bring the ray into OBJECT space so the
+    // CPU intersection runs against the raw vertex data.
+    const float ndcX=float(widgetPos.x())/float(std::max(width(),1))*2.0f-1.0f;
+    const float ndcY=1.0f-float(widgetPos.y())/float(std::max(height(),1))*2.0f;
+    const QMatrix4x4 inverse=(projectionMatrix()*viewMatrix()).inverted();
+    const QVector4D nearPoint4=inverse*QVector4D(ndcX,ndcY,-1.0f,1.0f);
+    const QVector4D farPoint4=inverse*QVector4D(ndcX,ndcY,1.0f,1.0f);
+    if(qFuzzyIsNull(nearPoint4.w())||qFuzzyIsNull(farPoint4.w()))return -1;
+    const QMatrix4x4 modelInverse=objectModelMatrix().inverted();
+    const QVector3D origin=modelInverse.map(nearPoint4.toVector3DAffine());
+    const QVector3D target=modelInverse.map(farPoint4.toVector3DAffine());
+    const QVector3D direction=(target-origin).normalized();
+
+    int best=-1;
+    float bestDistance=std::numeric_limits<float>::max();
+    for(qsizetype i=0;i+2<m_mesh.indices.size();i+=3){
+        const QVector3D& a=m_mesh.vertices[int(m_mesh.indices[i])].position;
+        const QVector3D& b=m_mesh.vertices[int(m_mesh.indices[i+1])].position;
+        const QVector3D& c=m_mesh.vertices[int(m_mesh.indices[i+2])].position;
+        // Möller–Trumbore, two-sided.
+        const QVector3D edge1=b-a,edge2=c-a;
+        const QVector3D h=QVector3D::crossProduct(direction,edge2);
+        const float det=QVector3D::dotProduct(edge1,h);
+        if(std::abs(det)<1e-9f)continue;
+        const float invDet=1.0f/det;
+        const QVector3D s=origin-a;
+        const float u=invDet*QVector3D::dotProduct(s,h);
+        if(u<0.0f||u>1.0f)continue;
+        const QVector3D q=QVector3D::crossProduct(s,edge1);
+        const float v=invDet*QVector3D::dotProduct(direction,q);
+        if(v<0.0f||u+v>1.0f)continue;
+        const float t=invDet*QVector3D::dotProduct(edge2,q);
+        if(t>1e-5f&&t<bestDistance){bestDistance=t;best=int(i/3);}
+    }
+    return best;
+}
+
+void PbrPreviewGL::setHighlightTriangles(const QVector<quint32>& triangles)
+{
+    m_highlightTriangles=triangles;
+    m_highlightDirty=true;
+    update();
 }
 
 void PbrPreviewGL::setFreeCamera(bool enabled)
@@ -3482,6 +3587,7 @@ void PbrPreviewGL::paintGL()
     }
     if(m_debugView==DebugView::Wireframe)glPolygonMode(GL_FRONT_AND_BACK,GL_FILL);
     m_vao->release();m_program->release();
+    drawMaskHighlight();
     drawGrid(); // inside the MSAA pass so the lines resolve smooth
     if(m_msaaSamples>1&&m_msaaFbo){
         glBindFramebuffer(GL_READ_FRAMEBUFFER,m_msaaFbo->handle());
@@ -3499,6 +3605,11 @@ void PbrPreviewGL::mousePressEvent(QMouseEvent* event)
         if(event->button()==Qt::LeftButton)setFreeCamera(false);      // confirm the flown position
         else if(event->button()==Qt::RightButton)cancelFreeCamera();  // back to where the flight started
         event->accept();return;
+    }
+    if(m_trianglePicking&&event->button()==Qt::LeftButton&&!(event->modifiers()&(Qt::ShiftModifier|Qt::ControlModifier))
+        &&navGizmoHitTest(event->position())<0){
+        const int triangle=pickTriangle(event->position());
+        if(triangle>=0){emit meshTrianglePicked(triangle);event->accept();return;}
     }
     if(event->button()==Qt::LeftButton){
         const int hit=navGizmoHitTest(event->position());

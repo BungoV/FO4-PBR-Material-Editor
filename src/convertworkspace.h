@@ -8,6 +8,7 @@
 #include <atomic>
 
 class QCheckBox;
+class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
@@ -47,6 +48,13 @@ private:
         float recovery = 1.0f;
         float glossCurve = 1.0f;
         float specPercentile = 0.98f;
+        QString maskPath;      // saved correction-mask sidecar for this material
+    };
+    // In-session mask painting state for the selected material.
+    struct MaskState {
+        QImage mask;                       // 0.5-neutral, R = correction
+        QVector<quint32> filledTriangles;  // for the viewport highlight
+        QString nifPath;
     };
     enum class RunScope { All, Checked, CurrentRow };
 
@@ -62,6 +70,11 @@ private:
     void updateFlaggedSummary();
     void stepFlagged(int direction);
     void loadOverrideControls();
+    void loadMaskReference();
+    void handleTrianglePicked(int triangle);
+    void clearMaskFills();
+    void saveMask();
+    QString currentMaterialKey() const;
     Converter::JobOptions collectOptions(bool dryRun) const;
     void persistSettings() const;
 
@@ -92,8 +105,18 @@ private:
     QDoubleSpinBox* m_overrideGlossCurve = nullptr;
     QDoubleSpinBox* m_overrideSpecPercentile = nullptr;
     QPushButton* m_reconvertButton = nullptr;
+    QPushButton* m_maskLoadNif = nullptr;
+    QComboBox* m_maskFillMode = nullptr;
+    QComboBox* m_maskFillValue = nullptr;
+    QCheckBox* m_maskPickEnabled = nullptr;
+    QPushButton* m_maskClear = nullptr;
+    QPushButton* m_maskSave = nullptr;
+    QLabel* m_maskStatus = nullptr;
 
     QHash<QString, MaterialOverride> m_overrides;
+    QHash<QString, MaskState> m_masks;
+    QVector<int> m_maskElements;      // cached element ids for the loaded mesh
+    QString m_maskElementsFor;        // nif path the cache belongs to
     QVector<QueueEntry> m_entries;
     QThread* m_worker = nullptr;
     std::atomic<bool> m_cancelRequested{false};

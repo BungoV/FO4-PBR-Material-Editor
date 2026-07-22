@@ -15,6 +15,7 @@ SOURCES += \
     src/converter.cpp \
     src/convertercore.cpp \
     src/convertworkspace.cpp \
+    src/maskpaint.cpp \
     src/normalderive.cpp \
     src/materialdocument.cpp \
     src/texturearchive.cpp \
@@ -41,6 +42,7 @@ HEADERS += \
     src/converter.h \
     src/convertercore.h \
     src/convertworkspace.h \
+    src/maskpaint.h \
     src/normalderive.h \
     src/materialdocument.h \
     src/texturearchive.h \

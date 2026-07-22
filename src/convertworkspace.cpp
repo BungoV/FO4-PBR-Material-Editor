@@ -1,9 +1,11 @@
 #include "convertworkspace.h"
 
+#include "maskpaint.h"
 #include "materialdocument.h"
 #include "materialpreviewwidget.h"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDir>
 #include <QDirIterator>
 #include <QDoubleSpinBox>
@@ -219,9 +221,12 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
         const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
         if (row < 0 || row >= m_entries.size()) return;
         const QString key = m_entries[row].materialPath.toLower();
+        const QString maskPath = m_overrides.value(key).maskPath; // survives the toggle
         if (m_overrideEnabled->isChecked()) {
             m_overrides.insert(key, {float(m_overrideRecovery->value()), float(m_overrideGlossCurve->value()),
-                float(m_overrideSpecPercentile->value())});
+                float(m_overrideSpecPercentile->value()), maskPath});
+        } else if (!maskPath.isEmpty()) {
+            m_overrides.insert(key, {1.0f, 1.0f, 0.98f, maskPath});
         } else {
             m_overrides.remove(key);
         }
@@ -230,6 +235,43 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     connect(m_overrideRecovery, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
     connect(m_overrideGlossCurve, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
     connect(m_overrideSpecPercentile, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
+
+    // Correction masking: load the material's reference NIF, click parts in
+    // the preview to force dielectric/metal, save the 0.5-neutral sidecar.
+    auto* maskRow = new QHBoxLayout();
+    maskRow->setSpacing(9);
+    m_maskLoadNif = new QPushButton(tr("Load Reference NIF…"), main);
+    m_maskLoadNif->setToolTip(tr("Show the material's mesh in the preview so fills can be picked in 3D."));
+    connect(m_maskLoadNif, &QPushButton::clicked, this, &ConvertWorkspace::loadMaskReference);
+    maskRow->addWidget(m_maskLoadNif);
+    m_maskPickEnabled = new QCheckBox(tr("Pick fills"), main);
+    m_maskPickEnabled->setToolTip(tr("While checked, clicking the mesh applies the fill; camera drags still work."));
+    connect(m_maskPickEnabled, &QCheckBox::toggled, this, [this](bool on) {
+        m_preview->canvas()->setTrianglePickingEnabled(on);
+    });
+    maskRow->addWidget(m_maskPickEnabled);
+    maskRow->addWidget(new QLabel(tr("Fill"), main));
+    m_maskFillMode = new QComboBox(main);
+    m_maskFillMode->addItems({tr("Triangle"), tr("Element"), tr("Submesh")});
+    m_maskFillMode->setCurrentIndex(1);
+    m_maskFillMode->setToolTip(tr("Triangle fills one face; Element fills the connected part under the click (position-welded); Submesh fills the whole shape."));
+    maskRow->addWidget(m_maskFillMode);
+    m_maskFillValue = new QComboBox(main);
+    m_maskFillValue->addItem(tr("Force Dielectric"), 0.0);
+    m_maskFillValue->addItem(tr("Force Metal"), 1.0);
+    m_maskFillValue->addItem(tr("Back to Inferred"), 0.5);
+    m_maskFillValue->setToolTip(tr("What the fill paints into the 0.5-neutral correction mask."));
+    maskRow->addWidget(m_maskFillValue);
+    m_maskClear = new QPushButton(tr("Clear Mask"), main);
+    connect(m_maskClear, &QPushButton::clicked, this, &ConvertWorkspace::clearMaskFills);
+    maskRow->addWidget(m_maskClear);
+    m_maskSave = new QPushButton(tr("Save Mask"), main);
+    m_maskSave->setToolTip(tr("Write the sidecar and attach it to this material's conversions."));
+    connect(m_maskSave, &QPushButton::clicked, this, &ConvertWorkspace::saveMask);
+    maskRow->addWidget(m_maskSave);
+    m_maskStatus = new QLabel(main);
+    maskRow->addWidget(m_maskStatus, 1);
+    mainLayout->addLayout(maskRow);
 
     auto* detailTitle = new QLabel(tr("Findings"), main);
     mainLayout->addWidget(detailTitle);
@@ -243,6 +285,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     // selected material's CONVERTED sibling with the output mod folder as
     // its texture root.
     m_preview = new MaterialPreviewWidget(splitter);
+    connect(m_preview->canvas(), &PbrPreviewGL::meshTrianglePicked, this, &ConvertWorkspace::handleTrianglePicked);
     splitter->addWidget(m_preview);
     splitter->setSizes({430, 620, 310});
     splitter->setStretchFactor(0, 0);
@@ -376,6 +419,7 @@ void ConvertWorkspace::startRun(bool dryRun, RunScope scope)
             rowJob.math.recoveryStrength = override->recovery;
             rowJob.math.glossCurve = override->glossCurve;
             rowJob.math.specNormalizePercentile = override->specPercentile;
+            rowJob.correctionMaskPath = override->maskPath;
         }
         jobs.append(rowJob);
     }
@@ -539,6 +583,109 @@ void ConvertWorkspace::updatePreview(const QueueEntry* entry)
     }
     // Nothing converted on disk for this row (or no row): neutral material.
     m_preview->setMaterial(Pbr::MaterialDocument());
+}
+
+QString ConvertWorkspace::currentMaterialKey() const
+{
+    QTreeWidgetItem* item = m_queue->currentItem();
+    const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
+    return row >= 0 && row < m_entries.size() ? m_entries[row].materialPath.toLower() : QString();
+}
+
+void ConvertWorkspace::loadMaskReference()
+{
+    const QString key = currentMaterialKey();
+    if (key.isEmpty()) { m_maskStatus->setText(tr("Select a material first.")); return; }
+    const QString start = QFileInfo(QDir::fromNativeSeparators(m_sourceEdit->text())).absolutePath();
+    const QString path = QFileDialog::getOpenFileName(this, tr("Choose the reference mesh"), start,
+        tr("Meshes (*.nif *.fbx)"));
+    if (path.isEmpty()) return;
+    QString error;
+    if (!m_preview->canvas()->loadCustomMesh(path, &error)) {
+        m_maskStatus->setText(tr("Mesh failed: %1").arg(error));
+        return;
+    }
+    m_preview->canvas()->setShape(PbrPreviewGL::Shape::Custom);
+    MaskState& state = m_masks[key];
+    state.nifPath = path;
+    if (state.mask.isNull()) state.mask = MaskPaint::neutralMask();
+    m_maskElements.clear();
+    m_maskElementsFor.clear();
+    m_maskPickEnabled->setChecked(true);
+    m_preview->canvas()->setHighlightTriangles(state.filledTriangles);
+    m_maskStatus->setText(tr("%1 — click parts to fill").arg(QFileInfo(path).fileName()));
+}
+
+void ConvertWorkspace::handleTrianglePicked(int triangle)
+{
+    const QString key = currentMaterialKey();
+    if (key.isEmpty() || triangle < 0) return;
+    const PreviewMesh& mesh = m_preview->canvas()->mesh();
+    if (!mesh.isValid()) return;
+    MaskState& state = m_masks[key];
+    if (state.mask.isNull()) state.mask = MaskPaint::neutralMask();
+
+    QVector<quint32> triangles;
+    switch (m_maskFillMode->currentIndex()) {
+    case 0: triangles.append(quint32(triangle)); break;
+    case 1: {
+        if (m_maskElementsFor != mesh.sourcePath || m_maskElements.isEmpty()) {
+            m_maskElements = MaskPaint::triangleElements(mesh);
+            m_maskElementsFor = mesh.sourcePath;
+        }
+        triangles = MaskPaint::trianglesInElement(mesh, m_maskElements, triangle);
+        break;
+    }
+    default: triangles = MaskPaint::trianglesInSubmesh(mesh, triangle); break;
+    }
+    if (triangles.isEmpty()) return;
+
+    const float value = float(m_maskFillValue->currentData().toDouble());
+    MaskPaint::rasterizeFill(state.mask, mesh, triangles, value);
+    if (qFuzzyCompare(value, 0.5f)) {
+        for (quint32 filled : triangles) state.filledTriangles.removeAll(filled);
+    } else {
+        for (quint32 filled : triangles)
+            if (!state.filledTriangles.contains(filled)) state.filledTriangles.append(filled);
+    }
+    m_preview->canvas()->setHighlightTriangles(state.filledTriangles);
+    m_maskStatus->setText(tr("%n triangle(s) filled — Save Mask to apply", nullptr, int(state.filledTriangles.size())));
+}
+
+void ConvertWorkspace::clearMaskFills()
+{
+    const QString key = currentMaterialKey();
+    if (key.isEmpty()) return;
+    MaskState& state = m_masks[key];
+    state.mask = MaskPaint::neutralMask();
+    state.filledTriangles.clear();
+    m_preview->canvas()->setHighlightTriangles({});
+    m_overrides[key].maskPath.clear();
+    m_maskStatus->setText(tr("Mask cleared."));
+}
+
+void ConvertWorkspace::saveMask()
+{
+    const QString key = currentMaterialKey();
+    if (key.isEmpty()) { m_maskStatus->setText(tr("Select a material first.")); return; }
+    const auto state = m_masks.constFind(key);
+    if (state == m_masks.constEnd() || state->mask.isNull()) {
+        m_maskStatus->setText(tr("Nothing to save — load a mesh and pick fills first."));
+        return;
+    }
+    const QString outputRoot = QDir::fromNativeSeparators(m_outputEdit->text().trimmed());
+    if (outputRoot.isEmpty()) { m_maskStatus->setText(tr("Choose an output mod folder first.")); return; }
+    QTreeWidgetItem* item = m_queue->currentItem();
+    const int row = m_queue->indexOfTopLevelItem(item);
+    const QString baseName = QFileInfo(m_entries[row].materialPath).completeBaseName();
+    const QString maskPath = outputRoot + QStringLiteral("/Masks/") + baseName + QStringLiteral("_correction.png");
+    QDir().mkpath(QFileInfo(maskPath).absolutePath());
+    if (!state->mask.save(maskPath)) {
+        m_maskStatus->setText(tr("Could not write %1").arg(QDir::toNativeSeparators(maskPath)));
+        return;
+    }
+    m_overrides[key].maskPath = maskPath;
+    m_maskStatus->setText(tr("Saved — reconvert to apply (%1)").arg(QDir::toNativeSeparators(maskPath)));
 }
 
 void ConvertWorkspace::updateButtons()

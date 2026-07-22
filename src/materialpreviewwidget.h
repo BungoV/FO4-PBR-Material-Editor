@@ -113,6 +113,11 @@ public:
     void setFreeCamera(bool enabled);
     void cancelFreeCamera();
     bool freeCamera() const { return m_freeCamera; }
+    // Correction-mask picking: while enabled, an unmodified LMB press raycasts
+    // the mesh and emits meshTrianglePicked instead of starting a drag.
+    void setTrianglePickingEnabled(bool enabled);
+    int pickTriangle(const QPointF& widgetPos) const;
+    void setHighlightTriangles(const QVector<quint32>& triangles);
     void setShadows(bool enabled, float intensity);
     void setDerivedEnvironmentShadow(bool enabled, float directionalWeight);
     float effectiveKeyIntensity() const { return m_derivedEnvironmentShadow ? 0.0f : m_keyIntensity; }
@@ -126,6 +131,7 @@ signals:
     void projectionChanged();
     void lightAnglesChanged(float yawDegrees, float pitchDegrees);
     void shaderErrorsChanged(const QString& log);
+    void meshTrianglePicked(int triangleIndex);
 
 protected:
     void initializeGL() override;
@@ -185,6 +191,7 @@ private:
     // axis directions, top-right navigation gizmo, Shift+F free camera.
     void buildGridGeometry();
     void drawGrid();
+    void drawMaskHighlight();
     void drawViewportOverlays();
     void navGizmoLayout(QPointF& center, float& radius, float& ballRadius) const;
     void navGizmoBalls(QPointF positions[6], float depths[6]) const;
@@ -203,6 +210,12 @@ private:
     std::unique_ptr<QOpenGLVertexArrayObject> m_gridVao;
     QOpenGLBuffer m_gridBuffer{QOpenGLBuffer::VertexBuffer};
     int m_gridVertexCount = 0;
+    bool m_trianglePicking = false;
+    QVector<quint32> m_highlightTriangles;
+    std::unique_ptr<QOpenGLVertexArrayObject> m_highlightVao;
+    QOpenGLBuffer m_highlightIndexBuffer{QOpenGLBuffer::IndexBuffer};
+    int m_highlightIndexCount = 0;
+    bool m_highlightDirty = false;
     QOpenGLBuffer m_vertexBuffer{QOpenGLBuffer::VertexBuffer};
     QOpenGLBuffer m_indexBuffer{QOpenGLBuffer::IndexBuffer};
     QOpenGLBuffer m_groundVertexBuffer{QOpenGLBuffer::VertexBuffer};
@@ -415,6 +428,7 @@ public:
     void setTextureRoot(const QString& textureRoot);
     void setMaterial(const Pbr::MaterialDocument& document);
     void reloadPreviewCubemaps();
+    PbrPreviewGL* canvas() const { return m_materialCanvas; }
 public slots:
     void inspectTexture(const QString& name, const QString& path, const QStringList& channels, const QColor& color);
     void showFullMaterial();

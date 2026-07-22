@@ -7,6 +7,7 @@
 
 #include <QColor>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -291,6 +292,17 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     }
     const QImage normal = loadSource(material.normalTexture, options.textureRoot, &result.notes, QStringLiteral("normal"));
 
+    // Painted 0.5-neutral metallic correction (the workspace's mesh fills or
+    // an explicit --correction-mask).
+    QImage correctionMask;
+    if (!options.correctionMaskPath.trimmed().isEmpty()) {
+        correctionMask = QImage(options.correctionMaskPath);
+        if (correctionMask.isNull())
+            correctionMask = loadSource(options.correctionMaskPath, options.textureRoot, &result.notes, QStringLiteral("correction mask"));
+        if (!correctionMask.isNull())
+            result.notes.append(QStringLiteral("metallic correction mask applied: ") + options.correctionMaskPath);
+    }
+
     // ---- Profile conversion ----
     ConvertedImages converted;
     const bool fallout76 = material.isFallout76();
@@ -300,6 +312,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         sources.reflectance = loadSource(material.specularTexture, options.textureRoot, &result.notes, QStringLiteral("reflectance (_r)"));
         sources.lighting = loadSource(material.lightingTexture, options.textureRoot, &result.notes, QStringLiteral("lighting (_l)"));
         sources.glow = loadSource(material.glowTexture, options.textureRoot, &result.notes, QStringLiteral("glow"));
+        sources.correctionMask = correctionMask;
         converted = convertFo76(sources, material, options.math);
     } else {
         Fo4Sources sources;
@@ -307,6 +320,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         sources.specular = loadSource(material.smoothSpecTexture, options.textureRoot, &result.notes, QStringLiteral("specular (_s)"));
         sources.glow = loadSource(material.glowTexture, options.textureRoot, &result.notes, QStringLiteral("glow"));
         sources.envMask = loadSource(material.envmapMaskTexture, options.textureRoot, &result.notes, QStringLiteral("env mask"));
+        sources.correctionMask = correctionMask;
         sources.hasCubemapTint = cubemapMeanColor(material.envmapTexture, options.textureRoot, &sources.cubemapTint);
         converted = convertFo4(sources, material, options.math);
         if (material.environmentMapping && !material.envmapTexture.trimmed().isEmpty() && !sources.hasCubemapTint)
@@ -361,9 +375,11 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     // ---- Outputs (dedup'd, collision-safe) ----
     const QString portableDirectory = portableOutputDirectory(diffusePath, materialRelative);
     const QString baseName = baseNameForOutputs(diffusePath);
-    const QString optionsSignature = QStringLiteral("|rs%1|f%2|gc%3|em%4|")
+    const QString optionsSignature = QStringLiteral("|rs%1|f%2|gc%3|em%4|sp%5|cm%6|")
         .arg(options.math.recoveryStrength).arg(fallout76).arg(options.math.glossCurve)
-        .arg(material.environmentMappingMaskScale);
+        .arg(material.environmentMappingMaskScale).arg(options.math.specNormalizePercentile)
+        .arg(options.correctionMaskPath.isEmpty() ? QString()
+            : options.correctionMaskPath.toLower() + QString::number(QFileInfo(options.correctionMaskPath).lastModified().toSecsSinceEpoch()));
     const QString pairSignature = diffusePath.toLower() + QLatin1Char('+')
         + (bgem ? QString() : material.smoothSpecTexture.toLower()) + QLatin1Char('+')
         + material.specularTexture.toLower() + QLatin1Char('+') + material.lightingTexture.toLower()

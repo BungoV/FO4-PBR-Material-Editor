@@ -518,13 +518,15 @@ int runMaterialInfo(const QStringList& args)
 int runConvert(const QStringList& args)
 {
     const Options options = parseOptions(args, {QStringLiteral("--out"), QStringLiteral("--texture-root"),
-        QStringLiteral("--recovery"), QStringLiteral("--gloss-curve"), QStringLiteral("--derivation-size")});
+        QStringLiteral("--recovery"), QStringLiteral("--gloss-curve"), QStringLiteral("--derivation-size"),
+        QStringLiteral("--correction-mask")});
     const QString outputRoot = options.value(QStringLiteral("--out"));
     const QString manifestName = QStringLiteral("/pbrm-conversion-manifest.json");
     if (outputRoot.isEmpty() || (options.paths.isEmpty() && !options.has(QStringLiteral("--clean")))) {
         out() << "usage: pbrm convert --out <mod folder> [--texture-root <dir>] [--dry-run] [--json]\n"
                  "                    [--force] [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]\n"
                  "                    [--recovery <0-1>] [--gloss-curve <v>] [--derivation-size <px>]\n"
+                 "                    [--correction-mask <image>]  # 0.5-neutral metallic correction\n"
                  "                    <materials, folders, or .ba2 archives...>\n"
                  "       pbrm convert --out <mod folder> --clean   # remove exactly the recorded output\n" << Qt::flush;
         return 2;
@@ -586,6 +588,7 @@ int runConvert(const QStringList& args)
         job.math.glossCurve = options.value(QStringLiteral("--gloss-curve")).toFloat();
     if (options.has(QStringLiteral("--derivation-size")))
         job.derive.derivationSize = options.value(QStringLiteral("--derivation-size")).toInt();
+    job.correctionMaskPath = options.value(QStringLiteral("--correction-mask"));
 
     struct MaterialSource {
         QString path;      // loose file, or the BA2 archive
@@ -623,9 +626,11 @@ int runConvert(const QStringList& args)
 
     // Incremental re-runs: an entry is up-to-date when the source is
     // unchanged, the same options produced it, and its sibling still exists.
-    const QString jobSignature = QStringLiteral("v1|%1|%2|%3|%4|%5|%6|%7")
+    const QString jobSignature = QStringLiteral("v1|%1|%2|%3|%4|%5|%6|%7|%8")
         .arg(job.math.recoveryStrength).arg(job.math.glossCurve).arg(job.derive.derivationSize)
-        .arg(job.heightInBlue).arg(job.detailAo).arg(job.writeMetallicDiagnostic).arg(job.textureRoot.toLower());
+        .arg(job.heightInBlue).arg(job.detailAo).arg(job.writeMetallicDiagnostic).arg(job.textureRoot.toLower())
+        .arg(job.correctionMaskPath.isEmpty() ? QString()
+            : job.correctionMaskPath.toLower() + QString::number(QFileInfo(job.correctionMaskPath).lastModified().toSecsSinceEpoch()));
     QHash<QString, QJsonObject> previousEntries;
     {
         QFile manifestFile(job.outputRoot + manifestName);
