@@ -10,6 +10,7 @@ UI_DIR = build/ui
 
 SOURCES += \
     src/main.cpp \
+    src/bgsmreader.cpp \
     src/clicommands.cpp \
     src/materialdocument.cpp \
     src/texturearchive.cpp \
@@ -31,6 +32,7 @@ SOURCES += \
     src/mainwindow_slots.cpp
 
 HEADERS += \
+    src/bgsmreader.h \
     src/clicommands.h \
     src/materialdocument.h \
     src/texturearchive.h \

@@ -1,3 +1,4 @@
+#include "bgsmreader.h"
 #include "materialdocument.h"
 #include "disclosureicon.h"
 #include "texturecache.h"
@@ -18,6 +19,7 @@
 #include <QComboBox>
 #include <QDataStream>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -663,6 +665,227 @@ int main(int argc, char* argv[])
         check(Pbr::surfaceStateDefinitionsFromJson(QJsonObject{{QStringLiteral("schema"), QStringLiteral("Nope")}}, &rejection).isEmpty()
             && !rejection.isEmpty(),
             QStringLiteral("unknown definitions schemas are rejected"));
+    }
+
+    {
+        // BGSM/BGEM reader: byte-exact synthetic materials mirroring the
+        // ousnius MaterialLib serialize order, plus root-chain borrowing and
+        // an optional real-corpus sweep (PBRM_TEST_BGSM_DIR).
+        struct MaterialBuilder {
+            QByteArray data;
+            void u8(quint8 v) { data.append(char(v)); }
+            void boolean(bool v) { u8(v ? 1 : 0); }
+            void u32(quint32 v) { for (int i = 0; i < 4; ++i) data.append(char((v >> (8 * i)) & 0xFF)); }
+            void f32(float v) { quint32 raw; std::memcpy(&raw, &v, 4); u32(raw); }
+            void color(float r, float g, float b) { f32(r); f32(g); f32(b); }
+            void str(const QString& s) { const QByteArray latin = s.toLatin1() + '\0'; u32(quint32(latin.size())); data.append(latin); }
+            void header(quint32 signature, quint32 version, bool envMapping, float envMaskScale) {
+                u32(signature); u32(version);
+                u32(3); // tile U+V
+                f32(.25f); f32(.5f); f32(2.0f); f32(4.0f); // offsets/scales
+                f32(.75f); // alpha
+                u8(1); u32(6); u32(7); // Standard blend
+                u8(96); boolean(true); // alphaTestRef, alphaTest
+                boolean(true); boolean(true); boolean(false); boolean(false); // z/ssr
+                boolean(false); boolean(true); boolean(false); boolean(false); // decal/twoSided/...
+                boolean(true); boolean(false); f32(.6f); // refraction block
+                if (version < 10) { boolean(envMapping); f32(envMaskScale); }
+                else boolean(false); // depthBias
+                boolean(false); // grayscaleToPalette
+                if (version >= 6) u8(63);
+            }
+        };
+        constexpr quint32 BgsmSig = 0x4D534742u, BgemSig = 0x4D454742u;
+
+        // Fallout 4 BGSM (version 2).
+        MaterialBuilder v2;
+        v2.header(BgsmSig, 2, true, 1.5f);
+        v2.str(QStringLiteral("textures\\armor\\a_d.dds"));
+        v2.str(QStringLiteral("textures\\armor\\a_n.dds"));
+        v2.str(QStringLiteral("textures\\armor\\a_s.dds"));
+        v2.str(QString());
+        v2.str(QStringLiteral("textures\\shared\\cubemaps\\chrome_e.dds"));
+        v2.str(QStringLiteral("textures\\armor\\a_g.dds"));
+        v2.str(QString()); v2.str(QString()); v2.str(QString());
+        v2.boolean(false); // editor alpha ref
+        v2.boolean(true); v2.f32(3.0f); v2.f32(.4f); // rim block (v<8)
+        v2.boolean(false); v2.f32(.3f);
+        v2.boolean(true); v2.color(1.0f, .8f, .6f); v2.f32(1.7f); v2.f32(.82f); // spec
+        v2.f32(5.0f); v2.f32(-1); v2.f32(-1); v2.f32(-1); v2.f32(-1); v2.f32(-1); v2.f32(-1); // fresnel+wetness (incl. envmap, v<10)
+        v2.str(QStringLiteral("materials\\shared\\root.bgsm"));
+        v2.boolean(false); // aniso
+        v2.boolean(true); v2.color(.2f, .9f, .3f); // emit + color
+        v2.f32(2.5f); // emittance mult
+        v2.boolean(false); v2.boolean(false); // msn/external
+        v2.boolean(false); // backlighting (v<8)
+        v2.boolean(true); v2.boolean(false); v2.boolean(true); v2.boolean(false); v2.boolean(false); // shadows...
+        v2.boolean(true); // glowmap
+        v2.boolean(false); v2.boolean(false); // envmap window/eye (v<7)
+        v2.boolean(false); v2.color(.5f, .5f, .5f); // hair
+        v2.boolean(false); v2.boolean(false); v2.boolean(false); v2.boolean(false); // tree/facegen/skin/tess
+        v2.f32(-.5f); v2.f32(10.0f); v2.f32(1.0f); v2.f32(1.0f); v2.f32(0.0f); // displacement/tess (v<3)
+        v2.f32(1.0f); v2.boolean(false); // grayscale scale, skew (v>=1)
+        Bgsm::Material fo4;
+        QString bgsmError;
+        check(Bgsm::read(v2.data, &fo4, &bgsmError), QStringLiteral("synthetic FO4 BGSM v2 parses: %1").arg(bgsmError));
+        check(fo4.kind == Bgsm::Kind::Bgsm && fo4.version == 2 && !fo4.isFallout76(),
+            QStringLiteral("v2 identifies as a Fallout 4 BGSM"));
+        check(fo4.blendMode == Bgsm::AlphaBlendMode::Standard && fo4.alphaTest && fo4.alphaTestRef == 96
+            && fo4.twoSided && fo4.refraction && qFuzzyCompare(fo4.refractionPower, .6f),
+            QStringLiteral("v2 header fields parse (blend, alpha test, two-sided, refraction)"));
+        check(fo4.environmentMapping && qFuzzyCompare(fo4.environmentMappingMaskScale, 1.5f),
+            QStringLiteral("v2 environment mapping and mask scale parse"));
+        check(fo4.diffuseTexture == QStringLiteral("textures\\armor\\a_d.dds")
+            && fo4.envmapTexture == QStringLiteral("textures\\shared\\cubemaps\\chrome_e.dds")
+            && fo4.glowTexture == QStringLiteral("textures\\armor\\a_g.dds"),
+            QStringLiteral("v2 texture set parses (diffuse, envmap cubemap, glow)"));
+        check(fo4.rimLighting && qFuzzyCompare(fo4.rimPower, 3.0f) && fo4.specularEnabled
+            && qFuzzyCompare(fo4.specularMult, 1.7f) && qFuzzyCompare(fo4.smoothness, .82f)
+            && qFuzzyCompare(fo4.specularColor.y(), .8f),
+            QStringLiteral("v2 rim and specular parameters parse"));
+        check(fo4.emitEnabled && qFuzzyCompare(fo4.emittanceColor.y(), .9f) && qFuzzyCompare(fo4.emittanceMult, 2.5f)
+            && fo4.glowmap && fo4.rootMaterialPath == QStringLiteral("materials\\shared\\root.bgsm"),
+            QStringLiteral("v2 conditional emittance color, glowmap, and root path parse"));
+
+        // Fallout 76 BGSM (version 20): FO76 texture set, translucency, PBR.
+        MaterialBuilder v20;
+        v20.header(BgsmSig, 20, false, 1.0f);
+        v20.str(QStringLiteral("textures\\armor76\\b_d.dds"));
+        v20.str(QStringLiteral("textures\\armor76\\b_n.dds"));
+        v20.str(QString());
+        v20.str(QString());
+        v20.str(QStringLiteral("textures\\armor76\\b_g.dds"));
+        v20.str(QString());
+        v20.str(QStringLiteral("textures\\armor76\\b_s.dds"));
+        v20.str(QStringLiteral("textures\\armor76\\b_l.dds"));
+        v20.str(QString());
+        v20.str(QString()); // distance field alpha (v>=17)
+        v20.boolean(false); // editor alpha ref
+        v20.boolean(true); v20.boolean(false); v20.boolean(true); // translucency block (v>=8)
+        v20.color(.9f, .5f, .4f); v20.f32(.65f); v20.f32(.2f);
+        v20.boolean(true); v20.color(1, 1, 1); v20.f32(1.0f); v20.f32(.35f); // spec
+        v20.f32(5.0f); v20.f32(-1); v20.f32(-1); v20.f32(-1); // no wetness envmap (v>=10)
+        v20.f32(-1); v20.f32(-1);
+        v20.boolean(true); // PBR (v>2)
+        v20.boolean(true); v20.f32(.42f); // porosity (v>=9)
+        v20.str(QString());
+        v20.boolean(false);
+        v20.boolean(false); // emit disabled -> no color in stream
+        v20.f32(1.0f);
+        v20.boolean(false); v20.boolean(false);
+        v20.f32(100.0f); // lum (v>=12)
+        v20.boolean(false); v20.f32(0); v20.f32(0); v20.f32(0); // adaptive (v>=13)
+        v20.boolean(true); v20.boolean(false); v20.boolean(true); v20.boolean(false); v20.boolean(false);
+        v20.boolean(false); // glowmap
+        v20.boolean(false); v20.color(.5f, .5f, .5f);
+        v20.boolean(false); v20.boolean(false); v20.boolean(true); v20.boolean(false); // skinTint true
+        v20.f32(1.0f); v20.boolean(false);
+        v20.boolean(false); // terrain (v>=3)
+        Bgsm::Material fo76;
+        check(Bgsm::read(v20.data, &fo76, &bgsmError), QStringLiteral("synthetic FO76 BGSM v20 parses: %1").arg(bgsmError));
+        check(fo76.isFallout76() && fo76.pbr && fo76.customPorosity && qFuzzyCompare(fo76.porosityValue, .42f),
+            QStringLiteral("v20 PBR flag and porosity parse"));
+        check(fo76.specularTexture == QStringLiteral("textures\\armor76\\b_s.dds")
+            && fo76.lightingTexture == QStringLiteral("textures\\armor76\\b_l.dds"),
+            QStringLiteral("v20 FO76 specular/lighting textures parse"));
+        check(fo76.translucency && fo76.translucencyMixAlbedo && qFuzzyCompare(fo76.translucencySubsurfaceColor.x(), .9f)
+            && qFuzzyCompare(fo76.translucencyTransmissiveScale, .65f),
+            QStringLiteral("v20 translucency block parses"));
+        check(!fo76.emitEnabled && qFuzzyCompare(fo76.lumEmittance, 100.0f) && fo76.skinTint,
+            QStringLiteral("v20 disabled emit skips the color and lum emittance parses"));
+
+        // Fallout 4 BGEM (version 2).
+        MaterialBuilder gem;
+        gem.header(BgemSig, 2, true, 2.0f);
+        gem.str(QStringLiteral("textures\\effects\\glow_d.dds"));
+        gem.str(QString());
+        gem.str(QString());
+        gem.str(QString());
+        gem.str(QString());
+        gem.boolean(false); gem.boolean(true); // blood, effect lighting
+        gem.boolean(true); gem.boolean(false); gem.boolean(false); gem.boolean(true); // falloff/soft
+        gem.color(.1f, .6f, 1.0f); gem.f32(8.0f); // base color + scale
+        gem.f32(10.0f); gem.f32(80.0f); gem.f32(1.0f); gem.f32(0.0f); // falloff
+        gem.f32(.25f); gem.u8(2); gem.f32(.15f); // lighting influence, minLOD, soft depth
+        Bgsm::Material effect;
+        check(Bgsm::read(gem.data, &effect, &bgsmError), QStringLiteral("synthetic FO4 BGEM v2 parses: %1").arg(bgsmError));
+        check(effect.kind == Bgsm::Kind::Bgem && effect.baseTexture == QStringLiteral("textures\\effects\\glow_d.dds")
+            && effect.effectLightingEnabled && effect.falloffEnabled && effect.softEnabled,
+            QStringLiteral("BGEM identifies and effect flags parse"));
+        check(qFuzzyCompare(effect.baseColor.z(), 1.0f) && qFuzzyCompare(effect.baseColorScale, 8.0f)
+            && qFuzzyCompare(effect.lightingInfluence, .25f) && effect.envmapMinLOD == 2,
+            QStringLiteral("BGEM base color/scale (the diffuse-as-emission inputs) parse"));
+
+        // Rejections: wrong signature and truncated data.
+        QByteArray bogus = v2.data; bogus[0] = 'X';
+        check(!Bgsm::read(bogus, &fo4), QStringLiteral("invalid signatures are rejected"));
+        check(!Bgsm::read(v2.data.left(v2.data.size() / 2), &fo4), QStringLiteral("truncated materials are rejected"));
+
+        // Root chain: the child borrows only empty texture fields.
+        Bgsm::Material chained;
+        check(Bgsm::read(v2.data, &chained, &bgsmError), QStringLiteral("root-chain child reparses"));
+        MaterialBuilder rootBuilder;
+        rootBuilder.header(BgsmSig, 2, false, 1.0f);
+        rootBuilder.str(QStringLiteral("textures\\shared\\root_d.dds"));
+        rootBuilder.str(QStringLiteral("textures\\shared\\root_n.dds"));
+        rootBuilder.str(QStringLiteral("textures\\shared\\root_s.dds"));
+        rootBuilder.str(QStringLiteral("textures\\shared\\root_grey.dds"));
+        rootBuilder.str(QString()); rootBuilder.str(QString()); rootBuilder.str(QString());
+        rootBuilder.str(QString()); rootBuilder.str(QString());
+        rootBuilder.boolean(false);
+        rootBuilder.boolean(false); rootBuilder.f32(2.0f); rootBuilder.f32(0.0f);
+        rootBuilder.boolean(false); rootBuilder.f32(.3f);
+        rootBuilder.boolean(false); rootBuilder.color(1, 1, 1); rootBuilder.f32(1.0f); rootBuilder.f32(1.0f);
+        rootBuilder.f32(5.0f); rootBuilder.f32(-1); rootBuilder.f32(-1); rootBuilder.f32(-1); rootBuilder.f32(-1); rootBuilder.f32(-1); rootBuilder.f32(-1);
+        rootBuilder.str(QString());
+        rootBuilder.boolean(false);
+        rootBuilder.boolean(false);
+        rootBuilder.f32(1.0f);
+        rootBuilder.boolean(false); rootBuilder.boolean(false);
+        rootBuilder.boolean(false);
+        rootBuilder.boolean(true); rootBuilder.boolean(false); rootBuilder.boolean(true); rootBuilder.boolean(false); rootBuilder.boolean(false);
+        rootBuilder.boolean(false);
+        rootBuilder.boolean(false); rootBuilder.boolean(false);
+        rootBuilder.boolean(false); rootBuilder.color(.5f, .5f, .5f);
+        rootBuilder.boolean(false); rootBuilder.boolean(false); rootBuilder.boolean(false); rootBuilder.boolean(false);
+        rootBuilder.f32(-.5f); rootBuilder.f32(10.0f); rootBuilder.f32(1.0f); rootBuilder.f32(1.0f); rootBuilder.f32(0.0f);
+        rootBuilder.f32(1.0f); rootBuilder.boolean(false);
+        const auto lookup = [&rootBuilder](const QString& path, QByteArray* data) {
+            if (!path.compare(QStringLiteral("materials\\shared\\root.bgsm"), Qt::CaseInsensitive)) {
+                *data = rootBuilder.data;
+                return true;
+            }
+            return false;
+        };
+        check(Bgsm::resolveRootChain(&chained, lookup, &bgsmError), QStringLiteral("root chain resolves: %1").arg(bgsmError));
+        check(chained.diffuseTexture == QStringLiteral("textures\\armor\\a_d.dds")
+            && chained.greyscaleTexture == QStringLiteral("textures\\shared\\root_grey.dds"),
+            QStringLiteral("root chain borrows only the textures the child left empty"));
+        Bgsm::Material cyclic;
+        check(Bgsm::read(v2.data, &cyclic, &bgsmError), QStringLiteral("cycle-test child reparses"));
+        const auto cyclicLookup = [&v2](const QString&, QByteArray* data) { *data = v2.data; return true; };
+        check(!Bgsm::resolveRootChain(&cyclic, cyclicLookup), QStringLiteral("root chain cycles are rejected"));
+
+        // Real-corpus sweep: parse every material under PBRM_TEST_BGSM_DIR.
+        const QString corpusDir = qEnvironmentVariable("PBRM_TEST_BGSM_DIR");
+        if (!corpusDir.isEmpty() && QFileInfo(corpusDir).isDir()) {
+            int parsed = 0, failed = 0;
+            QString firstFailure;
+            QDirIterator it(corpusDir, {QStringLiteral("*.bgsm"), QStringLiteral("*.bgem")}, QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext()) {
+                const QString file = it.next();
+                Bgsm::Material corpusMaterial;
+                QString corpusError;
+                if (Bgsm::readFile(file, &corpusMaterial, &corpusError)) ++parsed;
+                else {
+                    ++failed;
+                    if (firstFailure.isEmpty()) firstFailure = file + QStringLiteral(": ") + corpusError;
+                }
+            }
+            check(parsed > 0 && failed == 0,
+                QStringLiteral("real material corpus parses cleanly: %1 parsed, %2 failed (%3)")
+                    .arg(parsed).arg(failed).arg(firstFailure));
+        }
     }
 
     {

@@ -9,6 +9,7 @@ MOC_DIR = build/moc
 
 INCLUDEPATH += ../src
 SOURCES += main_cli.cpp \
+    ../src/bgsmreader.cpp \
     ../src/clicommands.cpp \
     ../src/materialdocument.cpp \
     ../src/texturearchive.cpp \
