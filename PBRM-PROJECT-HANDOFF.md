@@ -134,18 +134,22 @@ blindly.
 
 ## Backlog (agreed 2026-07-22, in order)
 
-1. **Validation quick-fixes** — Overview → Validation becomes structured
-   issue rows with per-row Fix buttons where a safe automatic remedy
-   exists (undo-able via `applyDocumentChange`, immediate re-validate);
-   texture-file findings stay manual by design. The widget is reused by
-   the Convert workspace.
-2. **`pbrm.exe` CLI companion** — full CLI parity is a standing rule:
-   every headless-capable operation gets a verb, and new features ship
-   with theirs. Console-subsystem binary from the same core sources; verbs
-   for existing operations first (`validate`, `migrate`, `extract-states`,
-   `strip-legacy`, `repair-paths`, `set-setting`, `pack`,
-   `export-definitions`, `export-json`); `--json` reporting; explicit
-   source/output flags with QSettings only as fallback.
+1. **Validation quick-fixes — SHIPPED 2026-07-23.** Overview → Validation
+   renders structured severity rows; findings with a safe remedy carry a
+   Fix button (single undo step via `applyDocumentChange`, immediate
+   re-validate). The extract-&-strip fix strips groups only, deliberately
+   leaving a retired response slot's repack finding in place; texture-file
+   findings stay manual by design. Live-verified on a crafted legacy
+   stress file.
+2. **`pbrm.exe` CLI companion — SHIPPED 2026-07-23.** Console binary from
+   the shared `src/clicommands.*` module (the GUI's `--validate` is now an
+   alias into it); verbs: `validate`, `migrate`, `extract-states`,
+   `strip-legacy`, `set-setting`, `repair-paths`, `export-definitions`,
+   `export-json`, `pack` (incl. `--toksvig`); `--json` reporting,
+   `--dry-run`, explicit `--texture-root` with QSettings fallback; exit
+   codes 0/1/2. Packaged into `publish` beside the editor; full CLI parity
+   remains the standing rule — converter verbs (`convert`, `bake-ao`) land
+   with the converter.
 3. **FO4/FO76 → PBR converter** — `docs/FO4-Conversion.md` is the
    authoritative spec: per-title source profiles (FO4 metal-darkness
    recovery vs. FO76 true-specular reconstruction), emissive color rules,

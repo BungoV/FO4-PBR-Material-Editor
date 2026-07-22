@@ -13,6 +13,10 @@
 // converge to their correct area averages at distance instead of being
 // contrast-boosted or bled into by RGB.
 //
+// Set `normalMapMips` for normal-map exports so each mip averages decoded
+// tangent-space vectors and renormalizes the result instead of averaging the
+// encoded RG bytes independently. This preserves the correct mean direction.
+//
 // When `toksvigNormal` is supplied (an RG tangent normal map paired with a
 // roughness-in-R export), the normal's per-mip variance is folded into the
 // roughness chain (Toksvig): distant minified speculars stop aliasing because
@@ -31,6 +35,6 @@ enum class DdsFormat {
 
 bool saveDds(const QImage& image, const QString& filePath, DdsFormat format,
     bool generateMips, QString* error = nullptr,
-    const QImage& toksvigNormal = QImage());
+    const QImage& toksvigNormal = QImage(), bool normalMapMips = false);
 
 } // namespace TextureWriter

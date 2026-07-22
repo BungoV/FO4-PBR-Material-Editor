@@ -1,0 +1,488 @@
+#include "clicommands.h"
+
+#include "materialdocument.h"
+#include "texturecache.h"
+#include "textureimage.h"
+#include "texturewriter.h"
+
+#include <QDataStream>
+#include <QDir>
+#include <QDirIterator>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSettings>
+#include <QTextStream>
+
+namespace PbrmCli {
+
+namespace {
+
+QTextStream& out()
+{
+    static QTextStream stream(stdout);
+    return stream;
+}
+
+// Splits args into flags (with optional values) and positional paths.
+struct Options {
+    QStringList paths;
+    QHash<QString, QString> flags;   // "--flag" -> value ("" for bare flags)
+    bool has(const QString& flag) const { return flags.contains(flag); }
+    QString value(const QString& flag, const QString& fallback = {}) const { return flags.value(flag, fallback); }
+};
+
+// Flags in this set consume the following argument as their value.
+Options parseOptions(const QStringList& args, const QSet<QString>& valueFlags)
+{
+    Options options;
+    for (int i = 0; i < args.size(); ++i) {
+        const QString& arg = args[i];
+        if (arg.startsWith(QStringLiteral("--"))) {
+            if (valueFlags.contains(arg) && i + 1 < args.size()) options.flags.insert(arg, args[++i]);
+            else options.flags.insert(arg, QString());
+        } else {
+            options.paths.append(arg);
+        }
+    }
+    return options;
+}
+
+QString effectiveTextureRoot(const Options& options)
+{
+    if (options.has(QStringLiteral("--texture-root"))) return options.value(QStringLiteral("--texture-root"));
+    // Fallback: the editor's configured sources (predictable CI machines pass
+    // the flag explicitly).
+    QSettings settings;
+    QString root = settings.value(QStringLiteral("textureRoot")).toString();
+    if (root.isEmpty())
+        root = settings.value(QStringLiteral("TextureSources/modFolders")).toStringList().value(0);
+    return root;
+}
+
+QStringList collectMaterialFiles(const QStringList& targets, QStringList* missing = nullptr)
+{
+    QStringList files;
+    for (const QString& target : targets) {
+        const QFileInfo info(target);
+        if (info.isDir()) {
+            QDirIterator it(info.absoluteFilePath(), {QStringLiteral("*.pbrm")}, QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext()) files.append(it.next());
+        } else if (info.isFile()) {
+            files.append(info.absoluteFilePath());
+        } else if (missing) {
+            missing->append(target);
+        }
+    }
+    return files;
+}
+
+// Reads the raw JSON payload of a .pbrm envelope (any accepted version).
+QByteArray rawPayload(const QString& fileName)
+{
+    QFile file(fileName);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    QDataStream stream(&file);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    quint32 magic = 0, version = 0, size = 0;
+    stream >> magic >> version >> size;
+    if (magic != Pbr::MaterialDocument::Magic) return {};
+    return file.read(size);
+}
+
+struct Finding {
+    QString file;
+    bool error = false;
+    QString message;
+};
+
+// Prints findings as text lines or one JSON document; returns 1 if any error.
+int reportFindings(const QVector<Finding>& findings, int fileCount, bool json, const QString& action)
+{
+    int errors = 0, warnings = 0;
+    for (const Finding& finding : findings) (finding.error ? errors : warnings)++;
+    if (json) {
+        QJsonArray array;
+        for (const Finding& finding : findings)
+            array.append(QJsonObject{{QStringLiteral("file"), finding.file},
+                {QStringLiteral("severity"), finding.error ? QStringLiteral("error") : QStringLiteral("warning")},
+                {QStringLiteral("message"), finding.message}});
+        const QJsonObject root{{QStringLiteral("action"), action}, {QStringLiteral("files"), fileCount},
+            {QStringLiteral("errors"), errors}, {QStringLiteral("warnings"), warnings},
+            {QStringLiteral("findings"), array}};
+        out() << QJsonDocument(root).toJson(QJsonDocument::Indented) << Qt::flush;
+    } else {
+        for (const Finding& finding : findings)
+            out() << finding.file << (finding.error ? ": error: " : ": warning: ") << finding.message << '\n';
+        out() << fileCount << " file(s), " << errors << " error(s), " << warnings << " warning(s)\n" << Qt::flush;
+    }
+    return errors > 0 ? 1 : 0;
+}
+
+} // namespace
+
+int runValidate(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--texture-root")});
+    const QString textureRoot = effectiveTextureRoot(options);
+    QStringList missing;
+    const QStringList files = collectMaterialFiles(options.paths, &missing);
+    QVector<Finding> findings;
+    for (const QString& target : missing) findings.append({target, true, QStringLiteral("path does not exist")});
+    if (files.isEmpty() && missing.isEmpty()) {
+        out() << "no .pbrm files found\n" << Qt::flush;
+        return 1;
+    }
+    for (const QString& file : files) {
+        Pbr::MaterialDocument document;
+        QString loadError;
+        if (!document.load(file, &loadError)) {
+            findings.append({file, true, loadError});
+            continue;
+        }
+        if (Pbr::hasLegacySurfaceStateGroups(document))
+            findings.append({file, true, QStringLiteral("legacy per-material surface state groups; extract to a definitions JSON and strip them (pbrm extract-states + strip-legacy)")});
+        for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
+            const QJsonObject set = document.textureSet(setName);
+            for (auto it = set.constBegin(); it != set.constEnd(); ++it) {
+                if (it.key().endsWith(QStringLiteral("SurfaceStateResponse")))
+                    findings.append({file, true, setName + QStringLiteral(": retired Surface State Response input; repack R into RMAOS alpha and B into Normal alpha, then strip legacy surface data")});
+                const QJsonObject slotValues = it.value().toObject().value(QStringLiteral("values")).toObject();
+                if (it.key().endsWith(QStringLiteral("Normal")) && slotValues.value(QStringLiteral("layerMaskInAlpha")).toBool(false))
+                    findings.append({file, false, setName + QLatin1Char('/') + it.key()
+                        + QStringLiteral(": retired layer-modulation-in-alpha flag; repack the mask to a Layer Coverage texture or use Height Blend coverage")});
+            }
+        }
+        const auto checkSet = [&](const QString& setName, const QJsonObject& set) {
+            for (auto it = set.constBegin(); it != set.constEnd(); ++it) {
+                const auto state = Pbr::TextureSlotState::fromJson(it.value().toObject());
+                if (!state.enabled) continue;
+                if (TextureCache::hasChannelSwaps(state.values))
+                    findings.append({file, false, setName + QLatin1Char('/') + it.key()
+                        + QStringLiteral(": unbaked channel sources; export a packed texture before runtime use")});
+                if (state.path.trimmed().isEmpty()) continue;
+                if (TextureImage::resolvePath(state.path, textureRoot).isEmpty()) {
+                    findings.append({file, true, setName + QLatin1Char('/') + it.key()
+                        + QStringLiteral(": texture cannot be resolved: ") + state.path});
+                    continue;
+                }
+                const TextureImage::Diagnostics info = TextureImage::inspect(state.path, textureRoot);
+                if (!info.valid)
+                    findings.append({file, true, setName + QLatin1Char('/') + it.key() + QStringLiteral(": ") + info.error});
+                else if (qMax(info.width, info.height) > 1 && info.mipLevels == 1)
+                    findings.append({file, false, setName + QLatin1Char('/') + it.key() + QStringLiteral(": no mip chain")});
+            }
+        };
+        for (const QString& set : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")})
+            checkSet(set, document.textureSet(set));
+        const QJsonObject resources = document.toJson().value(QStringLiteral("resources")).toObject();
+        for (auto it = resources.constBegin(); it != resources.constEnd(); ++it)
+            checkSet(it.key(), it.value().toObject());
+    }
+    return reportFindings(findings, files.size(), options.has(QStringLiteral("--json")), QStringLiteral("validate"));
+}
+
+int runMigrate(const QStringList& args)
+{
+    const Options options = parseOptions(args, {});
+    const bool dryRun = options.has(QStringLiteral("--dry-run"));
+    const QStringList files = collectMaterialFiles(options.paths);
+    if (files.isEmpty()) { out() << "no .pbrm files found\n" << Qt::flush; return 1; }
+    QVector<Finding> findings;
+    int migrated = 0;
+    for (const QString& file : files) {
+        Pbr::MaterialDocument document;
+        QString error;
+        if (!document.load(file, &error)) {
+            findings.append({file, true, error});
+            continue;
+        }
+        const QByteArray current = rawPayload(file);
+        const QByteArray next = QJsonDocument(document.toJson()).toJson(QJsonDocument::Compact);
+        if (current == next) continue;
+        if (!dryRun && !document.save(file, &error)) {
+            findings.append({file, true, QStringLiteral("save failed: ") + error});
+            continue;
+        }
+        ++migrated;
+        findings.append({file, false, dryRun ? QStringLiteral("would migrate to the current schema") : QStringLiteral("migrated to the current schema")});
+    }
+    if (!options.has(QStringLiteral("--json")))
+        out() << migrated << (dryRun ? " file(s) would migrate\n" : " file(s) migrated\n");
+    return reportFindings(findings, files.size(), options.has(QStringLiteral("--json")), QStringLiteral("migrate"));
+}
+
+int runExtractStates(const QStringList& args)
+{
+    const Options options = parseOptions(args, {});
+    const QStringList files = collectMaterialFiles(options.paths);
+    if (files.isEmpty()) { out() << "no .pbrm files found\n" << Qt::flush; return 1; }
+    QVector<Finding> findings;
+    for (const QString& file : files) {
+        Pbr::MaterialDocument document;
+        QString error;
+        if (!document.load(file, &error)) {
+            findings.append({file, true, error});
+            continue;
+        }
+        if (!Pbr::hasLegacySurfaceStateGroups(document)) continue;
+        const QFileInfo info(file);
+        const QString target = info.absolutePath() + QLatin1Char('/') + info.completeBaseName() + QStringLiteral(".SurfaceStates.json");
+        if (Pbr::extractLegacyStates(document, target, &error))
+            findings.append({file, false, QStringLiteral("extracted legacy states to ") + target});
+        else
+            findings.append({file, true, QStringLiteral("extraction failed: ") + error});
+    }
+    return reportFindings(findings, files.size(), options.has(QStringLiteral("--json")), QStringLiteral("extract-states"));
+}
+
+int runStripLegacy(const QStringList& args)
+{
+    const Options options = parseOptions(args, {});
+    const bool dryRun = options.has(QStringLiteral("--dry-run"));
+    const QStringList files = collectMaterialFiles(options.paths);
+    if (files.isEmpty()) { out() << "no .pbrm files found\n" << Qt::flush; return 1; }
+    QVector<Finding> findings;
+    for (const QString& file : files) {
+        Pbr::MaterialDocument document;
+        QString error;
+        if (!document.load(file, &error)) {
+            findings.append({file, true, error});
+            continue;
+        }
+        const int removed = Pbr::stripLegacySurfaceData(document);
+        if (removed == 0) continue;
+        if (!dryRun && !document.save(file, &error)) {
+            findings.append({file, true, QStringLiteral("save failed: ") + error});
+            continue;
+        }
+        findings.append({file, false, (dryRun ? QStringLiteral("would strip ") : QStringLiteral("stripped "))
+            + QString::number(removed) + QStringLiteral(" legacy surface item(s)")});
+    }
+    return reportFindings(findings, files.size(), options.has(QStringLiteral("--json")), QStringLiteral("strip-legacy"));
+}
+
+int runSetSetting(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--section"), QStringLiteral("--key"), QStringLiteral("--value")});
+    const QString section = options.value(QStringLiteral("--section"));
+    const QString key = options.value(QStringLiteral("--key"));
+    const QString raw = options.value(QStringLiteral("--value"));
+    if (section.isEmpty() || key.isEmpty() || !options.flags.contains(QStringLiteral("--value"))) {
+        out() << "usage: pbrm set-setting --section <Section> --key <key> --value <value> <files-or-folders...>\n" << Qt::flush;
+        return 2;
+    }
+    QJsonValue value;
+    bool isNumber = false;
+    const double number = raw.toDouble(&isNumber);
+    if (raw.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0) value = true;
+    else if (raw.compare(QStringLiteral("false"), Qt::CaseInsensitive) == 0) value = false;
+    else if (isNumber) value = number;
+    else value = raw;
+    const bool dryRun = options.has(QStringLiteral("--dry-run"));
+    const QStringList files = collectMaterialFiles(options.paths);
+    if (files.isEmpty()) { out() << "no .pbrm files found\n" << Qt::flush; return 1; }
+    QVector<Finding> findings;
+    for (const QString& file : files) {
+        Pbr::MaterialDocument document;
+        QString error;
+        if (!document.load(file, &error)) {
+            findings.append({file, true, error});
+            continue;
+        }
+        const QJsonObject before = document.toJson();
+        document.setSetting(section, key, value);
+        if (document.toJson() == before) continue;
+        if (!dryRun && !document.save(file, &error)) {
+            findings.append({file, true, QStringLiteral("save failed: ") + error});
+            continue;
+        }
+        findings.append({file, false, (dryRun ? QStringLiteral("would set ") : QStringLiteral("set "))
+            + section + QLatin1Char('/') + key});
+    }
+    return reportFindings(findings, files.size(), options.has(QStringLiteral("--json")), QStringLiteral("set-setting"));
+}
+
+int runRepairPaths(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--texture-root")});
+    const QString textureRoot = effectiveTextureRoot(options);
+    const bool dryRun = options.has(QStringLiteral("--dry-run"));
+    const QStringList files = collectMaterialFiles(options.paths);
+    if (files.isEmpty()) { out() << "no .pbrm files found\n" << Qt::flush; return 1; }
+    const QVector<TextureImage::Resource> resources = TextureImage::enumerate(textureRoot);
+    QVector<Finding> findings;
+    for (const QString& file : files) {
+        Pbr::MaterialDocument document;
+        QString error;
+        if (!document.load(file, &error)) {
+            findings.append({file, true, error});
+            continue;
+        }
+        const QJsonObject before = document.toJson();
+        QStringList notes;
+        for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
+            const QJsonObject set = document.textureSet(setName);
+            for (auto slotIt = set.constBegin(); slotIt != set.constEnd(); ++slotIt) {
+                auto state = Pbr::TextureSlotState::fromJson(slotIt.value().toObject());
+                if (state.path.trimmed().isEmpty()) continue;
+                if (!TextureImage::resolvePath(state.path, textureRoot).isEmpty()) continue;
+                const QString fileName = QFileInfo(state.path).fileName();
+                for (const TextureImage::Resource& resource : resources) {
+                    if (QFileInfo(resource.path).fileName().compare(fileName, Qt::CaseInsensitive) != 0) continue;
+                    notes << setName + QLatin1Char('/') + slotIt.key() + QStringLiteral(": ") + state.path
+                        + QStringLiteral(" -> ") + resource.path;
+                    state.path = resource.path;
+                    document.setTextureSlot(setName, slotIt.key(), state);
+                    break;
+                }
+            }
+        }
+        if (document.toJson() == before) continue;
+        if (!dryRun && !document.save(file, &error)) {
+            findings.append({file, true, QStringLiteral("save failed: ") + error});
+            continue;
+        }
+        for (const QString& note : notes)
+            findings.append({file, false, (dryRun ? QStringLiteral("would repair ") : QStringLiteral("repaired ")) + note});
+    }
+    return reportFindings(findings, files.size(), options.has(QStringLiteral("--json")), QStringLiteral("repair-paths"));
+}
+
+int runExportDefinitions(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--out")});
+    QString target = options.value(QStringLiteral("--out"));
+    if (target.isEmpty() && !options.paths.isEmpty()) target = options.paths.first();
+    if (target.isEmpty()) {
+        out() << "usage: pbrm export-definitions <file.json>\n" << Qt::flush;
+        return 2;
+    }
+    QString error;
+    if (!Pbr::saveSurfaceStateDefinitions(target, Pbr::surfaceStatePresets(), &error)) {
+        out() << "error: " << error << '\n' << Qt::flush;
+        return 1;
+    }
+    out() << "wrote built-in surface state definitions to " << target << '\n' << Qt::flush;
+    return 0;
+}
+
+int runExportJson(const QStringList& args)
+{
+    const Options options = parseOptions(args, {});
+    const QStringList files = collectMaterialFiles(options.paths);
+    if (files.isEmpty()) { out() << "no .pbrm files found\n" << Qt::flush; return 1; }
+    QVector<Finding> findings;
+    for (const QString& file : files) {
+        Pbr::MaterialDocument document;
+        QString error;
+        if (!document.load(file, &error)) {
+            findings.append({file, true, error});
+            continue;
+        }
+        const QString target = file + QStringLiteral(".json");
+        QFile outFile(target);
+        if (!outFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            findings.append({file, true, QStringLiteral("cannot write ") + target});
+            continue;
+        }
+        outFile.write(QJsonDocument(document.toJson()).toJson(QJsonDocument::Indented));
+        findings.append({file, false, QStringLiteral("exported ") + target});
+    }
+    return reportFindings(findings, files.size(), options.has(QStringLiteral("--json")), QStringLiteral("export-json"));
+}
+
+int runPack(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--material"), QStringLiteral("--set"), QStringLiteral("--slot"),
+        QStringLiteral("--out"), QStringLiteral("--format"), QStringLiteral("--toksvig"), QStringLiteral("--texture-root")});
+    const QString materialFile = options.value(QStringLiteral("--material"), options.paths.value(0));
+    const QString setName = options.value(QStringLiteral("--set"), QStringLiteral("UV0"));
+    const QString slotKey = options.value(QStringLiteral("--slot"));
+    const QString target = options.value(QStringLiteral("--out"));
+    if (materialFile.isEmpty() || slotKey.isEmpty() || target.isEmpty()) {
+        out() << "usage: pbrm pack --material <file.pbrm> --slot <slotKey> --out <file.dds> [--set UV0]"
+                 " [--format bc1|bc4|bc5|bc7|bc7-srgb|rgba8] [--no-mips] [--toksvig <normal texture>] [--texture-root <dir>]\n" << Qt::flush;
+        return 2;
+    }
+    Pbr::MaterialDocument document;
+    QString error;
+    if (!document.load(materialFile, &error)) {
+        out() << "error: " << error << '\n' << Qt::flush;
+        return 1;
+    }
+    const QString textureRoot = effectiveTextureRoot(options);
+    const Pbr::TextureSlotState state = document.textureSlot(setName, slotKey);
+    const QImage composite = TextureCache::packedImage(state, textureRoot);
+    if (composite.isNull()) {
+        out() << "error: the slot's composite image is empty (missing texture or unknown slot)\n" << Qt::flush;
+        return 1;
+    }
+    const QString formatName = options.value(QStringLiteral("--format"), QStringLiteral("bc7")).toLower();
+    TextureWriter::DdsFormat format = TextureWriter::DdsFormat::Bc7;
+    if (formatName == QLatin1String("bc1")) format = TextureWriter::DdsFormat::Bc1;
+    else if (formatName == QLatin1String("bc4")) format = TextureWriter::DdsFormat::Bc4;
+    else if (formatName == QLatin1String("bc5")) format = TextureWriter::DdsFormat::Bc5;
+    else if (formatName == QLatin1String("bc7-srgb")) format = TextureWriter::DdsFormat::Bc7Srgb;
+    else if (formatName == QLatin1String("rgba8")) format = TextureWriter::DdsFormat::Rgba8;
+    else if (formatName != QLatin1String("bc7")) {
+        out() << "error: unknown format '" << formatName << "'\n" << Qt::flush;
+        return 2;
+    }
+    QImage toksvigNormal;
+    if (options.flags.contains(QStringLiteral("--toksvig"))) {
+        QString toksvigError;
+        toksvigNormal = TextureImage::load(options.value(QStringLiteral("--toksvig")), textureRoot, &toksvigError);
+        if (toksvigNormal.isNull()) {
+            out() << "error: Toksvig normal could not be loaded: " << toksvigError << '\n' << Qt::flush;
+            return 1;
+        }
+    }
+    if (!TextureWriter::saveDds(composite, target, format, !options.has(QStringLiteral("--no-mips")), &error, toksvigNormal)) {
+        out() << "error: " << error << '\n' << Qt::flush;
+        return 1;
+    }
+    out() << "packed " << setName << '/' << slotKey << " -> " << target << '\n' << Qt::flush;
+    return 0;
+}
+
+QString helpText()
+{
+    return QStringLiteral(
+        "pbrm — FO4 PBR Material Editor headless companion\n"
+        "\n"
+        "usage: pbrm <verb> [options] [files or folders...]\n"
+        "\n"
+        "verbs:\n"
+        "  validate            check materials (same findings as the GUI validation)\n"
+        "  migrate             re-save materials on the current schema (v4 -> v5)\n"
+        "  extract-states      write legacy per-material states to definitions JSON sidecars\n"
+        "  strip-legacy        remove legacy surface data (groups, response slots, retired keys)\n"
+        "  set-setting         set one setting key across materials\n"
+        "  repair-paths        re-point broken texture paths by filename\n"
+        "  export-definitions  write the built-in surface state definitions JSON\n"
+        "  export-json         write readable .pbrm.json sidecars\n"
+        "  pack                composite a slot's channel sources into a game-ready DDS\n"
+        "\n"
+        "common options: --json (machine-readable reports), --dry-run (report only),\n"
+        "  --texture-root <dir> (explicit source root; editor settings are the fallback)\n");
+}
+
+int runVerb(const QString& verb, const QStringList& args)
+{
+    if (verb == QLatin1String("validate")) return runValidate(args);
+    if (verb == QLatin1String("migrate")) return runMigrate(args);
+    if (verb == QLatin1String("extract-states")) return runExtractStates(args);
+    if (verb == QLatin1String("strip-legacy")) return runStripLegacy(args);
+    if (verb == QLatin1String("set-setting")) return runSetSetting(args);
+    if (verb == QLatin1String("repair-paths")) return runRepairPaths(args);
+    if (verb == QLatin1String("export-definitions")) return runExportDefinitions(args);
+    if (verb == QLatin1String("export-json")) return runExportJson(args);
+    if (verb == QLatin1String("pack")) return runPack(args);
+    out() << helpText() << Qt::flush;
+    return verb == QLatin1String("help") || verb == QLatin1String("--help") ? 0 : 2;
+}
+
+} // namespace PbrmCli

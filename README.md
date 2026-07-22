@@ -85,9 +85,10 @@ scratch for this project and do not depend on Bethesda's Material Editor.
   micro-surface, landscape layers pack surface-state porosity into the normal
   array's alpha, and single-channel inputs get BC4 bake suggestions plus
   validation when fed multi-channel textures. Packed-texture export generates
-  mean-preserving per-channel mips and can fold a paired normal map's
+  mean-preserving per-channel mips; normal-map exports vector-average and
+  renormalize each mip, and RMAOS exports can fold a paired normal map's
   variance into the roughness chain (Toksvig) so minified speculars stop
-  aliasing.
+  aliasing without changing mip 0.
 - A particle compositing stack for the effect families: per-layer flipbooks
   (grid, age/time/constant drivers, loop modes, frame cross-fade), polar
   coordinates, extended layer blends (Screen, Subtract, Min, Max, Overlay),
@@ -160,9 +161,12 @@ scratch for this project and do not depend on Bethesda's Material Editor.
   layer copy/paste/reset; default/override/runtime/invalid state badges.
 - Starting templates for metal, painted metal, plastic, glass, skin, vegetation,
   hair, water, physically lit effects, and landscape materials.
-- Validation, undo/redo, recent materials and last-session reopen, an authored-
-  overrides comparison page, Ctrl+Backspace field reset, expert-mode overrides,
-  and root-relative portable paths.
+- Validation with quick-fixes: findings render as severity-ordered rows, and
+  findings with a safe automatic remedy carry a Fix button (each fix is a
+  single undo step and re-validates immediately); texture-file findings stay
+  manual by design. Plus undo/redo, recent materials and last-session reopen,
+  an authored-overrides comparison page, Ctrl+Backspace field reset,
+  expert-mode overrides, and root-relative portable paths.
 
 The editor defines and previews authoring data. Community Shaders runtime
 binding, animated/skinned NIF evaluation, and Creation Kit integration remain
@@ -179,7 +183,9 @@ qmake6 PBRMaterialEditor.pro
 mingw32-make -j4
 ```
 
-The executable is written to `bin/PBR Material Editor.exe`.
+The executable is written to `bin/PBR Material Editor.exe`. The console
+companion builds from `cli/PbrmCli.pro` the same way and lands at
+`bin/pbrm.exe`.
 
 Create a portable folder (including the MSYS2 runtime dependencies omitted by
 `windeployqt`) with:
@@ -187,6 +193,30 @@ Create a portable folder (including the MSYS2 runtime dependencies omitted by
 ```powershell
 .\scripts\package.ps1
 ```
+
+## Command line (`pbrm.exe`)
+
+Every headless-capable operation has a CLI verb (and new features ship with
+theirs). The portable package includes `pbrm.exe` beside the editor:
+
+```text
+pbrm validate [--texture-root <dir>] [--json] <files or folders...>
+pbrm migrate [--dry-run] <paths>            # re-save on the current schema
+pbrm extract-states <paths>                 # legacy states -> definitions JSON sidecars
+pbrm strip-legacy [--dry-run] <paths>       # remove legacy surface data
+pbrm set-setting --section S --key K --value V [--dry-run] <paths>
+pbrm repair-paths [--texture-root <dir>] [--dry-run] <paths>
+pbrm export-definitions <file.json>         # built-in surface state definitions
+pbrm export-json <paths>                    # readable .pbrm.json sidecars
+pbrm pack --material <m.pbrm> --slot <key> --out <f.dds>
+          [--set UV0] [--format bc1|bc4|bc5|bc7|bc7-srgb|rgba8]
+          [--no-mips] [--toksvig <normal>] [--texture-root <dir>]
+```
+
+Reporting verbs accept `--json`; exit codes are 0 (clean), 1 (findings or
+failures), 2 (usage). `--texture-root` overrides the editor's configured
+sources so CI machines behave predictably. The GUI executable keeps
+`--validate` and `--ui-smoke` as compatibility aliases.
 
 ## Tests
 

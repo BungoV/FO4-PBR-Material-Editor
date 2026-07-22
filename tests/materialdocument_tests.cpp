@@ -666,6 +666,38 @@ int main(int argc, char* argv[])
     }
 
     {
+        // Shared legacy-data helpers: the groups-only strip (the validation
+        // quick-fix scope) preserves response slots and retired keys; the
+        // full strip removes everything.
+        Pbr::MaterialDocument legacyDoc;
+        legacyDoc.setSetting(QStringLiteral("SurfaceStates/State0"), QStringLiteral("name"), QStringLiteral("Wetness"));
+        Pbr::TextureSlotState responseSlot;
+        responseSlot.enabled = true;
+        responseSlot.path = QStringLiteral("foo_response.dds");
+        legacyDoc.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primarySurfaceStateResponse"), responseSlot);
+        Pbr::TextureSlotState legacyNormal;
+        legacyNormal.enabled = true;
+        legacyNormal.values.insert(QStringLiteral("layerMaskInAlpha"), true);
+        legacyDoc.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal"), legacyNormal);
+        check(Pbr::hasLegacySurfaceStateGroups(legacyDoc), QStringLiteral("legacy group detection sees authored slots"));
+        Pbr::MaterialDocument groupsOnly = legacyDoc;
+        check(Pbr::stripLegacySurfaceStateGroups(groupsOnly) == 1
+            && !Pbr::hasLegacySurfaceStateGroups(groupsOnly)
+            && groupsOnly.textureSet(QStringLiteral("UV0")).contains(QStringLiteral("primarySurfaceStateResponse"))
+            && groupsOnly.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.contains(QStringLiteral("layerMaskInAlpha")),
+            QStringLiteral("groups-only strip keeps the response slot and retired keys"));
+        Pbr::MaterialDocument fullStrip = legacyDoc;
+        check(Pbr::stripLegacySurfaceData(fullStrip) == 3
+            && !fullStrip.textureSet(QStringLiteral("UV0")).contains(QStringLiteral("primarySurfaceStateResponse"))
+            && !fullStrip.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.contains(QStringLiteral("layerMaskInAlpha")),
+            QStringLiteral("full strip removes groups, response slots, and retired keys"));
+        const QString extractTarget = directory.filePath(QStringLiteral("helper-extract.json"));
+        QString helperError;
+        check(Pbr::extractLegacyStates(legacyDoc, extractTarget, &helperError) && QFileInfo::exists(extractTarget),
+            QStringLiteral("extract helper writes the definitions sidecar: %1").arg(helperError));
+    }
+
+    {
         // Packer mip discipline: plain mean-preserving averages for packed
         // data channels, and Toksvig variance folding into the roughness mips.
         QImage packed(8, 8, QImage::Format_RGBA8888);
@@ -701,6 +733,35 @@ int main(int argc, char* argv[])
             QStringLiteral("packed alpha (curvature) mips stay mean-preserving"));
         check(flatRough / 8.0 <= 52.0 && noisyRough / 8.0 >= 90.0,
             QStringLiteral("Toksvig raises roughness only where normal variance was averaged away"));
+    }
+
+    {
+        // Normal mips average decoded vectors rather than encoded bytes. Two
+        // +X and two +Y normals have a normalized mean of (.707, .707, 0),
+        // which encodes near (218, 218), not the byte average (192, 192).
+        QImage normals(2, 2, QImage::Format_RGBA8888);
+        normals.setPixelColor(0, 0, QColor(255, 128, 0, 64));
+        normals.setPixelColor(1, 0, QColor(128, 255, 255, 192));
+        normals.setPixelColor(0, 1, QColor(255, 128, 0, 64));
+        normals.setPixelColor(1, 1, QColor(128, 255, 255, 192));
+        const QString normalDdsFile = directory.filePath(QStringLiteral("vector-filtered-normal.dds"));
+        QString normalDdsError;
+        check(TextureWriter::saveDds(normals, normalDdsFile, TextureWriter::DdsFormat::Rgba8,
+            true, &normalDdsError, QImage(), true),
+            QStringLiteral("vector-filtered normal DDS saves: %1").arg(normalDdsError));
+        QFile normalDdsIn(normalDdsFile);
+        check(normalDdsIn.open(QIODevice::ReadOnly), QStringLiteral("vector-filtered normal DDS reopens"));
+        const QByteArray normalDds = normalDdsIn.readAll();
+        const int normalMip1 = 128 + 2 * 2 * 4;
+        const uchar* baseTexel = reinterpret_cast<const uchar*>(normalDds.constData()) + 128;
+        const uchar* filteredTexel = reinterpret_cast<const uchar*>(normalDds.constData()) + normalMip1;
+        check(normalDds.size() >= normalMip1 + 4 && baseTexel[0] == 255 && baseTexel[1] == 128,
+            QStringLiteral("vector filtering leaves normal mip 0 unchanged"));
+        check(filteredTexel[0] >= 216 && filteredTexel[0] <= 220
+            && filteredTexel[1] >= 216 && filteredTexel[1] <= 220,
+            QStringLiteral("normal mip direction is vector-averaged and renormalized"));
+        check(std::abs(int(filteredTexel[2]) - 128) <= 1 && std::abs(int(filteredTexel[3]) - 128) <= 1,
+            QStringLiteral("normal mip auxiliary channels remain mean-preserving"));
     }
 
     const QStringList goldenNames = {

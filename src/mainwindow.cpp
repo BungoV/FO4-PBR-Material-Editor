@@ -812,69 +812,24 @@ void MainWindow::showBatchOperations()
                 // Extract: materialize this material's legacy per-material
                 // states as a standalone definitions JSON beside the file, so
                 // the authored tuning survives the strip.
-                bool legacy = false;
-                for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")})
-                    legacy = legacy || !document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty();
-                for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot)
-                    legacy = legacy || !document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty();
-                if (legacy) {
+                if (Pbr::hasLegacySurfaceStateGroups(document)) {
                     const QFileInfo info(file);
                     const QString target = info.absolutePath() + QLatin1Char('/') + info.completeBaseName() + QStringLiteral(".SurfaceStates.json");
-                    const auto resolvedStates = Pbr::resolveSurfaceStates(document);
+                    const int stateCount = Pbr::resolveSurfaceStates(document).size();
                     if (apply) {
-                        if (Pbr::saveSurfaceStateDefinitions(target, resolvedStates, &error))
-                            notes << tr("extracted %1 state(s) to %2").arg(resolvedStates.size()).arg(target);
+                        if (Pbr::extractLegacyStates(document, target, &error))
+                            notes << tr("extracted %1 state(s) to %2").arg(stateCount).arg(target);
                         else
                             notes << tr("extraction FAILED: %1").arg(error);
                     } else {
-                        notes << tr("would extract %1 state(s) to %2").arg(resolvedStates.size()).arg(target);
+                        notes << tr("would extract %1 state(s) to %2").arg(stateCount).arg(target);
                     }
                 }
             } else if (operation->currentIndex() == 4) {
                 // Strip: remove legacy state groups, retired response slots,
                 // and retired layer-mask keys. Constants were already folded
                 // into their v5 homes by the load-time migration.
-                int removed = 0;
-                for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")}) {
-                    if (document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty()) continue;
-                    document.clearSettingGroup(QStringLiteral("SurfaceStates/") + legacyName);
-                    ++removed;
-                }
-                for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot) {
-                    if (document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty()) continue;
-                    document.clearSettingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot));
-                    ++removed;
-                }
-                for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
-                    QJsonObject set = document.textureSet(setName);
-                    QStringList slotKeys;
-                    for (auto slotIt = set.constBegin(); slotIt != set.constEnd(); ++slotIt) slotKeys << slotIt.key();
-                    bool setChanged = false;
-                    for (const QString& slotKey : slotKeys) {
-                        if (slotKey.endsWith(QStringLiteral("SurfaceStateResponse"))) {
-                            set.remove(slotKey);
-                            setChanged = true;
-                            ++removed;
-                            continue;
-                        }
-                        if (!slotKey.endsWith(QStringLiteral("Normal"))) continue;
-                        QJsonObject slotObject = set.value(slotKey).toObject();
-                        QJsonObject values = slotObject.value(QStringLiteral("values")).toObject();
-                        bool valuesChanged = false;
-                        for (const QString& retired : {QStringLiteral("layerMaskInAlpha"), QStringLiteral("overrideLayerMask"), QStringLiteral("layerMask")}) {
-                            if (!values.contains(retired)) continue;
-                            values.remove(retired);
-                            valuesChanged = true;
-                        }
-                        if (valuesChanged) {
-                            slotObject.insert(QStringLiteral("values"), values);
-                            set.insert(slotKey, slotObject);
-                            setChanged = true;
-                            ++removed;
-                        }
-                    }
-                    if (setChanged) document.setTextureSet(setName, set);
-                }
+                const int removed = Pbr::stripLegacySurfaceData(document);
                 if (removed > 0) notes << tr("stripped %1 legacy surface item(s)").arg(removed);
             }
             const bool wouldChange = document.toJson() != before;

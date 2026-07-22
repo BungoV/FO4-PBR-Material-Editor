@@ -37,6 +37,65 @@ QImage halveImage(const QImage& source)
     return result;
 }
 
+// Normal maps cannot use the packed-data box filter above: averaging encoded
+// RG values shortens or biases the represented direction. Decode each 2x2
+// footprint to unit tangent-space vectors, average in vector space, then
+// renormalize and encode RG again. B/A remain independent mean-preserving data
+// channels for BC7 normal layouts that also carry height or curvature.
+QImage halveNormalImage(const QImage& source)
+{
+    const int width = qMax(1, source.width() / 2);
+    const int height = qMax(1, source.height() / 2);
+    QImage result(width, height, QImage::Format_RGBA8888);
+    for (int y = 0; y < height; ++y) {
+        const uchar* rows[2] = {
+            source.constScanLine(qMin(y * 2, source.height() - 1)),
+            source.constScanLine(qMin(y * 2 + 1, source.height() - 1))
+        };
+        uchar* out = result.scanLine(y);
+        for (int x = 0; x < width; ++x) {
+            const int xs[2] = {
+                qMin(x * 2, source.width() - 1) * 4,
+                qMin(x * 2 + 1, source.width() - 1) * 4
+            };
+            float averageX = 0.0f, averageY = 0.0f, averageZ = 0.0f;
+            int dataB = 0, dataA = 0;
+            for (int row = 0; row < 2; ++row) {
+                for (int column = 0; column < 2; ++column) {
+                    const uchar* texel = rows[row] + xs[column];
+                    float nx = texel[0] / 255.0f * 2.0f - 1.0f;
+                    float ny = texel[1] / 255.0f * 2.0f - 1.0f;
+                    float nz = std::sqrt(qMax(0.0f, 1.0f - nx * nx - ny * ny));
+                    const float inputLength = std::sqrt(nx * nx + ny * ny + nz * nz);
+                    if (inputLength > 1.0e-6f) {
+                        nx /= inputLength;
+                        ny /= inputLength;
+                        nz /= inputLength;
+                    }
+                    averageX += nx;
+                    averageY += ny;
+                    averageZ += nz;
+                    dataB += texel[2];
+                    dataA += texel[3];
+                }
+            }
+            const float averageLength = std::sqrt(
+                averageX * averageX + averageY * averageY + averageZ * averageZ);
+            if (averageLength > 1.0e-6f) {
+                averageX /= averageLength;
+                averageY /= averageLength;
+            } else {
+                averageX = averageY = 0.0f;
+            }
+            out[x * 4] = uchar(std::lround(qBound(0.0f, averageX * 0.5f + 0.5f, 1.0f) * 255.0f));
+            out[x * 4 + 1] = uchar(std::lround(qBound(0.0f, averageY * 0.5f + 0.5f, 1.0f) * 255.0f));
+            out[x * 4 + 2] = uchar((dataB + 2) / 4);
+            out[x * 4 + 3] = uchar((dataA + 2) / 4);
+        }
+    }
+    return result;
+}
+
 // Folds normal-map variance into the roughness (R) mip chain. Each normal mip
 // is the plain average of decoded unit vectors; the shortening of that average
 // measures how much normal detail the level lost, and that lost detail becomes
@@ -188,7 +247,8 @@ QByteArray encodeMipLevel(const QImage& mip, DdsFormat format)
 } // namespace
 
 bool saveDds(const QImage& image, const QString& filePath, DdsFormat format,
-    bool generateMips, QString* error, const QImage& toksvigNormal)
+    bool generateMips, QString* error, const QImage& toksvigNormal,
+    bool normalMapMips)
 {
     if (image.isNull()) {
         if (error) *error = QStringLiteral("There is no composed image to export.");
@@ -200,7 +260,9 @@ bool saveDds(const QImage& image, const QString& filePath, DdsFormat format,
     mips.append(image.convertToFormat(QImage::Format_RGBA8888));
     if (generateMips) {
         while (mips.last().width() > 1 || mips.last().height() > 1)
-            mips.append(halveImage(mips.last()));
+            mips.append(normalMapMips
+                ? halveNormalImage(mips.last())
+                : halveImage(mips.last()));
         applyToksvigToMips(mips, toksvigNormal);
     }
 

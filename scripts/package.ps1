@@ -6,9 +6,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $executable = Join-Path $projectRoot 'bin\PBR Material Editor.exe'
+$cliExecutable = Join-Path $projectRoot 'bin\pbrm.exe'
 
 if (-not (Test-Path $executable)) {
     throw "Build the release executable first: $executable"
+}
+if (-not (Test-Path $cliExecutable)) {
+    throw "Build the CLI companion first (cli\PbrmCli.pro): $cliExecutable"
 }
 
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
@@ -16,6 +20,7 @@ New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 Get-ChildItem -LiteralPath $Destination -File -Filter '*smoke*.png' -ErrorAction SilentlyContinue | Remove-Item -Force
 Get-ChildItem -LiteralPath $Destination -File -Filter 'portable-*.png' -ErrorAction SilentlyContinue | Remove-Item -Force
 Copy-Item -Force $executable $Destination
+Copy-Item -Force $cliExecutable $Destination
 Copy-Item -Force (Join-Path $projectRoot 'README.md') $Destination
 
 $licenseDirectory = Join-Path $Destination 'licenses'

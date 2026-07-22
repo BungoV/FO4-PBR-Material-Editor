@@ -857,12 +857,15 @@ void TextureSlotWidget::exportPackedTexture()
     formatCombo->addItem(tr("PNG (authoring interchange)"), -1);
     // Suggest by slot semantics: sRGB slots -> BC7 sRGB, RG-normal slots -> BC5,
     // single-channel slots -> BC4, everything else packed linear BC7.
+    const bool normalMapSlot = m_spec.format.contains(QStringLiteral("RG normal"))
+        || m_spec.format.contains(QStringLiteral("RG bent"))
+        || m_spec.format.contains(QStringLiteral("RG tangent"))
+        || m_spec.format.contains(QStringLiteral("RG coat"))
+        || m_spec.format.contains(QStringLiteral("RG detail"))
+        || m_spec.format.contains(QStringLiteral("RG per-frame"));
     if (m_spec.format.startsWith(QStringLiteral("sRGB"))) formatCombo->setCurrentIndex(0);
     else if (m_spec.channels.size() == 1) formatCombo->setCurrentIndex(3);
-    else if (m_spec.format.contains(QStringLiteral("RG normal")) || m_spec.format.contains(QStringLiteral("RG bent"))
-        || m_spec.format.contains(QStringLiteral("RG tangent")) || m_spec.format.contains(QStringLiteral("RG coat"))
-        || m_spec.format.contains(QStringLiteral("RG detail")) || m_spec.format.contains(QStringLiteral("RG per-frame")))
-        formatCombo->setCurrentIndex(2);
+    else if (normalMapSlot) formatCombo->setCurrentIndex(2);
     else formatCombo->setCurrentIndex(1);
     auto* mipsCheck = new QCheckBox(tr("Generate full mip chain"), &dialog);
     mipsCheck->setChecked(true);
@@ -931,7 +934,8 @@ void TextureSlotWidget::exportPackedTexture()
             }
         }
         saved = TextureWriter::saveDds(composite, fileName,
-            TextureWriter::DdsFormat(formatCombo->currentData().toInt()), mipsCheck->isChecked(), &error, toksvigNormal);
+            TextureWriter::DdsFormat(formatCombo->currentData().toInt()), mipsCheck->isChecked(), &error,
+            toksvigNormal, normalMapSlot);
     }
     if (!saved) {
         QMessageBox::critical(this, tr("Export Packed Texture"), error);

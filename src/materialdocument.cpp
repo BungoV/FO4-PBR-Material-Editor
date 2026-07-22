@@ -898,6 +898,72 @@ bool loadSurfaceStateDefinitions(const QString& fileName, QVector<SurfaceStateSp
     return true;
 }
 
+bool hasLegacySurfaceStateGroups(const MaterialDocument& document)
+{
+    for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")})
+        if (!document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty()) return true;
+    for (int slot = 0; slot < MaxSurfaceStates; ++slot)
+        if (!document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty()) return true;
+    return false;
+}
+
+int stripLegacySurfaceStateGroups(MaterialDocument& document)
+{
+    int removed = 0;
+    for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")}) {
+        if (document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty()) continue;
+        document.clearSettingGroup(QStringLiteral("SurfaceStates/") + legacyName);
+        ++removed;
+    }
+    for (int slot = 0; slot < MaxSurfaceStates; ++slot) {
+        if (document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty()) continue;
+        document.clearSettingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot));
+        ++removed;
+    }
+    return removed;
+}
+
+int stripLegacySurfaceData(MaterialDocument& document)
+{
+    int removed = stripLegacySurfaceStateGroups(document);
+    for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
+        QJsonObject set = document.textureSet(setName);
+        QStringList slotKeys;
+        for (auto it = set.constBegin(); it != set.constEnd(); ++it) slotKeys << it.key();
+        bool setChanged = false;
+        for (const QString& slotKey : slotKeys) {
+            if (slotKey.endsWith(QStringLiteral("SurfaceStateResponse"))) {
+                set.remove(slotKey);
+                setChanged = true;
+                ++removed;
+                continue;
+            }
+            if (!slotKey.endsWith(QStringLiteral("Normal"))) continue;
+            QJsonObject slotObject = set.value(slotKey).toObject();
+            QJsonObject values = slotObject.value(QStringLiteral("values")).toObject();
+            bool valuesChanged = false;
+            for (const QString& retired : {QStringLiteral("layerMaskInAlpha"), QStringLiteral("overrideLayerMask"), QStringLiteral("layerMask")}) {
+                if (!values.contains(retired)) continue;
+                values.remove(retired);
+                valuesChanged = true;
+            }
+            if (valuesChanged) {
+                slotObject.insert(QStringLiteral("values"), values);
+                set.insert(slotKey, slotObject);
+                setChanged = true;
+                ++removed;
+            }
+        }
+        if (setChanged) document.setTextureSet(setName, set);
+    }
+    return removed;
+}
+
+bool extractLegacyStates(const MaterialDocument& document, const QString& fileName, QString* error)
+{
+    return saveSurfaceStateDefinitions(fileName, resolveSurfaceStates(document), error);
+}
+
 QVector<SurfaceStateSpec> activeSurfaceStateDefinitions(QString* sourcePath)
 {
     if (sourcePath) sourcePath->clear();

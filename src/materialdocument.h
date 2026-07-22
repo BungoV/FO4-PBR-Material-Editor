@@ -165,4 +165,16 @@ bool loadSurfaceStateDefinitions(const QString& fileName, QVector<SurfaceStateSp
 // otherwise the built-in defaults from surfaceStatePresets().
 QVector<SurfaceStateSpec> activeSurfaceStateDefinitions(QString* sourcePath = nullptr);
 
+// Legacy (pre-v5) surface-data tooling, shared by the GUI batch operations,
+// the validation quick-fixes, and the CLI.
+bool hasLegacySurfaceStateGroups(const MaterialDocument& document);
+// Removes only the legacy SurfaceStates/* setting groups (the quick-fix
+// scope: response slots keep their repack breadcrumb). Returns the count.
+int stripLegacySurfaceStateGroups(MaterialDocument& document);
+// Removes legacy SurfaceStates/* groups, retired SurfaceStateResponse slots,
+// and retired layer-mask keys. Returns the number of removed items.
+int stripLegacySurfaceData(MaterialDocument& document);
+// Writes the document's resolved legacy states as a definitions JSON.
+bool extractLegacyStates(const MaterialDocument& document, const QString& fileName, QString* error = nullptr);
+
 } // namespace Pbr

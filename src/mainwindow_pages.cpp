@@ -1084,12 +1084,27 @@ QWidget* MainWindow::createAdvancedPage()
 
 QWidget* MainWindow::createValidationPage()
 {
-    auto page = createPage(tr("Material Validation"), tr("Checks authoring consistency, texture resolution, shader scope, and inactive resources before export."));
+    auto page = createPage(tr("Material Validation"), tr("Checks authoring consistency, texture resolution, shader scope, and inactive resources before export. Findings with a safe automatic remedy carry a Fix button; each fix is a single undo step."));
     QStringList errors;
     QStringList warnings;
+    // Findings with a safe one-click remedy. The fix runs through
+    // applyDocumentChange (one undo step) and the workspace re-validates
+    // immediately after. Texture-file findings stay manual by design.
+    struct FixableIssue {
+        bool error = false;
+        QString text;
+        QString fixLabel;
+        QString undoText;
+        std::function<void()> fix;
+    };
+    QVector<FixableIssue> fixables;
+    const auto addFix = [&fixables](bool error, const QString& text, const QString& fixLabel,
+                            const QString& undoText, std::function<void()> fix) {
+        fixables.append({error, text, fixLabel, undoText, std::move(fix)});
+    };
     int enabledTextures = 0;
 
-    const auto validate = [this, &errors, &warnings, &enabledTextures](const QString& setName, const TextureSlotSpec& spec, bool required = false) {
+    const auto validate = [this, &errors, &warnings, &addFix, &enabledTextures](const QString& setName, const TextureSlotSpec& spec, bool required = false) {
         Pbr::TextureSlotState state = m_document.textureSlot(setName, spec.key);
         if (state.path.isNull()) {
             state.enabled = spec.defaultEnabled;
@@ -1130,10 +1145,17 @@ QWidget* MainWindow::createValidationPage()
             // BC5 RG-only normal map is valid as-is. Channels whose sampling
             // genuinely matters get targeted checks below instead of a
             // blanket missing-channel error.
+            const auto setSlotValue = [this, setName, key = spec.key](const QString& valueKey, const QJsonValue& value) {
+                Pbr::TextureSlotState slotState = m_document.textureSlot(setName, key);
+                slotState.values.insert(valueKey, value);
+                m_document.setTextureSlot(setName, key, slotState);
+            };
             if (spec.key.contains(QStringLiteral("Normal"), Qt::CaseInsensitive)) {
                 const bool height = state.values.value(QStringLiteral("heightInBlue")).toBool(false);
                 if (height && !info.channels.contains(QStringLiteral("B")))
-                    errors << tr("%1/%2 enables \"B contains height\" but the texture has no blue channel.").arg(setName, spec.name);
+                    addFix(true, tr("%1/%2 enables \"B contains height\" but the texture has no blue channel.").arg(setName, spec.name),
+                        tr("Disable height flag"), tr("Disable B contains height on %1").arg(spec.name),
+                        [setSlotValue] { setSlotValue(QStringLiteral("heightInBlue"), false); });
                 else if (height && info.format != QStringLiteral("BC7"))
                     warnings << tr("%1/%2 packs height and should use BC7.").arg(setName, spec.name);
                 else if (!height && info.format != QStringLiteral("BC5") && info.format != QStringLiteral("BC7"))
@@ -1143,10 +1165,14 @@ QWidget* MainWindow::createValidationPage()
                 const bool alphaPorosity = state.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Porosity");
                 if (!alphaPorosity && !state.values.value(QStringLiteral("overrideF0")).toBool(true)
                     && !info.channels.contains(QStringLiteral("A")))
-                    errors << tr("%1/%2 samples dielectric F0 but the texture has no alpha channel.").arg(setName, spec.name);
+                    addFix(true, tr("%1/%2 samples dielectric F0 but the texture has no alpha channel.").arg(setName, spec.name),
+                        tr("Use F0 constant"), tr("Use the F0 constant on %1").arg(spec.name),
+                        [setSlotValue] { setSlotValue(QStringLiteral("overrideF0"), true); });
                 if (alphaPorosity && !state.values.value(QStringLiteral("overridePorosity")).toBool(false)
                     && !info.channels.contains(QStringLiteral("A")))
-                    errors << tr("%1/%2 declares alpha as porosity but the texture has no alpha channel.").arg(setName, spec.name);
+                    addFix(true, tr("%1/%2 declares alpha as porosity but the texture has no alpha channel.").arg(setName, spec.name),
+                        tr("Use porosity constant"), tr("Use the porosity constant on %1").arg(spec.name),
+                        [setSlotValue] { setSlotValue(QStringLiteral("overridePorosity"), true); });
                 if (alphaPorosity && state.values.value(QStringLiteral("overrideMetallic")).toBool(true)
                     && state.values.value(QStringLiteral("metallic")).toDouble(0.0) > .5)
                     warnings << tr("%1/%2 dedicates alpha to porosity on a strongly metallic material; sealed metal has no meaningful porosity and F0 authoring is sacrificed.").arg(setName, spec.name);
@@ -1163,9 +1189,18 @@ QWidget* MainWindow::createValidationPage()
             if (spec.key.contains(QStringLiteral("Normal"), Qt::CaseInsensitive) && !spec.key.contains(QStringLiteral("Dynamic"), Qt::CaseInsensitive)) {
                 if (state.values.value(QStringLiteral("curvatureInAlpha")).toBool(false)
                     && !info.channels.contains(QStringLiteral("A")))
-                    errors << tr("%1/%2 enables \"A contains curvature\" but the texture has no alpha channel.").arg(setName, spec.name);
+                    addFix(true, tr("%1/%2 enables \"A contains curvature\" but the texture has no alpha channel.").arg(setName, spec.name),
+                        tr("Disable curvature flag"), tr("Disable A contains curvature on %1").arg(spec.name),
+                        [setSlotValue] { setSlotValue(QStringLiteral("curvatureInAlpha"), false); });
                 if (state.values.value(QStringLiteral("layerMaskInAlpha")).toBool(false))
-                    warnings << tr("%1/%2 carries the retired layer-modulation-in-alpha flag; Normal alpha now carries signed curvature. Repack the old mask into a Layer Coverage texture or switch the layer to Height Blend coverage, then strip legacy surface data via Batch Operations.").arg(setName, spec.name);
+                    addFix(false, tr("%1/%2 carries the retired layer-modulation-in-alpha flag; Normal alpha now carries signed curvature. Repack the old mask into a Layer Coverage texture or switch the layer to Height Blend coverage first if the mask mattered.").arg(setName, spec.name),
+                        tr("Remove retired keys"), tr("Remove retired layer-mask keys from %1").arg(spec.name),
+                        [this, setName, key = spec.key] {
+                            Pbr::TextureSlotState slotState = m_document.textureSlot(setName, key);
+                            for (const QString& retired : {QStringLiteral("layerMaskInAlpha"), QStringLiteral("overrideLayerMask"), QStringLiteral("layerMask")})
+                                slotState.values.remove(retired);
+                            m_document.setTextureSlot(setName, key, slotState);
+                        });
                 if (!state.values.value(QStringLiteral("heightInBlue")).toBool(false)
                     && !state.values.value(QStringLiteral("curvatureInAlpha")).toBool(false)
                     && (info.channels.contains(QStringLiteral("B")) || info.channels.contains(QStringLiteral("A")))
@@ -1174,14 +1209,34 @@ QWidget* MainWindow::createValidationPage()
                         .arg(setName, spec.name).arg(info.channels.join(QString()));
             }
             QStringList overrideToggles;
+            QStringList providedOverrides;
             bool allOverridden = true;
             for (const FieldSpec& field : spec.fields) {
                 if (field.type != FieldType::Toggle || !field.key.startsWith(QStringLiteral("override"))) continue;
                 overrideToggles << field.key;
                 allOverridden = allOverridden && state.values.value(field.key).toBool(field.defaultValue.toBool());
+                // Channel letters before the bullet in the label (the slot
+                // widget's convention); the fix flips only overrides whose
+                // channels the texture actually provides.
+                const QString channels = field.label.section(QChar(0x2022), 0, 0).trimmed();
+                bool provided = !channels.isEmpty();
+                for (const QChar channel : channels)
+                    if (QStringLiteral("RGBA").contains(channel)) provided = provided && info.channels.contains(channel);
+                if (provided) providedOverrides << field.key;
             }
-            if (overrideToggles.size() >= 2 && allOverridden)
-                warnings << tr("%1/%2 has a texture assigned but every channel is overridden by constants; the texture is never sampled.").arg(setName, spec.name);
+            if (overrideToggles.size() >= 2 && allOverridden) {
+                if (providedOverrides.isEmpty())
+                    warnings << tr("%1/%2 has a texture assigned but every channel is overridden by constants; the texture is never sampled.").arg(setName, spec.name);
+                else
+                    addFix(false, tr("%1/%2 has a texture assigned but every channel is overridden by constants; the texture is never sampled.").arg(setName, spec.name),
+                        tr("Use texture channels"), tr("Use texture channels on %1").arg(spec.name),
+                        [this, setName, key = spec.key, providedOverrides] {
+                            Pbr::TextureSlotState slotState = m_document.textureSlot(setName, key);
+                            for (const QString& overrideKey : providedOverrides)
+                                slotState.values.insert(overrideKey, false);
+                            m_document.setTextureSlot(setName, key, slotState);
+                        });
+            }
         }
     };
 
@@ -1193,14 +1248,20 @@ QWidget* MainWindow::createValidationPage()
             validate(QStringLiteral("Landscape"), spec, requiredArrays.contains(spec.key));
     } else {
         for (const auto& spec : textureSlotsFor(m_document.shaderMode(), QStringLiteral("UV0"))) validate(QStringLiteral("UV0"), spec);
-        const auto validateOverlay = [this, &validate, &warnings](const QString& uvSet, bool layerEnabled, const QString& layerName) {
+        const auto validateOverlay = [this, &validate, &addFix](const QString& uvSet, bool layerEnabled, const QString& layerName) {
             if (layerEnabled) {
                 for (const auto& spec : textureSlotsFor(m_document.shaderMode(), uvSet)) validate(uvSet, spec);
                 return;
             }
             for (const QJsonValue& value : m_document.textureSet(uvSet)) {
                 if (Pbr::TextureSlotState::fromJson(value.toObject()).enabled) {
-                    warnings << tr("%1 UV contains enabled inputs but the layer itself is disabled.").arg(layerName);
+                    const bool tertiary = uvSet == QStringLiteral("UV2");
+                    addFix(false, tr("%1 UV contains enabled inputs but the layer itself is disabled.").arg(layerName),
+                        tr("Enable layer"), tr("Enable the %1 UV layer").arg(layerName),
+                        [this, tertiary] {
+                            if (tertiary) m_document.setTertiaryUvEnabled(true);
+                            else m_document.setSecondaryUvEnabled(true);
+                        });
                     break;
                 }
             }
@@ -1211,9 +1272,14 @@ QWidget* MainWindow::createValidationPage()
     const QJsonObject parallax = m_document.settingGroup(QStringLiteral("Geometry/Parallax"));
     const QString heightSource = m_document.setting(QStringLiteral("Geometry/Source"), QStringLiteral("source"), QStringLiteral("None")).toString();
     if (parallax.value(QStringLiteral("enabled")).toBool(false)) {
-        if (heightSource == QStringLiteral("None")) errors << tr("Parallax is enabled without a height source.");
+        if (heightSource == QStringLiteral("None"))
+            addFix(true, tr("Parallax is enabled without a height source."),
+                tr("Disable parallax"), tr("Disable parallax"),
+                [this] { m_document.setSetting(QStringLiteral("Geometry/Parallax"), QStringLiteral("enabled"), false); });
         if (heightSource.startsWith(QStringLiteral("Secondary")) && !m_document.secondaryUvEnabled())
-            errors << tr("Parallax uses a Secondary height source while Secondary UV is disabled.");
+            addFix(true, tr("Parallax uses a Secondary height source while Secondary UV is disabled."),
+                tr("Enable Secondary UV"), tr("Enable the Secondary UV layer"),
+                [this] { m_document.setSecondaryUvEnabled(true); });
         if (heightSource != QStringLiteral("None")) {
             const bool landscapeSource = heightSource.startsWith(QStringLiteral("Landscape"));
             const bool secondarySource = heightSource.startsWith(QStringLiteral("Secondary"));
@@ -1224,22 +1290,56 @@ QWidget* MainWindow::createValidationPage()
                 ? (normalBlue ? QStringLiteral("normalHeightArray") : QStringLiteral("heightArray"))
                 : prefix + (normalBlue ? QStringLiteral("Normal") : QStringLiteral("SeparateHeight"));
             const Pbr::TextureSlotState sourceState = m_document.textureSlot(set, key);
-            if (!sourceState.enabled) errors << tr("The selected parallax height texture input is disabled.");
+            const auto setSourceValue = [this, set, key](const QString& valueKey, const QJsonValue& value) {
+                Pbr::TextureSlotState slotState = m_document.textureSlot(set, key);
+                slotState.values.insert(valueKey, value);
+                m_document.setTextureSlot(set, key, slotState);
+            };
+            if (!sourceState.enabled)
+                addFix(true, tr("The selected parallax height texture input is disabled."),
+                    tr("Enable input"), tr("Enable the parallax height input"),
+                    [this, set, key] {
+                        Pbr::TextureSlotState slotState = m_document.textureSlot(set, key);
+                        slotState.enabled = true;
+                        m_document.setTextureSlot(set, key, slotState);
+                    });
             if (normalBlue && !sourceState.values.value(QStringLiteral("heightInBlue")).toBool(false))
-                errors << tr("The selected Normal Blue source does not have 'B contains height' enabled.");
+                addFix(true, tr("The selected Normal Blue source does not have 'B contains height' enabled."),
+                    tr("Enable height flag"), tr("Enable B contains height on the parallax source"),
+                    [setSourceValue] { setSourceValue(QStringLiteral("heightInBlue"), true); });
             const bool overridden = sourceState.values.value(QStringLiteral("overrideHeight")).toBool(true);
             if (sourceState.path.trimmed().isEmpty() && overridden)
                 warnings << tr("Parallax uses a constant height override; without texture variation it cannot produce surface detail.");
         }
-        if (parallax.value(QStringLiteral("customQuality")).toBool(false)
-            && parallax.value(QStringLiteral("minSteps")).toInt(12) > parallax.value(QStringLiteral("maxSteps")).toInt(40))
-            errors << tr("Parallax minimum view steps exceed maximum view steps.");
-        if (parallax.value(QStringLiteral("fadeStart")).toDouble(512.0) > parallax.value(QStringLiteral("fadeEnd")).toDouble(2048.0))
-            errors << tr("Parallax fade start exceeds fade end.");
+        const int minSteps = parallax.value(QStringLiteral("minSteps")).toInt(12);
+        const int maxSteps = parallax.value(QStringLiteral("maxSteps")).toInt(40);
+        if (parallax.value(QStringLiteral("customQuality")).toBool(false) && minSteps > maxSteps)
+            addFix(true, tr("Parallax minimum view steps exceed maximum view steps."),
+                tr("Swap values"), tr("Swap parallax view-step bounds"),
+                [this, minSteps, maxSteps] {
+                    m_document.setSetting(QStringLiteral("Geometry/Parallax"), QStringLiteral("minSteps"), maxSteps);
+                    m_document.setSetting(QStringLiteral("Geometry/Parallax"), QStringLiteral("maxSteps"), minSteps);
+                });
+        const double parallaxFadeStart = parallax.value(QStringLiteral("fadeStart")).toDouble(512.0);
+        const double parallaxFadeEnd = parallax.value(QStringLiteral("fadeEnd")).toDouble(2048.0);
+        if (parallaxFadeStart > parallaxFadeEnd)
+            addFix(true, tr("Parallax fade start exceeds fade end."),
+                tr("Swap values"), tr("Swap parallax fade distances"),
+                [this, parallaxFadeStart, parallaxFadeEnd] {
+                    m_document.setSetting(QStringLiteral("Geometry/Parallax"), QStringLiteral("fadeStart"), parallaxFadeEnd);
+                    m_document.setSetting(QStringLiteral("Geometry/Parallax"), QStringLiteral("fadeEnd"), parallaxFadeStart);
+                });
     }
     const QJsonObject optimization = m_document.settingGroup(QStringLiteral("Advanced/Optimization"));
-    if (optimization.value(QStringLiteral("fadeStart")).toDouble(4096.0) > optimization.value(QStringLiteral("fadeEnd")).toDouble(8192.0))
-        errors << tr("Advanced feature fade start exceeds fade end.");
+    const double advancedFadeStart = optimization.value(QStringLiteral("fadeStart")).toDouble(4096.0);
+    const double advancedFadeEnd = optimization.value(QStringLiteral("fadeEnd")).toDouble(8192.0);
+    if (advancedFadeStart > advancedFadeEnd)
+        addFix(true, tr("Advanced feature fade start exceeds fade end."),
+            tr("Swap values"), tr("Swap Advanced fade distances"),
+            [this, advancedFadeStart, advancedFadeEnd] {
+                m_document.setSetting(QStringLiteral("Advanced/Optimization"), QStringLiteral("fadeStart"), advancedFadeEnd);
+                m_document.setSetting(QStringLiteral("Advanced/Optimization"), QStringLiteral("fadeEnd"), advancedFadeStart);
+            });
     const QJsonObject transparency = m_document.settingGroup(QStringLiteral("Transparency/Composition"));
     const QString composition = transparency.value(QStringLiteral("mode")).toString(QStringLiteral("Opaque"));
     const QString alphaSource = transparency.value(QStringLiteral("alphaSource")).toString(QStringLiteral("Base Color A"));
@@ -1250,11 +1350,15 @@ QWidget* MainWindow::createValidationPage()
     if (alphaSource.contains(QStringLiteral("Gradient")) && !effectShader)
         errors << tr("The selected alpha source requires a Particle Gradient texture input that this shader does not expose.");
     if (m_document.shaderMode() == Pbr::ShaderMode::LandscapeSurface && composition != QStringLiteral("Opaque"))
-        errors << tr("Landscape supports only Opaque composition.");
+        addFix(true, tr("Landscape supports only Opaque composition."),
+            tr("Set Opaque"), tr("Set composition to Opaque"),
+            [this] { m_document.setSetting(QStringLiteral("Transparency/Composition"), QStringLiteral("mode"), QStringLiteral("Opaque")); });
     if (composition == QStringLiteral("Alpha Test")
         && (transparency.value(QStringLiteral("threshold")).toDouble(0.5) <= 0.0
             || transparency.value(QStringLiteral("threshold")).toDouble(0.5) >= 1.0))
-        warnings << tr("Alpha-test threshold is at an extreme and will keep or discard nearly every pixel.");
+        addFix(false, tr("Alpha-test threshold is at an extreme and will keep or discard nearly every pixel."),
+            tr("Reset to 0.5"), tr("Reset the alpha-test threshold"),
+            [this] { m_document.setSetting(QStringLiteral("Transparency/Composition"), QStringLiteral("threshold"), 0.5); });
     const QStringList looseSources = TextureImage::searchRoots(m_textureRoot);
     const QStringList archives = TextureImage::archivePaths();
     if (looseSources.isEmpty() && archives.isEmpty())
@@ -1267,13 +1371,27 @@ QWidget* MainWindow::createValidationPage()
         // v5: surface state behavior is runtime-owned. Per-material state
         // groups and the response slot are legacy data; the SurfaceResponse
         // bindings are checked against the previewed definitions.
-        bool legacyGroups = false;
-        for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")})
-            legacyGroups = legacyGroups || !m_document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty();
-        for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot)
-            legacyGroups = legacyGroups || !m_document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty();
-        if (legacyGroups)
-            errors << tr("Legacy per-material surface state groups are authored; state behavior is runtime-owned as of PBRM v5. Use Batch Operations to extract them to a definitions JSON and strip them.");
+        if (Pbr::hasLegacySurfaceStateGroups(m_document)) {
+            if (m_document.fileName().trimmed().isEmpty())
+                errors << tr("Legacy per-material surface state groups are authored; state behavior is runtime-owned as of PBRM v5. Save the material to enable the one-click extract & strip.");
+            else
+                addFix(true, tr("Legacy per-material surface state groups are authored; state behavior is runtime-owned as of PBRM v5."),
+                    tr("Extract && strip"), tr("Extract legacy states and strip them"),
+                    [this] {
+                        const QFileInfo info(m_document.fileName());
+                        const QString target = info.absolutePath() + QLatin1Char('/') + info.completeBaseName() + QStringLiteral(".SurfaceStates.json");
+                        QString extractError;
+                        if (!Pbr::extractLegacyStates(m_document, target, &extractError)) {
+                            QMessageBox::warning(this, tr("Extract legacy states"),
+                                tr("The definitions JSON could not be written, so nothing was stripped: %1").arg(extractError));
+                            return;
+                        }
+                        // Groups only: a retired response slot keeps its own
+                        // finding (and repack breadcrumb) until handled.
+                        Pbr::stripLegacySurfaceStateGroups(m_document);
+                        statusBar()->showMessage(tr("Extracted legacy states to %1 and stripped the groups").arg(target), 6000);
+                    });
+        }
         for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
             const QJsonObject set = m_document.textureSet(setName);
             for (auto it = set.constBegin(); it != set.constEnd(); ++it)
@@ -1297,9 +1415,62 @@ QWidget* MainWindow::createValidationPage()
             warnings << tr("Surface state mask bindings are authored but no Surface State Masks texture is assigned.");
     }
 
-    addInfoCard(page.content, errors.isEmpty() ? tr("No blocking errors") : tr("Blocking errors"),
-        errors.isEmpty() ? tr("The material structure is internally consistent.") : errors.join(QStringLiteral("\n")), !errors.isEmpty());
-    if (!warnings.isEmpty()) addInfoCard(page.content, tr("Warnings"), warnings.join(QStringLiteral("\n")), true);
+    int errorCount = errors.size(), warningCount = warnings.size();
+    for (const auto& fixable : fixables) (fixable.error ? errorCount : warningCount)++;
+    if (errorCount + warningCount == 0) {
+        addInfoCard(page.content, tr("No findings"), tr("The material structure is internally consistent."));
+    } else {
+        // Structured findings: severity-ordered rows; rows with a safe
+        // automatic remedy carry a Fix button (one undo step, immediate
+        // re-validation).
+        auto* card = new QFrame(page.content->parentWidget());
+        card->setObjectName(QStringLiteral("Card"));
+        card->setStyleSheet(errorCount > 0
+            ? QStringLiteral("QFrame#Card { border-color:#8a4034; background:#362823; }")
+            : QStringLiteral("QFrame#Card { border-color:#9a6d2c; background:#392f24; }"));
+        auto* rows = new QVBoxLayout(card);
+        rows->setContentsMargins(8, 5, 8, 5);
+        rows->setSpacing(4);
+        auto* heading = new QLabel(errorCount > 0
+            ? tr("Findings — %1 error(s), %2 warning(s)").arg(errorCount).arg(warningCount)
+            : tr("Findings — %1 warning(s)").arg(warningCount), card);
+        heading->setObjectName(QStringLiteral("SectionTitle"));
+        rows->addWidget(heading);
+        QStringList searchText;
+        const auto addRow = [this, card, rows, &searchText](bool error, const QString& text, const FixableIssue* fixable) {
+            searchText << text;
+            auto* row = new QWidget(card);
+            auto* rowLayout = new QHBoxLayout(row);
+            rowLayout->setContentsMargins(0, 0, 0, 0);
+            rowLayout->setSpacing(8);
+            auto* dot = new QLabel(QStringLiteral("●"), row);
+            dot->setStyleSheet(error ? QStringLiteral("color:#e06c5a;") : QStringLiteral("color:#d9a13c;"));
+            auto* label = new QLabel(text, row);
+            label->setObjectName(QStringLiteral("Muted"));
+            label->setWordWrap(true);
+            rowLayout->addWidget(dot, 0, Qt::AlignTop);
+            rowLayout->addWidget(label, 1);
+            if (fixable && fixable->fix) {
+                auto* fixButton = new QPushButton(fixable->fixLabel, row);
+                const QString undoText = fixable->undoText;
+                const std::function<void()> fix = fixable->fix;
+                connect(fixButton, &QPushButton::clicked, this, [this, undoText, fix] {
+                    applyDocumentChange(undoText, fix);
+                    // Refresh after the click finishes so the button is not
+                    // destroyed mid-signal (the settings-editor rebuild rule).
+                    QTimer::singleShot(0, this, [this] { rebuildWorkspace(m_currentPage); });
+                });
+                rowLayout->addWidget(fixButton, 0, Qt::AlignTop);
+            }
+            rows->addWidget(row);
+        };
+        for (const QString& text : errors) addRow(true, text, nullptr);
+        for (const auto& fixable : fixables) if (fixable.error) addRow(true, fixable.text, &fixable);
+        for (const QString& text : warnings) addRow(false, text, nullptr);
+        for (const auto& fixable : fixables) if (!fixable.error) addRow(false, fixable.text, &fixable);
+        card->setProperty("searchText", tr("Findings") + QStringLiteral(" ") + searchText.join(QStringLiteral(" ")));
+        page.content->addWidget(card);
+    }
     addInfoCard(page.content, tr("Resource summary"), tr("Shader: %1\nActive texture inputs: %2\nTexture sources: %3 loose, %4 archive(s)")
         .arg(Pbr::shaderModeName(m_document.shaderMode())).arg(enabledTextures)
         .arg(looseSources.size()).arg(archives.size()));
