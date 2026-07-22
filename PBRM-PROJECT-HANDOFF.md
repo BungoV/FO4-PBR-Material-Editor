@@ -164,12 +164,21 @@ blindly.
    Live-verified on FO76 (gold Protectron 90% metal, warm albedo
    reconstructed from black diffuse), FO4 BGSM (X-02), FO4 BGEM (Unlit
    emission), FO4 glowmap `_E` bake. 308 test checks green.
-   **Remaining, in spec order**: Convert workspace GUI (Author|Convert
-   switcher + queue), 3D mask painting with Substance-style fills,
-   geometry AO (canonical-instance islands, QOffscreenSurface) +
-   `bake-ao`, manifest incremental/`--clean`, BA2-direct reads. Finish
-   line: dry-run + convert across the entire vanilla Fallout 4 texture
-   BA2 set.
+   **Also shipped**: 285-material real-FO76 sweep (texture-free
+   constant-color BGEMs now convert to constants-only siblings), manifest
+   incremental re-runs (source mtime + options signature; `--force`) +
+   `--clean` rollback (containment-guarded, foreign files survive), and
+   the **Convert workspace foundation** (`src/convertworkspace.*`):
+   Author|Convert top-bar switcher over a QStackedWidget, source/texture
+   root/output pickers (QSettings-persisted), scan queue with per-material
+   status + metal%, options row, Dry Run / Convert Selected / Convert All
+   / Cancel on a worker thread, per-material findings detail, Open in
+   Author bridge — live-verified end to end.
+   **Remaining, in spec order**: workspace polish (shared preview pane,
+   flagged-queue walk, correction-mask hooks), 3D mask painting with
+   Substance-style fills, geometry AO (canonical-instance islands,
+   QOffscreenSurface) + `bake-ao`, BA2-direct reads. Finish line: dry-run
+   + convert across the entire vanilla Fallout 4 texture BA2 set.
 4. **Runtime campaign** (#38, below).
 
 ## Next: runtime campaign (#38, FO4CS repo)

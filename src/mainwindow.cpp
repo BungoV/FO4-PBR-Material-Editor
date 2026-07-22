@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 
 #include "colorpicker.h"
+#include "convertworkspace.h"
 #include "disclosureicon.h"
 #include "dragnumericedit.h"
 #include "mainwindow_detail.h"
@@ -176,6 +177,27 @@ void MainWindow::buildWindow()
     topBar->setObjectName(QStringLiteral("TopBar"));
     auto* top = new QHBoxLayout(topBar);
     top->setContentsMargins(9, 5, 9, 5);
+    // Workspace switcher: Author edits one .pbrm; Convert runs the FO4/FO76
+    // batch pipeline (docs/FO4-Conversion.md).
+    const auto makeModeButton = [topBar, this](const QString& text, bool convert) {
+        auto* button = new QToolButton(topBar);
+        button->setText(text);
+        button->setCheckable(true);
+        button->setAutoRaise(true);
+        connect(button, &QToolButton::clicked, this, [this, convert] { setWorkspaceMode(convert); });
+        return button;
+    };
+    m_authorModeButton = makeModeButton(tr("Author"), false);
+    m_authorModeButton->setChecked(true);
+    m_authorModeButton->setToolTip(tr("Edit the open .pbrm material."));
+    m_convertModeButton = makeModeButton(tr("Convert"), true);
+    m_convertModeButton->setToolTip(tr("Batch-convert FO4/FO76 .bgsm/.bgem materials and textures to PBR siblings."));
+    top->addWidget(m_authorModeButton);
+    top->addWidget(m_convertModeButton);
+    auto* modeSeparator = new QFrame(topBar);
+    modeSeparator->setFrameShape(QFrame::VLine);
+    modeSeparator->setFrameShadow(QFrame::Sunken);
+    top->addWidget(modeSeparator);
     top->addWidget(new QLabel(tr("Shader"), topBar));
     m_shaderCombo = new QComboBox(topBar);
     m_shaderCombo->addItems(Pbr::shaderModeNames());
@@ -224,7 +246,14 @@ void MainWindow::buildWindow()
     m_splitter->setStretchFactor(0, 0);
     m_splitter->setStretchFactor(1, 1);
     m_splitter->setStretchFactor(2, 0);
-    root->addWidget(m_splitter, 1);
+    m_workspaceStack = new QStackedWidget(central);
+    m_workspaceStack->addWidget(m_splitter);
+    m_convertWorkspace = new ConvertWorkspace(m_workspaceStack);
+    m_workspaceStack->addWidget(m_convertWorkspace);
+    connect(m_convertWorkspace, &ConvertWorkspace::openInAuthorRequested, this, [this](const QString& pbrmPath) {
+        if (maybeSave() && openFile(pbrmPath)) setWorkspaceMode(false);
+    });
+    root->addWidget(m_workspaceStack, 1);
     setCentralWidget(central);
 
     connect(m_shaderCombo, &QComboBox::currentTextChanged, this, [this](const QString& name) {
@@ -250,6 +279,17 @@ void MainWindow::buildWindow()
             if (it.key().contains(query, Qt::CaseInsensitive)) { openSearchResult(it.key()); return; }
         }
     });
+}
+
+void MainWindow::setWorkspaceMode(bool convert)
+{
+    m_authorModeButton->setChecked(!convert);
+    m_convertModeButton->setChecked(convert);
+    m_workspaceStack->setCurrentIndex(convert ? 1 : 0);
+    // The shader combo and settings search act on the Author document; keep
+    // them visibly inert while the Convert queue owns the window.
+    m_shaderCombo->setEnabled(!convert);
+    m_search->setEnabled(!convert);
 }
 
 void MainWindow::buildMenus()

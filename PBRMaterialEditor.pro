@@ -14,6 +14,7 @@ SOURCES += \
     src/clicommands.cpp \
     src/converter.cpp \
     src/convertercore.cpp \
+    src/convertworkspace.cpp \
     src/normalderive.cpp \
     src/materialdocument.cpp \
     src/texturearchive.cpp \
@@ -39,6 +40,7 @@ HEADERS += \
     src/clicommands.h \
     src/converter.h \
     src/convertercore.h \
+    src/convertworkspace.h \
     src/normalderive.h \
     src/materialdocument.h \
     src/texturearchive.h \

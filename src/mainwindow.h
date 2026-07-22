@@ -26,6 +26,7 @@ class QSplitter;
 class QToolButton;
 class QUndoStack;
 class QVBoxLayout;
+class ConvertWorkspace;
 class MaterialPreviewWidget;
 
 class MainWindow final : public QMainWindow {
@@ -52,6 +53,7 @@ private:
 
     void buildWindow();
     void buildMenus();
+    void setWorkspaceMode(bool convert);
     void rebuildWorkspace(const QString& preferredPage = QStringLiteral("Primary UV Textures"));
     void rebuildNavigation();
     void addNavigationSection(const QString& title);
@@ -128,6 +130,10 @@ private:
     QStackedWidget* m_pages = nullptr;
     MaterialPreviewWidget* m_preview = nullptr;
     QSplitter* m_splitter = nullptr;
+    QStackedWidget* m_workspaceStack = nullptr;
+    ConvertWorkspace* m_convertWorkspace = nullptr;
+    QToolButton* m_authorModeButton = nullptr;
+    QToolButton* m_convertModeButton = nullptr;
     QMap<QString, QWidget*> m_pageByName;
     QMap<QString, QPair<QString, QString>> m_searchTargets;
     QString m_currentPage;
