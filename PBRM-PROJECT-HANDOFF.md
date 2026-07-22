@@ -2,7 +2,7 @@
 
 Date: 2026-07-22
 Status: the editor is feature-complete at PBRM v5. All editor-side work through
-the surface-state architecture slice has shipped, is tested (219 checks, zero
+the surface-state architecture slice has shipped, is tested (222 checks, zero
 failures), and is deployed to `publish`. The remaining campaign is runtime-side
 (#38) in the separate Community Shaders repository, which already carries a
 validated PBRM v4 slice that must be upgraded to v5.
@@ -49,8 +49,9 @@ page), Settings > Surface State Definitions (export starter JSON / load a
 modded set / built-in defaults), the preview States tab (simulates the active
 definitions with weather envelopes and tag physics — verified live 2026-07-22
 with Wetness 1.0 darkening, glossing, and rippling the X01 sphere), and the
-channel packer (mean-preserving mips, no premultiplied-alpha bleed; optional
-Toksvig normal-variance baking into roughness mips on RMAOS exports).
+channel packer (mean-preserving packed-data mips, vector-averaged and
+renormalized normal mips, no premultiplied-alpha bleed; optional Toksvig
+normal-variance baking into roughness mips on RMAOS exports).
 
 ## Paths
 
@@ -119,13 +120,43 @@ blindly.
 
 ## Guardrails that still apply
 
-- The editor is `.pbrm`-only. Do not restore BGSM/BGEM parsing or editing.
+- The editor is `.pbrm`-only **as an editor**. The conversion campaign adds
+  a **read-only** BGSM/BGEM importer (2026-07-22 decision); the editor
+  still never writes or edits Bethesda materials.
 - Only the one X-01 torso test NIF in the PBR mod is deliberate; do not
-  bulk-convert assets.
+  bulk-edit NIFs there. (Bulk *conversion* is now the explicit goal of the
+  converter campaign — but its output lives in its own output mod folder
+  and never touches source assets.)
 - Preview cubemaps and preview settings are editor preferences (QSettings /
   `publish\preview-environments.ini`) and are never serialized into `.pbrm`.
 - Any combo box inside a scrollable page needs `WheelFocusGuard::install`
   (the preview widget sweeps all its combos in the constructor).
+
+## Backlog (agreed 2026-07-22, in order)
+
+1. **Validation quick-fixes** — Overview → Validation becomes structured
+   issue rows with per-row Fix buttons where a safe automatic remedy
+   exists (undo-able via `applyDocumentChange`, immediate re-validate);
+   texture-file findings stay manual by design. The widget is reused by
+   the Convert workspace.
+2. **`pbrm.exe` CLI companion** — full CLI parity is a standing rule:
+   every headless-capable operation gets a verb, and new features ship
+   with theirs. Console-subsystem binary from the same core sources; verbs
+   for existing operations first (`validate`, `migrate`, `extract-states`,
+   `strip-legacy`, `repair-paths`, `set-setting`, `pack`,
+   `export-definitions`, `export-json`); `--json` reporting; explicit
+   source/output flags with QSettings only as fallback.
+3. **FO4/FO76 → PBR converter** — `docs/FO4-Conversion.md` is the
+   authoritative spec: per-title source profiles (FO4 metal-darkness
+   recovery vs. FO76 true-specular reconstruction), emissive color rules,
+   the four-fate parameter audit with root-material chains, derivation
+   pipeline (derivation-side denoising, Poisson height → AO/curvature),
+   geometry AO with canonical-instance island baking, correction masking
+   with Substance-style fills, the Convert workspace queue,
+   dedup/manifest/rollback, and the `convert`/`bake-ao` verbs. Finish
+   line: dry-run + convert across the entire vanilla Fallout 4 texture
+   BA2 set.
+4. **Runtime campaign** (#38, below).
 
 ## Next: runtime campaign (#38, FO4CS repo)
 
