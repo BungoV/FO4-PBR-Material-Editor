@@ -388,8 +388,26 @@ subcommand grammar `pbrm <verb> [options]`:
 
 `validate`, `migrate` (v4 → v5 re-save), `extract-states`, `strip-legacy`,
 `repair-paths`, `set-setting`, `pack` (channel-packer bake incl. Toksvig),
-`export-definitions`, `export-json`, `convert` (full FO4/FO76 batch with
-`--dry-run`), `bake-ao` (geometry-AO rebake against the manifest).
+`export-definitions`, `export-json`, `inspect` (texture diagnostics),
+`convert` (full FO4/FO76 batch with `--dry-run` — **shipped**),
+`material-info` (parsed `.bgsm`/`.bgem` field dump — **shipped**),
+`bake-ao` (geometry-AO rebake against the manifest — with the workspace).
+
+`pbrm convert --out <mod folder>` writes `Materials/` + `Textures/` mirrors,
+the sibling `.pbrm` set, and `pbrm-conversion-manifest.json` (one entry per
+material: outputs, flags, notes, errors, metal coverage). Options:
+`--texture-root`, `--dry-run`, `--json`, `--height-in-blue`,
+`--no-detail-ao`, `--metal-diagnostic`, `--recovery`, `--gloss-curve`,
+`--derivation-size`. Live-verified 2026-07-23 on FO76 (alien dielectric 0%,
+gold Protectron 90% metal reconstructed warm from black diffuse), FO4 BGSM
+v1/v2 (X-02 metal trim + auto-denoise engagement + dangling-reference
+warnings surfaced honestly), and FO4 BGEM (Unlit Effect emission via
+base × tint × intensity) — plus the FO4 glowmap `_E` bake (mask × BGSM
+emittance color, `primaryEmissive` intensity = emittance mult).
+
+FO76 normal maps ship as **BC5_SNORM** (legacy `BC5S` fourCC or DXGI 84);
+the DDS reader decodes signed BC4/BC5 natively (test-pinned endpoints) —
+unsigned reads would fold negative components into garbage.
 
 Every reporting verb accepts `--json` for machine-readable output; sources
 and output roots are explicit flags with the editor's configured sources

@@ -151,13 +151,23 @@ blindly.
    remains the standing rule — converter verbs (`convert`, `bake-ao`) land
    with the converter.
 3. **FO4/FO76 → PBR converter** — `docs/FO4-Conversion.md` is the
-   authoritative spec: per-title source profiles (FO4 metal-darkness
-   recovery vs. FO76 true-specular reconstruction), emissive color rules,
-   the four-fate parameter audit with root-material chains, derivation
-   pipeline (derivation-side denoising, Poisson height → AO/curvature),
-   geometry AO with canonical-instance island baking, correction masking
-   with Substance-style fills, the Convert workspace queue,
-   dedup/manifest/rollback, and the `convert`/`bake-ao` verbs. Finish
+   authoritative spec. **Automatic pipeline SHIPPED 2026-07-23**:
+   `src/bgsmreader.*` (BGSM/BGEM v1-v22 binary + JSON forms, root chains,
+   full-corpus clean: 28,851 FO76 + 3,310 FO4), `src/convertercore.*`
+   (per-title profiles: FO4 metal-darkness recovery incl. cubemap hue
+   donor vs. FO76 true-specular reconstruction; four-fate parameter
+   mapping), `src/normalderive.*` (derivation-side denoise, FFT Poisson
+   height, horizon AO, signed curvature), `src/converter.*` (orchestrator:
+   dedup + hash-suffix collisions, Materials/Textures mirrors, sibling
+   `.pbrm`, manifest), and the `convert`/`material-info`/`inspect` verbs.
+   DDS reader gained signed BC4/BC5 (FO76 normals are BC5_SNORM).
+   Live-verified on FO76 (gold Protectron 90% metal, warm albedo
+   reconstructed from black diffuse), FO4 BGSM (X-02), FO4 BGEM (Unlit
+   emission), FO4 glowmap `_E` bake. 308 test checks green.
+   **Remaining, in spec order**: Convert workspace GUI (Author|Convert
+   switcher + queue), 3D mask painting with Substance-style fills,
+   geometry AO (canonical-instance islands, QOffscreenSurface) +
+   `bake-ao`, manifest incremental/`--clean`, BA2-direct reads. Finish
    line: dry-run + convert across the entire vanilla Fallout 4 texture
    BA2 set.
 4. **Runtime campaign** (#38, below).

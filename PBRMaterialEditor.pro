@@ -12,6 +12,7 @@ SOURCES += \
     src/main.cpp \
     src/bgsmreader.cpp \
     src/clicommands.cpp \
+    src/converter.cpp \
     src/convertercore.cpp \
     src/normalderive.cpp \
     src/materialdocument.cpp \
@@ -36,6 +37,7 @@ SOURCES += \
 HEADERS += \
     src/bgsmreader.h \
     src/clicommands.h \
+    src/converter.h \
     src/convertercore.h \
     src/normalderive.h \
     src/materialdocument.h \

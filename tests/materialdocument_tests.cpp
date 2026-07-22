@@ -1,4 +1,5 @@
 #include "bgsmreader.h"
+#include "converter.h"
 #include "convertercore.h"
 #include "normalderive.h"
 #include "materialdocument.h"
@@ -887,6 +888,161 @@ int main(int argc, char* argv[])
             check(parsed > 0 && failed == 0,
                 QStringLiteral("real material corpus parses cleanly: %1 parsed, %2 failed (%3)")
                     .arg(parsed).arg(failed).arg(firstFailure));
+        }
+
+        // ---- Orchestrator: a synthetic FO4 metal through the full pipeline
+        // (sources -> conversion -> derivations -> DDS set -> sibling .pbrm),
+        // then the dedup and dry-run contracts.
+        QTemporaryDir convRoot, convOut;
+        check(convRoot.isValid() && convOut.isValid(), QStringLiteral("orchestrator temp roots create"));
+        QDir(convRoot.path()).mkpath(QStringLiteral("materials/armor"));
+        QDir(convRoot.path()).mkpath(QStringLiteral("textures/armor"));
+        QImage convDiffuse(16, 16, QImage::Format_RGBA8888);
+        convDiffuse.fill(QColor(90, 60, 45, 255)); // dark warm metal (hue-reliable)
+        convDiffuse.save(QDir(convRoot.path()).filePath(QStringLiteral("textures/armor/conv_d.png")));
+        QImage convSpec(16, 16, QImage::Format_RGBA8888);
+        convSpec.fill(QColor(230, 128, 0, 255)); // R spec strength, G gloss
+        convSpec.save(QDir(convRoot.path()).filePath(QStringLiteral("textures/armor/conv_s.png")));
+        QImage convNormal(16, 16, QImage::Format_RGBA8888);
+        convNormal.fill(QColor(128, 128, 255, 255));
+        convNormal.save(QDir(convRoot.path()).filePath(QStringLiteral("textures/armor/conv_n.png")));
+
+        const auto buildConvMaterial = [&](const QString& fileName) {
+            MaterialBuilder builder;
+            builder.header(BgsmSig, 2, true, 1.0f);
+            builder.str(QStringLiteral("armor/conv_d.png"));
+            builder.str(QStringLiteral("armor/conv_n.png"));
+            builder.str(QStringLiteral("armor/conv_s.png"));
+            builder.str(QString()); builder.str(QString()); builder.str(QString());
+            builder.str(QString()); builder.str(QString()); builder.str(QString());
+            builder.boolean(false);
+            builder.boolean(false); builder.f32(2.0f); builder.f32(0.0f);
+            builder.boolean(false); builder.f32(.3f);
+            builder.boolean(true); builder.color(1, 1, 1); builder.f32(1.0f); builder.f32(.5f);
+            builder.f32(5.0f); builder.f32(-1); builder.f32(-1); builder.f32(-1); builder.f32(-1); builder.f32(-1); builder.f32(-1);
+            builder.str(QString()); // no root chain
+            builder.boolean(false);
+            builder.boolean(false); // emit disabled -> no color in stream
+            builder.f32(1.0f);
+            builder.boolean(false); builder.boolean(false);
+            builder.boolean(false);
+            builder.boolean(true); builder.boolean(false); builder.boolean(true); builder.boolean(false); builder.boolean(false);
+            builder.boolean(false); // glowmap
+            builder.boolean(false); builder.boolean(false);
+            builder.boolean(false); builder.color(.5f, .5f, .5f);
+            builder.boolean(false); builder.boolean(false); builder.boolean(false); builder.boolean(false);
+            builder.f32(-.5f); builder.f32(10.0f); builder.f32(1.0f); builder.f32(1.0f); builder.f32(0.0f);
+            builder.f32(1.0f); builder.boolean(false);
+            const QString path = QDir(convRoot.path()).filePath(QStringLiteral("materials/armor/") + fileName);
+            QFile file(path);
+            file.open(QIODevice::WriteOnly);
+            file.write(builder.data);
+            file.close();
+            return path;
+        };
+
+        Converter::JobOptions jobOptions;
+        jobOptions.outputRoot = convOut.path();
+        jobOptions.textureRoot = convRoot.path() + QStringLiteral("/textures");
+        jobOptions.derive.derivationSize = 64;
+        Converter::TextureCache textureCache;
+        const Converter::JobResult first = Converter::convertMaterial(buildConvMaterial(QStringLiteral("conv.bgsm")), jobOptions, &textureCache);
+        check(first.converted && first.errors.isEmpty(),
+            QStringLiteral("orchestrator converts the synthetic metal: %1").arg(first.errors.join(QStringLiteral("; "))));
+        check(first.metalCoverage > 0.9f,
+            QStringLiteral("dark diffuse + strong spec + envmap infers metal (coverage %1)").arg(first.metalCoverage));
+        check(QFileInfo::exists(first.pbrmPath) && first.pbrmPath.endsWith(QStringLiteral("Materials/armor/conv.pbrm")),
+            QStringLiteral("sibling .pbrm lands on the materials-relative path"));
+        for (const QString& suffix : {QStringLiteral("_BC"), QStringLiteral("_RMAOS"), QStringLiteral("_N")})
+            check(QFileInfo::exists(convOut.path() + QStringLiteral("/Textures/armor/conv") + suffix + QStringLiteral(".dds")),
+                QStringLiteral("converted %1 texture is written").arg(suffix));
+        check(!QFileInfo::exists(convOut.path() + QStringLiteral("/Textures/armor/conv_E.dds")),
+            QStringLiteral("no emissive output for a non-emissive material"));
+
+        Pbr::MaterialDocument convertedDoc;
+        QString convertedError;
+        check(convertedDoc.load(first.pbrmPath, &convertedError), QStringLiteral("converted .pbrm loads: %1").arg(convertedError));
+        const Pbr::TextureSlotState convertedBase = convertedDoc.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryBaseColor"));
+        const Pbr::TextureSlotState convertedNormalSlot = convertedDoc.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal"));
+        check(convertedBase.enabled && QDir::fromNativeSeparators(convertedBase.path) == QStringLiteral("armor/conv_BC.dds"),
+            QStringLiteral("base color slot wires the portable texture path"));
+        check(convertedNormalSlot.values.value(QStringLiteral("curvatureInAlpha")).toBool(false),
+            QStringLiteral("normal slot declares curvature in alpha"));
+
+        QString decodeError;
+        const QImage convertedBc = TextureImage::load(QStringLiteral("armor/conv_BC.dds"),
+            convOut.path() + QStringLiteral("/Textures"), &decodeError);
+        check(!convertedBc.isNull(), QStringLiteral("converted BC decodes: %1").arg(decodeError));
+        if (!convertedBc.isNull()) {
+            const QColor recovered = convertedBc.pixelColor(8, 8);
+            check(recovered.redF() > 0.5f && recovered.redF() > recovered.blueF() + 0.05f,
+                QStringLiteral("metal albedo recovery brightens and keeps the warm hue (%1 %2 %3)")
+                    .arg(recovered.redF()).arg(recovered.greenF()).arg(recovered.blueF()));
+        }
+        const QImage convertedNormalOut = TextureImage::load(QStringLiteral("armor/conv_N.dds"),
+            convOut.path() + QStringLiteral("/Textures"), &decodeError);
+        check(!convertedNormalOut.isNull()
+            && std::abs(convertedNormalOut.pixelColor(8, 8).alphaF() - 0.5f) < 0.08f,
+            QStringLiteral("flat normal ships neutral signed curvature in alpha"));
+
+        // Dedup: a second material over the same sources reuses the outputs.
+        const Converter::JobResult second = Converter::convertMaterial(buildConvMaterial(QStringLiteral("conv2.bgsm")), jobOptions, &textureCache);
+        check(second.converted && textureCache.baseColorBySignature.size() == 1,
+            QStringLiteral("identical pairings dedup to one converted texture set"));
+        Pbr::MaterialDocument secondDoc;
+        check(secondDoc.load(second.pbrmPath, nullptr)
+            && QDir::fromNativeSeparators(secondDoc.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryBaseColor")).path)
+                == QStringLiteral("armor/conv_BC.dds"),
+            QStringLiteral("the deduped sibling points at the shared textures"));
+
+        // Dry run: reports, writes nothing.
+        QTemporaryDir dryOut;
+        Converter::JobOptions dryOptions = jobOptions;
+        dryOptions.outputRoot = dryOut.path();
+        dryOptions.dryRun = true;
+        Converter::TextureCache dryCache;
+        const Converter::JobResult dry = Converter::convertMaterial(buildConvMaterial(QStringLiteral("conv3.bgsm")), dryOptions, &dryCache);
+        check(dry.converted && QDir(dryOut.path()).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty(),
+            QStringLiteral("dry run reports the conversion without writing"));
+    }
+
+    {
+        // Signed BC4/BC5 (SNORM) DDS decode: FO76 normal maps ship as
+        // BC5_SNORM; the unsigned path would fold negative components into
+        // garbage. One 4x4 block per channel, extremes pinned.
+        QByteArray snorm;
+        snorm.append("DDS ");
+        auto appendU32 = [&snorm](quint32 value) {
+            for (int i = 0; i < 4; ++i) snorm.append(char((value >> (8 * i)) & 0xFF));
+        };
+        appendU32(124);
+        appendU32(0x1007); // caps/height/width/pixelformat flags
+        appendU32(4); appendU32(4); // height, width
+        while (snorm.size() < 76) snorm.append('\0');
+        appendU32(32); appendU32(4); // pixel format size, FOURCC flag
+        snorm.append("DX10");
+        while (snorm.size() < 128) snorm.append('\0');
+        appendU32(84); // DXGI_FORMAT_BC5_SNORM
+        appendU32(3); appendU32(0); appendU32(1); appendU32(0); // dimension/misc/arraySize/misc2
+        // Red block: e0=+127, e1=-127 (e0>e1 ramp), all indices 0 -> +1.0.
+        snorm.append(char(127)); snorm.append(char(-127));
+        for (int i = 0; i < 6; ++i) snorm.append('\0');
+        // Green block: e0=-127, e1=+127 (e0<=e1 specials), all indices 7 -> +1.0.
+        snorm.append(char(-127)); snorm.append(char(127));
+        for (int i = 0; i < 6; ++i) snorm.append(char(0xFF));
+        QTemporaryDir snormDir;
+        QDir(snormDir.path()).mkpath(QStringLiteral("textures"));
+        QFile snormFile(QDir(snormDir.path()).filePath(QStringLiteral("textures/signed_n.dds")));
+        snormFile.open(QIODevice::WriteOnly);
+        snormFile.write(snorm);
+        snormFile.close();
+        QString snormError;
+        const QImage signedImage = TextureImage::load(QStringLiteral("signed_n.dds"), snormDir.path() + QStringLiteral("/textures"), &snormError);
+        check(!signedImage.isNull(), QStringLiteral("BC5_SNORM DDS decodes: %1").arg(snormError));
+        if (!signedImage.isNull()) {
+            const QColor texel = signedImage.pixelColor(0, 0);
+            check(texel.red() == 255 && texel.green() == 255,
+                QStringLiteral("SNORM +1.0 endpoints decode to full channels (%1 %2)").arg(texel.red()).arg(texel.green()));
         }
     }
 

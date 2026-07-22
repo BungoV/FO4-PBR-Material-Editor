@@ -211,7 +211,18 @@ pbrm export-json <paths>                    # readable .pbrm.json sidecars
 pbrm pack --material <m.pbrm> --slot <key> --out <f.dds>
           [--set UV0] [--format bc1|bc4|bc5|bc7|bc7-srgb|rgba8]
           [--no-mips] [--toksvig <normal>] [--texture-root <dir>]
+pbrm inspect [--texture-root <dir>] <textures> # diagnostics + channel statistics
+pbrm convert --out <mod folder> [--texture-root <dir>] [--dry-run] [--json]
+             [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]
+             [--recovery <0-1>] [--gloss-curve <v>] [--derivation-size <px>]
+             <.bgsm/.bgem files or folders>   # FO4/FO76 -> PBR conversion
+pbrm material-info <.bgsm/.bgem files>        # parsed material field dump
 ```
+
+`convert` writes `Materials/` + `Textures/` mirrors, same-name sibling
+`.pbrm` files (sources untouched), and `pbrm-conversion-manifest.json`;
+identical source pairings dedup to one converted texture set, and
+divergent pairings get a hash suffix instead of a silent overwrite.
 
 Reporting verbs accept `--json`; exit codes are 0 (clean), 1 (findings or
 failures), 2 (usage). `--texture-root` overrides the editor's configured

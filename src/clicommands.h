@@ -23,6 +23,8 @@ int runExportDefinitions(const QStringList& args);
 int runExportJson(const QStringList& args);
 int runPack(const QStringList& args);
 int runInspect(const QStringList& args);
+int runConvert(const QStringList& args);
+int runMaterialInfo(const QStringList& args);
 QString helpText();
 
 } // namespace PbrmCli

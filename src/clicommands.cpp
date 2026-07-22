@@ -1,5 +1,6 @@
 #include "clicommands.h"
 
+#include "converter.h"
 #include "materialdocument.h"
 #include "texturecache.h"
 #include "textureimage.h"
@@ -15,6 +16,8 @@
 #include <QJsonObject>
 #include <QSettings>
 #include <QTextStream>
+
+#include <cmath>
 
 namespace PbrmCli {
 
@@ -448,6 +451,152 @@ int runPack(const QStringList& args)
     return 0;
 }
 
+int runMaterialInfo(const QStringList& args)
+{
+    const Options options = parseOptions(args, {});
+    if (options.paths.isEmpty()) {
+        out() << "usage: pbrm material-info <files.bgsm/.bgem...>\n" << Qt::flush;
+        return 2;
+    }
+    int failures = 0;
+    for (const QString& path : options.paths) {
+        Bgsm::Material material;
+        QString error;
+        if (!Bgsm::readFile(path, &material, &error)) {
+            out() << path << ": error: " << error << "\n";
+            ++failures;
+            continue;
+        }
+        const auto vec = [](const QVector3D& v) {
+            return QStringLiteral("%1 %2 %3").arg(v.x(), 0, 'f', 3).arg(v.y(), 0, 'f', 3).arg(v.z(), 0, 'f', 3);
+        };
+        out() << path << ": " << (material.kind == Bgsm::Kind::Bgem ? "BGEM" : "BGSM")
+              << " v" << material.version << (material.isFallout76() ? " (FO76)" : " (FO4)") << "\n";
+        const QList<QPair<QString, QString>> textures = {
+            {QStringLiteral("diffuse"), material.diffuseTexture}, {QStringLiteral("base"), material.baseTexture},
+            {QStringLiteral("normal"), material.normalTexture}, {QStringLiteral("smoothSpec"), material.smoothSpecTexture},
+            {QStringLiteral("greyscale"), material.greyscaleTexture}, {QStringLiteral("envmap"), material.envmapTexture},
+            {QStringLiteral("envmapMask"), material.envmapMaskTexture}, {QStringLiteral("glow"), material.glowTexture},
+            {QStringLiteral("innerLayer"), material.innerLayerTexture}, {QStringLiteral("displacement"), material.displacementTexture},
+            {QStringLiteral("specular (_r)"), material.specularTexture}, {QStringLiteral("lighting (_l)"), material.lightingTexture},
+            {QStringLiteral("wrinkles"), material.wrinklesTexture}, {QStringLiteral("flow"), material.flowTexture},
+            {QStringLiteral("root"), material.rootMaterialPath}};
+        for (const auto& pair : textures)
+            if (!pair.second.trimmed().isEmpty()) out() << "  " << pair.first << ": " << pair.second << "\n";
+        out() << "  tiling U/V " << material.tileU << "/" << material.tileV
+              << " scale " << material.uScale << "," << material.vScale
+              << " offset " << material.uOffset << "," << material.vOffset << "\n";
+        out() << "  alpha " << material.alpha << " blend " << int(material.blendMode)
+              << " test " << material.alphaTest << " ref " << material.alphaTestRef
+              << " twoSided " << material.twoSided << " decal " << material.decal << "\n";
+        out() << "  envMapping " << material.environmentMapping << " maskScale " << material.environmentMappingMaskScale
+              << " smoothness " << material.smoothness << " specMult " << material.specularMult
+              << " specColor " << vec(material.specularColor) << "\n";
+        out() << "  grayscaleToPaletteColor " << material.grayscaleToPaletteColor
+              << " grayscaleToPaletteScale " << material.grayscaleToPaletteScale << "\n";
+        if (material.emitEnabled || material.glowmap)
+            out() << "  emit " << material.emitEnabled << " glowmap " << material.glowmap
+                  << " color " << vec(material.emittanceColor) << " mult " << material.emittanceMult << "\n";
+        if (material.kind == Bgsm::Kind::Bgem)
+            out() << "  baseColor " << vec(material.baseColor) << " scale " << material.baseColorScale
+                  << " effectLighting " << material.effectLightingEnabled << " falloff " << material.falloffEnabled << "\n";
+        if (material.pbr || material.customPorosity)
+            out() << "  pbr " << material.pbr << " customPorosity " << material.customPorosity
+                  << " porosity " << material.porosityValue << "\n";
+        if (material.skinTint || material.facegen || material.hair || material.translucency || material.subsurfaceLighting)
+            out() << "  skinTint " << material.skinTint << " facegen " << material.facegen << " hair " << material.hair
+                  << " translucency " << material.translucency << " subsurface " << material.subsurfaceLighting << "\n";
+    }
+    out() << Qt::flush;
+    return failures ? 1 : 0;
+}
+
+int runConvert(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--out"), QStringLiteral("--texture-root"),
+        QStringLiteral("--recovery"), QStringLiteral("--gloss-curve"), QStringLiteral("--derivation-size")});
+    const QString outputRoot = options.value(QStringLiteral("--out"));
+    if (outputRoot.isEmpty() || options.paths.isEmpty()) {
+        out() << "usage: pbrm convert --out <mod folder> [--texture-root <dir>] [--dry-run] [--json]\n"
+                 "                    [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]\n"
+                 "                    [--recovery <0-1>] [--gloss-curve <v>] [--derivation-size <px>]\n"
+                 "                    <materials or folders...>\n" << Qt::flush;
+        return 2;
+    }
+    Converter::JobOptions job;
+    job.outputRoot = QDir::fromNativeSeparators(outputRoot);
+    job.textureRoot = effectiveTextureRoot(options);
+    job.dryRun = options.has(QStringLiteral("--dry-run"));
+    job.detailAo = !options.has(QStringLiteral("--no-detail-ao"));
+    job.heightInBlue = options.has(QStringLiteral("--height-in-blue"));
+    job.writeMetallicDiagnostic = options.has(QStringLiteral("--metal-diagnostic"));
+    if (options.has(QStringLiteral("--recovery")))
+        job.math.recoveryStrength = options.value(QStringLiteral("--recovery")).toFloat();
+    if (options.has(QStringLiteral("--gloss-curve")))
+        job.math.glossCurve = options.value(QStringLiteral("--gloss-curve")).toFloat();
+    if (options.has(QStringLiteral("--derivation-size")))
+        job.derive.derivationSize = options.value(QStringLiteral("--derivation-size")).toInt();
+
+    QStringList materials;
+    for (const QString& target : options.paths) {
+        const QFileInfo info(target);
+        if (info.isDir()) {
+            QDirIterator it(info.absoluteFilePath(), {QStringLiteral("*.bgsm"), QStringLiteral("*.bgem")},
+                QDir::Files, QDirIterator::Subdirectories);
+            while (it.hasNext()) materials.append(it.next());
+        } else if (info.isFile()) {
+            materials.append(info.absoluteFilePath());
+        } else {
+            out() << target << ": error: path does not exist\n";
+        }
+    }
+    if (materials.isEmpty()) {
+        out() << "no .bgsm/.bgem materials found\n" << Qt::flush;
+        return 1;
+    }
+
+    Converter::TextureCache textureCache;
+    QVector<Finding> findings;
+    QJsonArray manifestEntries;
+    int converted = 0, flagged = 0, failed = 0;
+    for (const QString& material : materials) {
+        const Converter::JobResult jobResult = Converter::convertMaterial(material, job, &textureCache);
+        for (const QString& note : jobResult.notes) findings.append({material, false, note});
+        for (const QString& jobError : jobResult.errors) findings.append({material, true, jobError});
+        if (jobResult.converted) {
+            ++converted;
+            findings.append({material, false, (job.dryRun ? QStringLiteral("would convert -> ") : QStringLiteral("converted -> "))
+                + jobResult.pbrmPath
+                + QStringLiteral(" (metal %1%)").arg(int(std::lround(jobResult.metalCoverage * 100.0f)))});
+        } else {
+            ++failed;
+        }
+        if (jobResult.flagged) ++flagged;
+        manifestEntries.append(QJsonObject{
+            {QStringLiteral("material"), material},
+            {QStringLiteral("pbrm"), jobResult.pbrmPath},
+            {QStringLiteral("converted"), jobResult.converted},
+            {QStringLiteral("flagged"), jobResult.flagged},
+            {QStringLiteral("metalCoverage"), double(jobResult.metalCoverage)},
+            {QStringLiteral("notes"), QJsonArray::fromStringList(jobResult.notes)},
+            {QStringLiteral("errors"), QJsonArray::fromStringList(jobResult.errors)}});
+    }
+    if (!job.dryRun) {
+        QDir().mkpath(job.outputRoot);
+        QFile manifest(job.outputRoot + QStringLiteral("/pbrm-conversion-manifest.json"));
+        if (manifest.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            manifest.write(QJsonDocument(QJsonObject{
+                {QStringLiteral("schema"), QStringLiteral("FO4.PBRM.ConversionManifest")},
+                {QStringLiteral("schemaVersion"), 1},
+                {QStringLiteral("entries"), manifestEntries}}).toJson(QJsonDocument::Indented));
+    }
+    if (!options.has(QStringLiteral("--json")))
+        out() << converted << (job.dryRun ? " material(s) would convert, " : " material(s) converted, ")
+              << flagged << " flagged for review, " << failed << " failed\n";
+    const int findingsCode = reportFindings(findings, materials.size(), options.has(QStringLiteral("--json")), QStringLiteral("convert"));
+    return failed > 0 ? 1 : findingsCode;
+}
+
 int runInspect(const QStringList& args)
 {
     const Options options = parseOptions(args, {QStringLiteral("--texture-root")});
@@ -525,6 +674,8 @@ QString helpText()
         "  export-json         write readable .pbrm.json sidecars\n"
         "  pack                composite a slot's channel sources into a game-ready DDS\n"
         "  inspect             texture diagnostics + per-channel statistics\n"
+        "  convert             convert FO4/FO76 .bgsm/.bgem materials + textures to PBR\n"
+        "  material-info       dump parsed .bgsm/.bgem fields (textures, scalars, flags)\n"
         "\n"
         "common options: --json (machine-readable reports), --dry-run (report only),\n"
         "  --texture-root <dir> (explicit source root; editor settings are the fallback)\n");
@@ -542,6 +693,8 @@ int runVerb(const QString& verb, const QStringList& args)
     if (verb == QLatin1String("export-json")) return runExportJson(args);
     if (verb == QLatin1String("pack")) return runPack(args);
     if (verb == QLatin1String("inspect")) return runInspect(args);
+    if (verb == QLatin1String("convert")) return runConvert(args);
+    if (verb == QLatin1String("material-info")) return runMaterialInfo(args);
     out() << helpText() << Qt::flush;
     return verb == QLatin1String("help") || verb == QLatin1String("--help") ? 0 : 2;
 }

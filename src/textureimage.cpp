@@ -76,6 +76,33 @@ void decodeAlphaBlock(const uchar* block, uchar values[16])
     for (int i = 0; i < 16; ++i) values[i] = palette[(bits >> (3 * i)) & 7u];
 }
 
+// Signed (SNORM) BC4/BC5 channel block, decoded into unsigned 0-255 space
+// ((v/127)*0.5+0.5). FO76 normal maps ship as BC5_SNORM — legacy fourCC
+// "BC5S" or DX10 DXGI 84 — and reading them through the unsigned path folds
+// negative components into garbage.
+void decodeSignedChannelBlock(const uchar* block, uchar values[16])
+{
+    const auto toUnsigned = [](int signedValue) {
+        const float normalized = qMax(signedValue, -127) / 127.0f;
+        return static_cast<uchar>(qBound(0, static_cast<int>((normalized * 0.5f + 0.5f) * 255.0f + 0.5f), 255));
+    };
+    const int e0 = static_cast<qint8>(block[0]);
+    const int e1 = static_cast<qint8>(block[1]);
+    uchar palette[8]{toUnsigned(e0), toUnsigned(e1)};
+    if (e0 > e1) {
+        for (int i = 1; i <= 6; ++i)
+            palette[i + 1] = toUnsigned(((7 - i) * e0 + i * e1) / 7);
+    } else {
+        for (int i = 1; i <= 4; ++i)
+            palette[i + 1] = toUnsigned(((5 - i) * e0 + i * e1) / 5);
+        palette[6] = 0;    // -1.0
+        palette[7] = 255;  // +1.0
+    }
+    quint64 bits = 0;
+    for (int i = 0; i < 6; ++i) bits |= static_cast<quint64>(block[2 + i]) << (8 * i);
+    for (int i = 0; i < 16; ++i) values[i] = palette[(bits >> (3 * i)) & 7u];
+}
+
 void writeBlock(QImage& image, int bx, int by, const QColor pixels[16])
 {
     for (int y = 0; y < 4; ++y) {
@@ -111,8 +138,10 @@ QImage decodeDds(const QByteArray& data, QString* error)
         if (dxgi == 71 || dxgi == 72) fourCc = QByteArrayLiteral("DXT1");
         else if (dxgi == 74 || dxgi == 75) fourCc = QByteArrayLiteral("DXT3");
         else if (dxgi == 77 || dxgi == 78) fourCc = QByteArrayLiteral("DXT5");
-        else if (dxgi == 80 || dxgi == 81) fourCc = QByteArrayLiteral("ATI1");
-        else if (dxgi == 83 || dxgi == 84) fourCc = QByteArrayLiteral("ATI2");
+        else if (dxgi == 80) fourCc = QByteArrayLiteral("ATI1");
+        else if (dxgi == 81) fourCc = QByteArrayLiteral("BC4S");
+        else if (dxgi == 83) fourCc = QByteArrayLiteral("ATI2");
+        else if (dxgi == 84) fourCc = QByteArrayLiteral("BC5S");
         else if (dxgi == 98 || dxgi == 99) fourCc = QByteArrayLiteral("BC7 ");
     }
 
@@ -121,8 +150,8 @@ QImage decodeDds(const QByteArray& data, QString* error)
     const int blocksX = (width + 3) / 4;
     const int blocksY = (height + 3) / 4;
     int blockBytes = 0;
-    if (fourCc == QByteArrayLiteral("DXT1") || fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U")) blockBytes = 8;
-    else if (fourCc == QByteArrayLiteral("DXT3") || fourCc == QByteArrayLiteral("DXT5") || fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U") || fourCc == QByteArrayLiteral("BC7 ")) blockBytes = 16;
+    if (fourCc == QByteArrayLiteral("DXT1") || fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U") || fourCc == QByteArrayLiteral("BC4S")) blockBytes = 8;
+    else if (fourCc == QByteArrayLiteral("DXT3") || fourCc == QByteArrayLiteral("DXT5") || fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U") || fourCc == QByteArrayLiteral("BC5S") || fourCc == QByteArrayLiteral("BC7 ")) blockBytes = 16;
 
     if (blockBytes) {
         if (offset + blocksX * blocksY * blockBytes > data.size()) {
@@ -144,11 +173,20 @@ QImage decodeDds(const QByteArray& data, QString* error)
                 uchar alpha[16]; decodeAlphaBlock(block, alpha);
                 decodeColorBlock(block + 8, pixels, false);
                 for (int i = 0; i < 16; ++i) pixels[i].setAlpha(alpha[i]);
-            } else if (fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U")) {
-                uchar red[16]; decodeAlphaBlock(block, red);
+            } else if (fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U") || fourCc == QByteArrayLiteral("BC4S")) {
+                uchar red[16];
+                if (fourCc == QByteArrayLiteral("BC4S")) decodeSignedChannelBlock(block, red);
+                else decodeAlphaBlock(block, red);
                 for (int i = 0; i < 16; ++i) pixels[i] = QColor(red[i], red[i], red[i], 255);
-            } else if (fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U")) {
-                uchar red[16], green[16]; decodeAlphaBlock(block, red); decodeAlphaBlock(block + 8, green);
+            } else if (fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U") || fourCc == QByteArrayLiteral("BC5S")) {
+                uchar red[16], green[16];
+                if (fourCc == QByteArrayLiteral("BC5S")) {
+                    decodeSignedChannelBlock(block, red);
+                    decodeSignedChannelBlock(block + 8, green);
+                } else {
+                    decodeAlphaBlock(block, red);
+                    decodeAlphaBlock(block + 8, green);
+                }
                 for (int i = 0; i < 16; ++i) {
                     const double nx = red[i] / 127.5 - 1.0;
                     const double ny = green[i] / 127.5 - 1.0;
@@ -515,8 +553,8 @@ QVector<QImage> loadCubemapFaces(const QString& authoredPath, const QString& tex
         else if (dxgi == 98 || dxgi == 99) fourCc = QByteArrayLiteral("BC7 ");
     }
     int blockBytes = 0;
-    if (fourCc == QByteArrayLiteral("DXT1") || fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U")) blockBytes = 8;
-    else if (fourCc == QByteArrayLiteral("DXT3") || fourCc == QByteArrayLiteral("DXT5") || fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U") || fourCc == QByteArrayLiteral("BC7 ")) blockBytes = 16;
+    if (fourCc == QByteArrayLiteral("DXT1") || fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U") || fourCc == QByteArrayLiteral("BC4S")) blockBytes = 8;
+    else if (fourCc == QByteArrayLiteral("DXT3") || fourCc == QByteArrayLiteral("DXT5") || fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U") || fourCc == QByteArrayLiteral("BC5S") || fourCc == QByteArrayLiteral("BC7 ")) blockBytes = 16;
     const auto levelBytes = [blockBytes](int w, int h) {
         return blockBytes ? qMax(1, (w + 3) / 4) * qMax(1, (h + 3) / 4) * blockBytes : w * h * 4;
     };
@@ -604,9 +642,13 @@ Diagnostics inspect(const QString& authoredPath, const QString& textureRoot)
             result.format = QStringLiteral("BC2"); result.channels = {"R","G","B","A"};
         } else if (fourCc == QByteArrayLiteral("DXT5") || dxgi == 77 || dxgi == 78) {
             result.format = QStringLiteral("BC3"); result.channels = {"R","G","B","A"};
-        } else if (fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U") || dxgi == 80 || dxgi == 81) {
+        } else if (fourCc == QByteArrayLiteral("BC4S") || dxgi == 81) {
+            result.format = QStringLiteral("BC4 SNORM"); result.channels = {"R"};
+        } else if (fourCc == QByteArrayLiteral("ATI1") || fourCc == QByteArrayLiteral("BC4U") || dxgi == 80) {
             result.format = QStringLiteral("BC4"); result.channels = {"R"};
-        } else if (fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U") || dxgi == 83 || dxgi == 84) {
+        } else if (fourCc == QByteArrayLiteral("BC5S") || dxgi == 84) {
+            result.format = QStringLiteral("BC5 SNORM"); result.channels = {"R","G"};
+        } else if (fourCc == QByteArrayLiteral("ATI2") || fourCc == QByteArrayLiteral("BC5U") || dxgi == 83) {
             result.format = QStringLiteral("BC5"); result.channels = {"R","G"};
         } else if (dxgi == 98 || dxgi == 99) {
             result.format = QStringLiteral("BC7"); result.channels = {"R","G","B","A"};

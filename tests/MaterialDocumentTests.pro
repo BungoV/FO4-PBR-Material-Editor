@@ -8,7 +8,7 @@ OBJECTS_DIR = build/obj
 MOC_DIR = build/moc
 
 INCLUDEPATH += ../src
-SOURCES += materialdocument_tests.cpp ../src/bgsmreader.cpp ../src/convertercore.cpp ../src/normalderive.cpp ../src/materialdocument.cpp ../src/texturearchive.cpp ../src/texturecache.cpp ../src/textureimage.cpp ../src/texturewriter.cpp ../src/previewenvironmentsettings.cpp ../src/tinyexr_impl.cpp ../src/texturebrowserdialog.cpp \
+SOURCES += materialdocument_tests.cpp ../src/bgsmreader.cpp ../src/converter.cpp ../src/convertercore.cpp ../src/normalderive.cpp ../src/materialdocument.cpp ../src/texturearchive.cpp ../src/texturecache.cpp ../src/textureimage.cpp ../src/texturewriter.cpp ../src/previewenvironmentsettings.cpp ../src/tinyexr_impl.cpp ../src/texturebrowserdialog.cpp \
     ../src/textureslotwidget.cpp ../src/dragnumericedit.cpp ../src/wheelfocusguard.cpp ../src/disclosureicon.cpp ../src/colorpicker.cpp ../src/previewmesh.cpp \
     ../src/materialpreviewwidget.cpp ../src/mainwindow.cpp ../src/mainwindow_pages.cpp ../src/mainwindow_slots.cpp
 HEADERS += ../src/materialdocument.h ../src/texturearchive.h ../src/textureimage.h ../src/previewenvironmentsettings.h ../src/texturebrowserdialog.h ../src/textureslotwidget.h \
