@@ -132,8 +132,7 @@ private:
     QSplitter* m_splitter = nullptr;
     QStackedWidget* m_workspaceStack = nullptr;
     ConvertWorkspace* m_convertWorkspace = nullptr;
-    QToolButton* m_authorModeButton = nullptr;
-    QToolButton* m_convertModeButton = nullptr;
+    QComboBox* m_workspaceModeCombo = nullptr;
     QMap<QString, QWidget*> m_pageByName;
     QMap<QString, QPair<QString, QString>> m_searchTargets;
     QString m_currentPage;

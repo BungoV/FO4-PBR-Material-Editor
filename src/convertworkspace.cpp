@@ -1,5 +1,8 @@
 #include "convertworkspace.h"
 
+#include "materialdocument.h"
+#include "materialpreviewwidget.h"
+
 #include <QCheckBox>
 #include <QDir>
 #include <QDirIterator>
@@ -176,9 +179,17 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     mainLayout->addWidget(m_detail, 1);
 
     splitter->addWidget(main);
-    splitter->setSizes({430, 730});
+
+    // ---- Far right: the same live 3D preview the editor uses, showing the
+    // selected material's CONVERTED sibling with the output mod folder as
+    // its texture root.
+    m_preview = new MaterialPreviewWidget(splitter);
+    splitter->addWidget(m_preview);
+    splitter->setSizes({430, 620, 310});
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 1);
+    splitter->setStretchFactor(2, 0);
+    updatePreview(nullptr);
 
     updateButtons();
 }
@@ -372,6 +383,7 @@ void ConvertWorkspace::updateDetail()
     QTreeWidgetItem* item = m_queue->currentItem();
     const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
     const bool valid = row >= 0 && row < m_entries.size();
+    updatePreview(valid ? &m_entries[row] : nullptr);
     if (!valid) {
         m_openInAuthor->setEnabled(false);
         return;
@@ -392,6 +404,24 @@ void ConvertWorkspace::updateDetail()
             m_detail->addItem(tr("Texture: %1").arg(QDir::toNativeSeparators(texture)));
     }
     m_openInAuthor->setEnabled(entry.result.converted && QFileInfo::exists(entry.result.pbrmPath));
+}
+
+void ConvertWorkspace::updatePreview(const QueueEntry* entry)
+{
+    // The preview always resolves against the output mod folder; converted
+    // siblings carry portable Textures-relative paths.
+    m_preview->setTextureRoot(QDir::fromNativeSeparators(m_outputEdit->text().trimmed())
+        + QStringLiteral("/Textures"));
+    if (entry && entry->hasResult && entry->result.converted
+        && QFileInfo::exists(entry->result.pbrmPath)) {
+        Pbr::MaterialDocument document;
+        if (document.load(entry->result.pbrmPath, nullptr)) {
+            m_preview->setMaterial(document);
+            return;
+        }
+    }
+    // Nothing converted on disk for this row (or no row): neutral material.
+    m_preview->setMaterial(Pbr::MaterialDocument());
 }
 
 void ConvertWorkspace::updateButtons()

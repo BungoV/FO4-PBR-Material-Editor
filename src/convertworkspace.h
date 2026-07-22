@@ -16,6 +16,7 @@ class QSpinBox;
 class QThread;
 class QTreeWidget;
 class QTreeWidgetItem;
+class MaterialPreviewWidget;
 
 // The Convert workspace (docs/FO4-Conversion.md): scan a source tree for
 // .bgsm/.bgem materials, run the automatic conversion pipeline over them on
@@ -46,6 +47,7 @@ private:
     void finishRun();
     void handleResult(int row, const Converter::JobResult& result);
     void updateDetail();
+    void updatePreview(const QueueEntry* entry);
     void updateButtons();
     Converter::JobOptions collectOptions(bool dryRun) const;
     void persistSettings() const;
@@ -56,6 +58,7 @@ private:
     QTreeWidget* m_queue = nullptr;
     QLabel* m_queueSummary = nullptr;
     QListWidget* m_detail = nullptr;
+    MaterialPreviewWidget* m_preview = nullptr;
     QPushButton* m_openInAuthor = nullptr;
     QPushButton* m_scanButton = nullptr;
     QPushButton* m_dryRunButton = nullptr;

@@ -177,23 +177,18 @@ void MainWindow::buildWindow()
     topBar->setObjectName(QStringLiteral("TopBar"));
     auto* top = new QHBoxLayout(topBar);
     top->setContentsMargins(9, 5, 9, 5);
-    // Workspace switcher: Author edits one .pbrm; Convert runs the FO4/FO76
-    // batch pipeline (docs/FO4-Conversion.md).
-    const auto makeModeButton = [topBar, this](const QString& text, bool convert) {
-        auto* button = new QToolButton(topBar);
-        button->setText(text);
-        button->setCheckable(true);
-        button->setAutoRaise(true);
-        connect(button, &QToolButton::clicked, this, [this, convert] { setWorkspaceMode(convert); });
-        return button;
-    };
-    m_authorModeButton = makeModeButton(tr("Author"), false);
-    m_authorModeButton->setChecked(true);
-    m_authorModeButton->setToolTip(tr("Edit the open .pbrm material."));
-    m_convertModeButton = makeModeButton(tr("Convert"), true);
-    m_convertModeButton->setToolTip(tr("Batch-convert FO4/FO76 .bgsm/.bgem materials and textures to PBR siblings."));
-    top->addWidget(m_authorModeButton);
-    top->addWidget(m_convertModeButton);
+    // Workspace switcher: the Material Editor edits one .pbrm; the Material
+    // Converter runs the FO4/FO76 batch pipeline (docs/FO4-Conversion.md).
+    m_workspaceModeCombo = new QComboBox(topBar);
+    m_workspaceModeCombo->addItem(tr("Material Editor"));
+    m_workspaceModeCombo->addItem(tr("Material Converter"));
+    m_workspaceModeCombo->setItemData(0, tr("Edit the open .pbrm material."), Qt::ToolTipRole);
+    m_workspaceModeCombo->setItemData(1, tr("Batch-convert FO4/FO76 .bgsm/.bgem materials and textures to PBR siblings."), Qt::ToolTipRole);
+    m_workspaceModeCombo->setToolTip(tr("Switch between authoring a material and the batch converter."));
+    connect(m_workspaceModeCombo, &QComboBox::currentIndexChanged, this, [this](int index) {
+        setWorkspaceMode(index == 1);
+    });
+    top->addWidget(m_workspaceModeCombo);
     auto* modeSeparator = new QFrame(topBar);
     modeSeparator->setFrameShape(QFrame::VLine);
     modeSeparator->setFrameShadow(QFrame::Sunken);
@@ -283,11 +278,13 @@ void MainWindow::buildWindow()
 
 void MainWindow::setWorkspaceMode(bool convert)
 {
-    m_authorModeButton->setChecked(!convert);
-    m_convertModeButton->setChecked(convert);
+    if (m_workspaceModeCombo->currentIndex() != (convert ? 1 : 0)) {
+        const QSignalBlocker blocker(m_workspaceModeCombo);
+        m_workspaceModeCombo->setCurrentIndex(convert ? 1 : 0);
+    }
     m_workspaceStack->setCurrentIndex(convert ? 1 : 0);
-    // The shader combo and settings search act on the Author document; keep
-    // them visibly inert while the Convert queue owns the window.
+    // The shader combo and settings search act on the editor document; keep
+    // them visibly inert while the converter queue owns the window.
     m_shaderCombo->setEnabled(!convert);
     m_search->setEnabled(!convert);
 }
