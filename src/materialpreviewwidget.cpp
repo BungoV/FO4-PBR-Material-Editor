@@ -1,5 +1,6 @@
 #include "materialpreviewwidget.h"
 #include "colorpicker.h"
+#include "disclosureicon.h"
 #include "dragnumericedit.h"
 #include "previewenvironmentsettings.h"
 #include "texturecache.h"
@@ -3252,7 +3253,25 @@ MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent) : QFrame(parent)
 
 void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
 {
-    m_controls=new QGroupBox(tr("Preview Settings"),this);m_controls->setObjectName(QStringLiteral("PreviewSettings"));
+    // Collapsible header: folding the settings away hands their height to the
+    // viewport (m_stack carries the layout stretch).
+    m_settingsToggle=new QToolButton(this);
+    m_settingsToggle->setText(tr("Preview Settings"));
+    m_settingsToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_settingsToggle->setAutoRaise(true);
+    m_settingsToggle->setCheckable(true);
+    m_settingsToggle->setToolTip(tr("Show or hide the preview settings to give the viewport more room."));
+    layout->addWidget(m_settingsToggle);
+    m_controls=new QGroupBox(QString(),this);m_controls->setObjectName(QStringLiteral("PreviewSettings"));
+    const bool settingsExpanded=!QSettings().value(QStringLiteral("Preview/settingsCollapsed"),false).toBool();
+    m_settingsToggle->setChecked(settingsExpanded);
+    m_settingsToggle->setIcon(disclosureArrowIcon(settingsExpanded,14,QColor(223,226,230)));
+    m_controls->setVisible(settingsExpanded);
+    connect(m_settingsToggle,&QToolButton::toggled,this,[this](bool expanded){
+        m_controls->setVisible(expanded);
+        m_settingsToggle->setIcon(disclosureArrowIcon(expanded,14,QColor(223,226,230)));
+        QSettings().setValue(QStringLiteral("Preview/settingsCollapsed"),!expanded);
+    });
     auto* box=new QVBoxLayout(m_controls);box->setContentsMargins(6,8,6,6);box->setSpacing(0);
     auto* tabs=new QTabWidget(m_controls);tabs->setObjectName(QStringLiteral("PreviewSettingsTabs"));
     // The tab pages outgrew the fixed panel height; scrolling beats letting
@@ -3800,7 +3819,7 @@ void MaterialPreviewWidget::tickWeatherSimulation()
 void MaterialPreviewWidget::inspectTexture(const QString& name,const QString& path,const QStringList& channels,const QColor& color)
 {
     m_textureName=name;m_textureColor=color;m_textureError.clear();m_textureImage=TextureImage::load(path,m_textureRoot,&m_textureError);
-    m_title->setText(name+tr(" • Texture Preview"));m_textureCanvas->showTexture(name,m_textureImage,color,QStringLiteral("RGBA"),m_textureError);m_stack->setCurrentWidget(m_textureCanvas);m_controls->hide();m_buttonHost->show();rebuildChannelButtons(channels);
+    m_title->setText(name+tr(" • Texture Preview"));m_textureCanvas->showTexture(name,m_textureImage,color,QStringLiteral("RGBA"),m_textureError);m_stack->setCurrentWidget(m_textureCanvas);m_controls->hide();m_settingsToggle->hide();m_buttonHost->show();rebuildChannelButtons(channels);
 }
 
 void MaterialPreviewWidget::showFullMaterial()
@@ -3808,7 +3827,9 @@ void MaterialPreviewWidget::showFullMaterial()
     const int layerIndex=m_uvSet->currentIndex();const QString layer=layerIndex==1?tr("Secondary (UV1)"):(layerIndex==2?tr("Tertiary (UV2)"):(layerIndex==3?tr("Combined (All Layers)"):tr("Primary (UV0)")));
     m_title->setText(tr("Material Preview • %1").arg(layer));
     m_title->setToolTip(tr("Live editor preview includes texture channels and overrides, UV layering, transparency, environment lighting, parallax/displacement, and enabled shader-family effects. Custom NIF meshes are displayed in static bind pose; skinned animation is intentionally not evaluated."));
-    m_stack->setCurrentWidget(m_previewContainer);m_controls->show();
+    // Returning from texture preview restores the settings only if the user
+    // has them expanded — the disclosure toggle owns that preference.
+    m_stack->setCurrentWidget(m_previewContainer);m_settingsToggle->show();m_controls->setVisible(m_settingsToggle->isChecked());
     while(QLayoutItem* item=m_buttons->takeAt(0)){delete item->widget();delete item;}m_buttonHost->hide();
 }
 

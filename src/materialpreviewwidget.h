@@ -76,6 +76,10 @@ public:
 
     explicit PbrPreviewGL(QWidget* parent = nullptr);
     ~PbrPreviewGL() override;
+    // QOpenGLWidget's 640x480 default hint would let the canvas drive the
+    // main splitter wider whenever the settings box (previously the widest
+    // child) is collapsed; the canvas has no natural size — it fills.
+    QSize sizeHint() const override { return {300, 300}; }
     bool rendererReady() const;
     void setMaterial(const Pbr::MaterialDocument& document, const QString& textureRoot);
     void setShape(Shape shape);
@@ -402,6 +406,7 @@ private:
     TexturePreviewCanvas* m_textureCanvas = nullptr;
     QWidget* m_buttonHost = nullptr;
     QHBoxLayout* m_buttons = nullptr;
+    QToolButton* m_settingsToggle = nullptr;
     QGroupBox* m_controls = nullptr;
     QComboBox* m_shape = nullptr;
     QLabel* m_planeOptionsLabel = nullptr;
