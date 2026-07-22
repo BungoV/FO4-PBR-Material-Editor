@@ -58,6 +58,23 @@ QPushButton#TemplatesButton { padding-right: 20px; }
 QListWidget { background: #27292d; border: none; outline: none; }
 QListWidget::item { min-height: 25px; padding-left: 7px; }
 QListWidget::item:selected { background: #3d6f9f; color: #ffb44a; }
+QTreeView, QTreeWidget {
+    background: #27292d;
+    alternate-background-color: #2d3034;
+    color: #e6e8eb;
+    border: 1px solid #4d5056;
+    outline: none;
+}
+QTreeView::item { min-height: 22px; }
+QTreeView::item:selected { background: #3d6f9f; color: #ffffff; }
+QHeaderView::section {
+    background: #2c2f33;
+    color: #aeb3ba;
+    border: none;
+    border-right: 1px solid #3a3d42;
+    border-bottom: 1px solid #3a3d42;
+    padding: 3px 6px;
+}
 QScrollArea { border: none; background: #303236; }
 QScrollBar:vertical { background: #25272a; width: 14px; margin: 0; }
 QScrollBar::handle:vertical { background: #62666c; min-height: 30px; border-radius: 5px; margin: 2px; }

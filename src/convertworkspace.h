@@ -94,7 +94,7 @@ private:
     QPushButton* m_cancelButton = nullptr;
     QDoubleSpinBox* m_recovery = nullptr;
     QDoubleSpinBox* m_glossCurve = nullptr;
-    QSpinBox* m_derivationSize = nullptr;
+    QDoubleSpinBox* m_derivationSize = nullptr;
     QCheckBox* m_heightInBlue = nullptr;
     QCheckBox* m_detailAo = nullptr;
     QCheckBox* m_metalDiagnostic = nullptr;

@@ -1,5 +1,6 @@
 #include "convertworkspace.h"
 
+#include "dragnumericedit.h"
 #include "maskpaint.h"
 #include "materialdocument.h"
 #include "materialpreviewwidget.h"
@@ -130,8 +131,10 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     mainLayout->setContentsMargins(7, 7, 7, 7);
     mainLayout->setSpacing(7);
 
+    // The editor's drag-scrub number fields — same left/right slider feel as
+    // the authoring pages.
     const auto makeSpin = [main](double value, double min, double max, double step, int decimals = 2) {
-        auto* spin = new QDoubleSpinBox(main);
+        auto* spin = new DragNumericEdit(main);
         spin->setRange(min, max);
         spin->setSingleStep(step);
         spin->setDecimals(decimals);
@@ -181,10 +184,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     m_recovery->setToolTip(tr("How strongly dark FO4 metal albedo is rebuilt from spec + cubemap hue."));
     m_glossCurve = makeSpin(settings.value(QStringLiteral("Convert/glossCurve"), 1.0).toDouble(), 0.25, 4.0, 0.05);
     m_glossCurve->setToolTip(tr("Response curve for the gloss/smoothness to roughness inversion (1 = linear)."));
-    m_derivationSize = new QSpinBox(batchGroup);
-    m_derivationSize->setRange(64, 2048);
-    m_derivationSize->setSingleStep(64);
-    m_derivationSize->setValue(settings.value(QStringLiteral("Convert/derivationSize"), 512).toInt());
+    m_derivationSize = makeSpin(settings.value(QStringLiteral("Convert/derivationSize"), 512).toInt(), 64, 2048, 64, 0);
     m_derivationSize->setToolTip(tr("Resolution cap for the height/AO derivations (curvature always runs full-res)."));
     batchGrid->addWidget(new QLabel(tr("Metal recovery"), batchGroup), 0, 0);
     batchGrid->addWidget(m_recovery, 0, 1);
@@ -311,10 +311,12 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     m_preview = new MaterialPreviewWidget(splitter);
     connect(m_preview->canvas(), &PbrPreviewGL::meshTrianglePicked, this, &ConvertWorkspace::handleTrianglePicked);
     splitter->addWidget(m_preview);
-    splitter->setSizes({430, 620, 310});
+    // The 3D viewport opens at half the window width, matching the
+    // authoring workspace.
+    splitter->setSizes({330, 630, 960});
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 1);
-    splitter->setStretchFactor(2, 0);
+    splitter->setStretchFactor(2, 1);
     updatePreview(nullptr);
 
     updateButtons();
@@ -404,7 +406,7 @@ Converter::JobOptions ConvertWorkspace::collectOptions(bool dryRun) const
     job.writeMetallicDiagnostic = m_metalDiagnostic->isChecked();
     job.math.recoveryStrength = float(m_recovery->value());
     job.math.glossCurve = float(m_glossCurve->value());
-    job.derive.derivationSize = m_derivationSize->value();
+    job.derive.derivationSize = int(m_derivationSize->value());
     return job;
 }
 
