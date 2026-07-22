@@ -2859,6 +2859,10 @@ void PbrPreviewGL::buildGridGeometry()
         line({-half,y,t},{half,y,t},colorZ);
     }
     m_gridVertexCount=int(data.size()/7);
+    // Trailing pair: the green vertical Y axis, drawn only in orthographic
+    // side views where the ground grid is edge-on.
+    const QVector4D yAxisColor(.42f,.78f,.35f,.95f);
+    line({0,y,0},{0,y+2.0f*half,0},yAxisColor);
     m_gridVao->bind();
     m_gridBuffer.bind();
     m_gridBuffer.allocate(data.constData(),int(data.size()*sizeof(float)));
@@ -2925,6 +2929,8 @@ void PbrPreviewGL::drawGrid()
     m_lineProgram->setUniformValue("uUseConstant",false);
     m_gridVao->bind();
     glDrawArrays(GL_LINES,0,m_gridVertexCount);
+    if(m_projection==Projection::Orthographic&&std::abs(m_pitch)<45.0f)
+        glDrawArrays(GL_LINES,m_gridVertexCount,2); // green Y axis in ortho side views
     m_gridVao->release();
     m_lineProgram->release();
     glDepthMask(GL_TRUE);
@@ -3034,28 +3040,7 @@ void PbrPreviewGL::drawNavGizmo(QPainter& painter)
 void PbrPreviewGL::drawViewportOverlays()
 {
     QPainter painter(this);
-    drawNavGizmo(painter);
-    if(m_gridEnabled&&m_shape!=Shape::Plane&&!m_freeCamera){
-        // Direction labels at the grid's axis ends, depth-ignoring on purpose.
-        painter.setRenderHint(QPainter::TextAntialiasing,true);
-        QFont font=painter.font();font.setPixelSize(11);font.setBold(true);painter.setFont(font);
-        const QMatrix4x4 viewProjection=projectionMatrix()*viewMatrix();
-        const auto label=[&](const QVector3D& world,const QColor& color,const QString& text){
-            const QVector4D clip=viewProjection*QVector4D(world,1.0f);
-            if(clip.w()<=0.01f)return;
-            const QPointF screen((clip.x()/clip.w()*0.5f+0.5f)*width(),(0.5f-clip.y()/clip.w()*0.5f)*height());
-            if(!rect().adjusted(4,4,-4,-4).contains(screen.toPoint()))return;
-            painter.setPen(QColor(0,0,0,170));
-            painter.drawText(QRectF(screen.x()-19,screen.y()-9,40,18).translated(1,1),Qt::AlignCenter,text);
-            painter.setPen(color);
-            painter.drawText(QRectF(screen.x()-20,screen.y()-10,40,18),Qt::AlignCenter,text);
-        };
-        constexpr float y=-1.075f,half=5.0f;
-        label({half+.25f,y,0},QColor(226,96,96),QStringLiteral("+X"));
-        label({-half-.25f,y,0},QColor(226,96,96),QStringLiteral("-X"));
-        label({0,y,half+.25f},QColor(96,150,236),QStringLiteral("+Z"));
-        label({0,y,-half-.25f},QColor(96,150,236),QStringLiteral("-Z"));
-    }
+    drawNavGizmo(painter); // orientation lives in the gizmo; the grid stays label-free
     if(m_freeCamera){
         // FPS crosshair + flight hint.
         painter.setRenderHint(QPainter::Antialiasing,true);
@@ -3264,16 +3249,22 @@ void PbrPreviewGL::paintGL()
         // sample count, and comparing against format().samples() would then
         // recreate the FBO every frame.
         if(!m_msaaFbo||m_msaaFbo->size()!=QSize(pixelWidth,pixelHeight)||m_msaaRequested!=m_msaaSamples){
+            GLint maxSamples=1;
+            glGetIntegerv(GL_MAX_SAMPLES,&maxSamples);
             QOpenGLFramebufferObjectFormat msaaFormat;
             msaaFormat.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
-            msaaFormat.setSamples(m_msaaSamples);
+            msaaFormat.setSamples(std::min(m_msaaSamples,int(maxSamples)));
             m_msaaFbo=std::make_unique<QOpenGLFramebufferObject>(pixelWidth,pixelHeight,msaaFormat);
             m_msaaRequested=m_msaaSamples;
-            if(m_msaaFbo->format().samples()<2)
+            if(!m_msaaFbo->isValid()){
+                qWarning("Preview MSAA: %d-sample framebuffer failed; rendering without AA",m_msaaSamples);
+                m_msaaFbo.reset();
+            }else if(m_msaaFbo->format().samples()<2){
                 qWarning("Preview MSAA: driver clamped %d requested samples to %d — anti-aliasing unavailable",
                     m_msaaSamples,m_msaaFbo->format().samples());
+            }
         }
-        m_msaaFbo->bind();
+        if(m_msaaFbo)m_msaaFbo->bind();
         glClearColor(.1f,.1f,.1f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     } else if(m_msaaFbo) m_msaaFbo.reset();
     glViewport(0,0,pixelWidth,pixelHeight);
@@ -3952,7 +3943,7 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
 
     auto* lighting=new QWidget(tabs);auto* lightingForm=new QFormLayout(lighting);lightingForm->setContentsMargins(8,8,8,8);lightingForm->setVerticalSpacing(6);
     m_lightingPreset=new QComboBox(lighting);m_lightingPreset->addItems({tr("Studio"),tr("Direct Sun"),tr("Outdoor Shadow"),tr("Interior"),tr("Neutral Validation"),tr("Custom")});m_lightingPreset->setToolTip(tr("Apply a complete preview-lighting preset."));lightingForm->addRow(tr("Lighting preset"),m_lightingPreset);
-    m_deriveExrLighting=new QCheckBox(tr("Derive shadow direction from EXR"),lighting);m_deriveExrLighting->setObjectName(QStringLiteral("DeriveExrLighting"));m_deriveExrLighting->setEnabled(false);m_deriveExrLighting->setToolTip(tr("Uses the dominant HDR radiance direction only to cast an environment shadow. The EXR remains the sole lighting source, so its bright region is not counted twice."));lightingForm->addRow(QString(),m_deriveExrLighting);
+    m_deriveExrLighting=new QCheckBox(tr("Lighting derived from the EXR"),lighting);m_deriveExrLighting->setObjectName(QStringLiteral("DeriveExrLighting"));m_deriveExrLighting->setEnabled(false);m_deriveExrLighting->setToolTip(tr("With an EXR environment loaded, the key light and shadow direction always derive from its dominant radiance — the EXR is the sole light source, so its bright region is never counted twice. Manual key-light controls return when a non-HDR cubemap is active."));lightingForm->addRow(QString(),m_deriveExrLighting);
     addHeading(lightingForm,tr("Key Light"));
     m_keyIntensity=spin(0,20,.25,QString(),lighting);m_keyYaw=spin(-360,360,1,tr("°"),lighting);m_keyPitch=spin(-89,89,1,tr("°"),lighting);
     m_temperature=new QComboBox(lighting);m_temperature->setPlaceholderText(tr("From EXR"));m_temperature->addItem(tr("Warm 3200 K"),3200);m_temperature->addItem(tr("Neutral 5500 K"),5500);m_temperature->addItem(tr("Daylight 6500 K"),6500);m_temperature->addItem(tr("Cool 9000 K"),9000);m_temperature->setCurrentIndex(1);
@@ -4259,10 +4250,13 @@ void MaterialPreviewWidget::refreshDerivedEnvironmentLight(bool enableShadows)
 {
     const bool wasActive=m_deriveExrLighting->isChecked();
     const PbrPreviewGL::EnvironmentLight light=m_materialCanvas->derivedEnvironmentLight(float(m_environmentYaw->value()));
-    const bool active=light.valid&&m_deriveExrLightingPreferred;
+    // An EXR environment is authoritative: while one is loaded, the lights
+    // ALWAYS derive from it (the checkbox is a status indicator, not a
+    // choice). Manual lighting applies only to non-HDR cubemaps.
+    const bool active=light.valid;
     m_applyingDerivedLight=true;
     {
-        QSignalBlocker deriveBlocker(m_deriveExrLighting);m_deriveExrLighting->setEnabled(light.valid);m_deriveExrLighting->setChecked(active);
+        QSignalBlocker deriveBlocker(m_deriveExrLighting);m_deriveExrLighting->setEnabled(false);m_deriveExrLighting->setChecked(active);
     }
     if(active){
         captureManualLight();

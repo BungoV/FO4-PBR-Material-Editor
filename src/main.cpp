@@ -17,7 +17,9 @@ int main(int argc, char* argv[])
     previewFormat.setVersion(3, 3);
     previewFormat.setProfile(QSurfaceFormat::CoreProfile);
     previewFormat.setDepthBufferSize(24);
-    previewFormat.setSamples(4);
+    // No surface multisampling: the viewport's own MSAA FBO owns AA. A
+    // multisampled backing store would make the resolve blit illegal for any
+    // sample count other than its own (8x MSAA rendered black through 8->4).
     QSurfaceFormat::setDefaultFormat(previewFormat);
 
     QApplication application(argc, argv);
