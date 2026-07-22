@@ -1,4 +1,5 @@
 #include "bgsmreader.h"
+#include "convertercore.h"
 #include "materialdocument.h"
 #include "disclosureicon.h"
 #include "texturecache.h"
@@ -886,6 +887,173 @@ int main(int argc, char* argv[])
                 QStringLiteral("real material corpus parses cleanly: %1 parsed, %2 failed (%3)")
                     .arg(parsed).arg(failed).arg(firstFailure));
         }
+    }
+
+    {
+        // Conversion math core: the per-texel functions are the contract the
+        // whole converter stands on — pin them.
+        const Converter::Options options;
+
+        // Gloss/smoothness inversion.
+        check(qFuzzyIsNull(Converter::glossToRoughness(1.0f, options))
+            && qFuzzyCompare(Converter::glossToRoughness(0.0f, options), 1.0f),
+            QStringLiteral("gloss 1 -> roughness 0 and gloss 0 -> roughness 1"));
+
+        // FO4 metallic inference: needs env mapping AND bright spec AND dark
+        // diffuse; each missing leg kills it.
+        check(Converter::metallicConfidenceFo4(0.9f, 0.05f, true, 1.0f, 1.0f, options) > 0.9f,
+            QStringLiteral("FO4 inference fires on envmap + bright spec + dark diffuse"));
+        check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.9f, 0.05f, false, 1.0f, 1.0f, options)),
+            QStringLiteral("FO4 inference is dead without environment mapping"));
+        check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.05f, 0.05f, true, 1.0f, 1.0f, options)),
+            QStringLiteral("FO4 inference is dead without spec strength"));
+        check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.9f, 0.6f, true, 1.0f, 1.0f, options)),
+            QStringLiteral("FO4 inference is dead on a bright diffuse"));
+
+        // FO76 inference: bright reflectance + black diffuse.
+        check(Converter::metallicConfidenceFo76({0.7f, 0.6f, 0.45f}, 0.02f, options) > 0.9f,
+            QStringLiteral("FO76 inference fires on bright reflectance over black diffuse"));
+        check(qFuzzyIsNull(Converter::metallicConfidenceFo76({0.04f, 0.04f, 0.04f}, 0.4f, options)),
+            QStringLiteral("FO76 inference is dead on dielectric reflectance"));
+
+        // Painted correction: 0.5 neutral, extremes override fully.
+        check(qFuzzyCompare(Converter::applyMetallicCorrection(0.8f, 0.5f), 0.8f)
+            && qFuzzyIsNull(Converter::applyMetallicCorrection(0.8f, 0.0f))
+            && qFuzzyCompare(Converter::applyMetallicCorrection(0.1f, 1.0f), 1.0f),
+            QStringLiteral("metallic corrections respect the 0.5-neutral contract"));
+
+        // Metal albedo recovery: a black diffuse takes its hue from the
+        // cubemap tint (the vault-of-gold case); a hued dark diffuse keeps
+        // its own hue; brightness always comes from spec.
+        const QVector3D goldTint(0.6f, 0.45f, 0.2f);
+        const QVector3D fromBlack = Converter::recoverMetalAlbedoFo4({0.001f, 0.001f, 0.001f}, 1.0f, goldTint, true, options);
+        check(fromBlack.x() > fromBlack.z() * 1.5f && fromBlack.x() > 0.4f,
+            QStringLiteral("black-diffuse metal recovers the cubemap's warm hue at metal brightness"));
+        const QVector3D fromHue = Converter::recoverMetalAlbedoFo4({0.25f, 0.03f, 0.03f}, 1.0f, goldTint, true, options);
+        check(fromHue.x() > fromHue.y() * 2.0f,
+            QStringLiteral("a hued dark diffuse keeps its own hue through recovery"));
+        const QVector3D dim = Converter::recoverMetalAlbedoFo4({0.25f, 0.03f, 0.03f}, 0.0f, goldTint, true, options);
+        check(Converter::luminance(dim) < Converter::luminance(fromHue),
+            QStringLiteral("spec strength drives recovered brightness"));
+
+        // Saturation clamp: sky-blue scene cubes cannot tint metals.
+        const QVector3D clamped = Converter::clampTintSaturation({0.2f, 0.4f, 0.9f}, 0.2f);
+        const float clampedLuma = Converter::luminance(clamped);
+        check(std::abs(clamped.z() - clampedLuma) < std::abs(0.9f - Converter::luminance(QVector3D(0.2f, 0.4f, 0.9f))),
+            QStringLiteral("tint saturation clamp pulls scene colors toward neutral"));
+
+        // Image-level FO4 conversion: half dielectric red plastic, half
+        // authored-black metal under a warm cubemap.
+        QImage diffuse(8, 8, QImage::Format_RGBA8888);
+        QImage specular(8, 8, QImage::Format_RGBA8888);
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) {
+                const bool metal = x >= 4;
+                diffuse.setPixelColor(x, y, metal ? QColor(2, 2, 2) : QColor(180, 40, 40));
+                // R spec strength, G gloss.
+                specular.setPixelColor(x, y, metal ? QColor(230, 200, 0) : QColor(30, 60, 0));
+            }
+        Bgsm::Material fo4Material;
+        fo4Material.environmentMapping = true;
+        fo4Material.environmentMappingMaskScale = 1.0f;
+        fo4Material.specularMult = 1.0f;
+        Converter::Fo4Sources fo4Sources;
+        fo4Sources.diffuse = diffuse;
+        fo4Sources.specular = specular;
+        fo4Sources.cubemapTint = goldTint;
+        fo4Sources.hasCubemapTint = true;
+        const Converter::ConvertedImages fo4Out = Converter::convertFo4(fo4Sources, fo4Material, options);
+        check(!fo4Out.baseColor.isNull() && fo4Out.metalCoverage > 0.4f && fo4Out.metalCoverage < 0.6f,
+            QStringLiteral("FO4 conversion reports the authored metal coverage"));
+        const QColor metalBase = fo4Out.baseColor.pixelColor(6, 4);
+        const QColor plasticBase = fo4Out.baseColor.pixelColor(1, 4);
+        check(metalBase.redF() > 0.4 && metalBase.redF() > metalBase.blueF(),
+            QStringLiteral("FO4 black metal converts to a bright warm base color"));
+        check(plasticBase.redF() > 0.5 && qFuzzyCompare(float(plasticBase.greenF()), float(QColor(180, 40, 40).greenF())),
+            QStringLiteral("FO4 dielectric base color passes through untouched"));
+        const QColor metalRmaos = QColor(fo4Out.rmaos.pixelColor(6, 4));
+        const QColor plasticRmaos = QColor(fo4Out.rmaos.pixelColor(1, 4));
+        check(metalRmaos.greenF() > 0.9 && plasticRmaos.greenF() < 0.05,
+            QStringLiteral("FO4 metallic channel splits the halves"));
+        check(metalRmaos.redF() < plasticRmaos.redF(),
+            QStringLiteral("FO4 glossy metal converts smoother than dull plastic"));
+
+        // Image-level FO76 conversion: gold over black diffuse with _l data.
+        QImage diffuse76(4, 4, QImage::Format_RGBA8888);
+        QImage reflectance76(4, 4, QImage::Format_RGBA8888);
+        QImage lighting76(4, 4, QImage::Format_RGBA8888);
+        diffuse76.fill(QColor(3, 3, 3));
+        reflectance76.fill(QColor(185, 167, 123));
+        lighting76.fill(QColor(160, 200, 0)); // R smoothness .63, G AO .78
+        Bgsm::Material fo76Material;
+        fo76Material.version = 20;
+        Converter::Fo76Sources fo76Sources;
+        fo76Sources.diffuse = diffuse76;
+        fo76Sources.reflectance = reflectance76;
+        fo76Sources.lighting = lighting76;
+        const Converter::ConvertedImages fo76Out = Converter::convertFo76(fo76Sources, fo76Material, options);
+        const QColor goldBase = fo76Out.baseColor.pixelColor(2, 2);
+        // sRGB encoding compresses channel ratios; assert the warm ordering
+        // rather than a linear-space ratio.
+        check(fo76Out.metalCoverage > 0.99f && goldBase.redF() > 0.6
+            && goldBase.redF() > goldBase.greenF() && goldBase.greenF() > goldBase.blueF()
+            && goldBase.redF() - goldBase.blueF() > 0.1,
+            QStringLiteral("FO76 black-diffuse gold reconstructs its color from the reflectance map"));
+        const QColor goldRmaos = fo76Out.rmaos.pixelColor(2, 2);
+        check(goldRmaos.greenF() > 0.95 && std::abs(goldRmaos.blueF() - 200.0 / 255.0) < 0.02
+            && std::abs(goldRmaos.redF() - (1.0 - 160.0 / 255.0)) < 0.02,
+            QStringLiteral("FO76 RMAOS carries metallic, the shipped AO, and inverted smoothness"));
+
+        // Emissive rule: grayscale glow x material color, mask in alpha.
+        QImage glow(2, 2, QImage::Format_RGBA8888);
+        glow.fill(QColor(128, 128, 128));
+        fo4Material.emitEnabled = true;
+        fo4Material.emittanceColor = QVector3D(1.0f, 0.5f, 0.0f);
+        fo4Sources.glow = glow;
+        const Converter::ConvertedImages emissiveOut = Converter::convertFo4(fo4Sources, fo4Material, options);
+        const QColor emissive = emissiveOut.emissive.pixelColor(0, 0);
+        check(!emissiveOut.emissive.isNull() && std::abs(emissive.redF() - 0.5) < 0.01
+            && std::abs(emissive.greenF() - 0.25) < 0.01 && qFuzzyIsNull(float(emissive.blueF()))
+            && std::abs(emissive.alphaF() - 0.5) < 0.01,
+            QStringLiteral("FO4 emissive bakes mask x material color with the raw mask in alpha"));
+
+        // Parameter mapping: the four-fate audit's mapped fates.
+        Bgsm::Material mapped;
+        mapped.alphaTest = true;
+        mapped.alphaTestRef = 96;
+        mapped.twoSided = true;
+        mapped.modelSpaceNormals = true;
+        mapped.refraction = true;
+        mapped.refractionPower = 0.4f;
+        mapped.customPorosity = true;
+        mapped.porosityValue = 0.7f;
+        mapped.grayscaleToPaletteColor = true;
+        Pbr::MaterialDocument converted;
+        QStringList unhonoredFields;
+        Converter::mapParameters(mapped, &converted, &unhonoredFields);
+        check(converted.setting(QStringLiteral("Transparency/Composition"), QStringLiteral("mode")).toString() == QStringLiteral("Alpha Test")
+            && std::abs(converted.setting(QStringLiteral("Transparency/Composition"), QStringLiteral("threshold")).toDouble() - 96.0 / 255.0) < 1e-6,
+            QStringLiteral("alpha test maps to composition mode + threshold"));
+        check(converted.setting(QStringLiteral("Shading/Core"), QStringLiteral("twoSided")).toBool()
+            && converted.setting(QStringLiteral("Shading/Core"), QStringLiteral("normalSpace")).toString() == QStringLiteral("Model"),
+            QStringLiteral("two-sided and model-space normals map to core shading"));
+        check(converted.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryScreenDistortion")).enabled,
+            QStringLiteral("refraction maps to the Screen Distortion input"));
+        const QJsonObject porosityValues = converted.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values;
+        check(porosityValues.value(QStringLiteral("overridePorosity")).toBool(false)
+            && std::abs(porosityValues.value(QStringLiteral("porosity")).toDouble() - 0.7) < 1e-6,
+            QStringLiteral("FO76 vanilla porosity maps onto the v5 porosity constant"));
+        check(!unhonoredFields.isEmpty(),
+            QStringLiteral("unrepresentable fields are reported, never silently dropped"));
+        Bgsm::Material effectMapped;
+        effectMapped.kind = Bgsm::Kind::Bgem;
+        effectMapped.effectLightingEnabled = false;
+        effectMapped.baseColorScale = 6.0f;
+        Pbr::MaterialDocument effectConverted;
+        Converter::mapParameters(effectMapped, &effectConverted, nullptr);
+        check(effectConverted.shaderMode() == Pbr::ShaderMode::UnlitEffect
+            && std::abs(effectConverted.setting(QStringLiteral("Shading/Unlit"), QStringLiteral("intensity")).toDouble() - 6.0) < 1e-6,
+            QStringLiteral("unlit BGEM maps its diffuse-as-emission scale to Unlit intensity"));
     }
 
     {

@@ -12,6 +12,7 @@ SOURCES += \
     src/main.cpp \
     src/bgsmreader.cpp \
     src/clicommands.cpp \
+    src/convertercore.cpp \
     src/materialdocument.cpp \
     src/texturearchive.cpp \
     src/texturecache.cpp \
@@ -34,6 +35,7 @@ SOURCES += \
 HEADERS += \
     src/bgsmreader.h \
     src/clicommands.h \
+    src/convertercore.h \
     src/materialdocument.h \
     src/texturearchive.h \
     src/texturecache.h \

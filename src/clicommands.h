@@ -22,6 +22,7 @@ int runRepairPaths(const QStringList& args);
 int runExportDefinitions(const QStringList& args);
 int runExportJson(const QStringList& args);
 int runPack(const QStringList& args);
+int runInspect(const QStringList& args);
 QString helpText();
 
 } // namespace PbrmCli

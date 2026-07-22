@@ -448,6 +448,65 @@ int runPack(const QStringList& args)
     return 0;
 }
 
+int runInspect(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--texture-root")});
+    if (options.paths.isEmpty()) {
+        out() << "usage: pbrm inspect [--texture-root <dir>] <textures...>\n" << Qt::flush;
+        return 2;
+    }
+    const QString textureRoot = effectiveTextureRoot(options);
+    int failures = 0;
+    for (const QString& path : options.paths) {
+        const TextureImage::Diagnostics info = TextureImage::inspect(path, textureRoot);
+        if (!info.valid) {
+            out() << path << ": error: " << info.error << '\n';
+            ++failures;
+            continue;
+        }
+        out() << path << ": " << info.width << 'x' << info.height << " " << info.format
+              << " " << info.colorSpace << " channels " << info.channels.join(QString())
+              << " mips " << info.mipLevels << '\n';
+        QString loadError;
+        const QImage image = TextureImage::load(path, textureRoot, &loadError).convertToFormat(QImage::Format_RGBA8888);
+        if (image.isNull()) {
+            out() << "  (decode failed: " << loadError << ")\n";
+            continue;
+        }
+        // Per-channel statistics answer packing questions with data.
+        double sum[4] = {}, minimum[4] = {255, 255, 255, 255}, maximum[4] = {};
+        double variance[4] = {};
+        const double texels = double(image.width()) * image.height();
+        for (int y = 0; y < image.height(); ++y) {
+            const uchar* line = image.constScanLine(y);
+            for (int x = 0; x < image.width(); ++x)
+                for (int channel = 0; channel < 4; ++channel) {
+                    const double value = line[x * 4 + channel];
+                    sum[channel] += value;
+                    minimum[channel] = qMin(minimum[channel], value);
+                    maximum[channel] = qMax(maximum[channel], value);
+                }
+        }
+        for (int y = 0; y < image.height(); ++y) {
+            const uchar* line = image.constScanLine(y);
+            for (int x = 0; x < image.width(); ++x)
+                for (int channel = 0; channel < 4; ++channel) {
+                    const double delta = line[x * 4 + channel] - sum[channel] / texels;
+                    variance[channel] += delta * delta;
+                }
+        }
+        const char* channelNames[4] = {"R", "G", "B", "A"};
+        for (int channel = 0; channel < 4; ++channel)
+            out() << "  " << channelNames[channel]
+                  << " mean " << QString::number(sum[channel] / texels / 255.0, 'f', 3)
+                  << " min " << QString::number(minimum[channel] / 255.0, 'f', 3)
+                  << " max " << QString::number(maximum[channel] / 255.0, 'f', 3)
+                  << " stddev " << QString::number(std::sqrt(variance[channel] / texels) / 255.0, 'f', 3) << '\n';
+    }
+    out() << Qt::flush;
+    return failures > 0 ? 1 : 0;
+}
+
 QString helpText()
 {
     return QStringLiteral(
@@ -465,6 +524,7 @@ QString helpText()
         "  export-definitions  write the built-in surface state definitions JSON\n"
         "  export-json         write readable .pbrm.json sidecars\n"
         "  pack                composite a slot's channel sources into a game-ready DDS\n"
+        "  inspect             texture diagnostics + per-channel statistics\n"
         "\n"
         "common options: --json (machine-readable reports), --dry-run (report only),\n"
         "  --texture-root <dir> (explicit source root; editor settings are the fallback)\n");
@@ -481,6 +541,7 @@ int runVerb(const QString& verb, const QStringList& args)
     if (verb == QLatin1String("export-definitions")) return runExportDefinitions(args);
     if (verb == QLatin1String("export-json")) return runExportJson(args);
     if (verb == QLatin1String("pack")) return runPack(args);
+    if (verb == QLatin1String("inspect")) return runInspect(args);
     out() << helpText() << Qt::flush;
     return verb == QLatin1String("help") || verb == QLatin1String("--help") ? 0 : 2;
 }
