@@ -40,6 +40,7 @@ QString canonicalPath(QString path)
     path = path.trimmed().replace(u'\\', u'/');
     while (path.startsWith(u'/')) path.remove(0, 1);
     if (path.startsWith(QStringLiteral("textures/"), Qt::CaseInsensitive)) path.remove(0, 9);
+    else if (path.startsWith(QStringLiteral("materials/"), Qt::CaseInsensitive)) path.remove(0, 10);
     return path.toLower();
 }
 
@@ -124,8 +125,10 @@ public:
             return false;
         }
         const quint32 version = read32(header, 4);
-        if (version != 1) {
-            if (error) *error = QStringLiteral("Unsupported BA2 version %1; Fallout 4 texture archives use version 1.").arg(version);
+        // 1 = Fallout 4 and early Fallout 76; 7/8 = later Fallout 76 updates
+        // with the identical table layout, only the number changed.
+        if (version != 1 && version != 7 && version != 8) {
+            if (error) *error = QStringLiteral("Unsupported BA2 version %1 (Fallout 4/76 archives use 1, 7, or 8).").arg(version);
             return false;
         }
         const QByteArray kind = header.mid(8, 4);
@@ -205,14 +208,16 @@ public:
             }
             QString display = QString::fromUtf8(name).replace(u'\\', u'/');
             while (display.startsWith(u'/')) display.remove(0, 1);
-            if (display.startsWith(QStringLiteral("textures/"), Qt::CaseInsensitive)) display.remove(0, 9);
+            const bool texture = display.endsWith(QStringLiteral(".dds"), Qt::CaseInsensitive);
+            // Textures keep their historical "material form" (textures/
+            // stripped); everything else keeps the full archive path so
+            // callers can mirror the tree.
+            if (texture && display.startsWith(QStringLiteral("textures/"), Qt::CaseInsensitive)) display.remove(0, 9);
             records[int(i)].displayPath = display;
-            if (display.endsWith(QStringLiteral(".dds"), Qt::CaseInsensitive)) {
-                const QString key = canonicalPath(display);
-                if (!m_lookup.contains(key)) {
-                    m_lookup.insert(key, m_entries.size());
-                    m_entries.append(records[int(i)]);
-                }
+            const QString key = canonicalPath(display);
+            if (!m_lookup.contains(key)) {
+                m_lookup.insert(key, m_entries.size());
+                m_entries.append(records[int(i)]);
             }
         }
         return true;
@@ -223,7 +228,17 @@ public:
     {
         QStringList result;
         result.reserve(m_entries.size());
-        for (const Entry& entry : m_entries) result.append(entry.displayPath);
+        for (const Entry& entry : m_entries)
+            if (entry.displayPath.endsWith(QStringLiteral(".dds"), Qt::CaseInsensitive))
+                result.append(entry.displayPath);
+        return result;
+    }
+    QStringList pathsWithSuffix(const QString& suffix) const
+    {
+        QStringList result;
+        for (const Entry& entry : m_entries)
+            if (entry.displayPath.endsWith(suffix, Qt::CaseInsensitive))
+                result.append(entry.displayPath);
         return result;
     }
     bool contains(const QString& path) const { return m_lookup.contains(canonicalPath(path)); }
@@ -292,6 +307,12 @@ QStringList texturePaths(const QString& archivePath, QString* error)
 {
     const auto index = indexFor(archivePath, error);
     return index ? index->paths() : QStringList{};
+}
+
+QStringList entryPaths(const QString& archivePath, const QString& suffix, QString* error)
+{
+    const auto index = indexFor(archivePath, error);
+    return index ? index->pathsWithSuffix(suffix) : QStringList{};
 }
 
 bool contains(const QString& archivePath, const QString& texturePath)

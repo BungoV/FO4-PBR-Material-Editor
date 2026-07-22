@@ -50,4 +50,11 @@ struct JobResult {
 
 JobResult convertMaterial(const QString& materialPath, const JobOptions& options, TextureCache* cache);
 
+// Archive-direct conversion: `entryPath` is the material's path inside the
+// BA2 (e.g. "materials/actors/x.bgsm"), `data` its extracted bytes. Textures
+// resolve through the texture root's loose files and archives; the archive's
+// own folder acts as the Data root for template chains.
+JobResult convertMaterialData(const QString& archivePath, const QString& entryPath, const QByteArray& data,
+    const JobOptions& options, TextureCache* cache);
+
 } // namespace Converter

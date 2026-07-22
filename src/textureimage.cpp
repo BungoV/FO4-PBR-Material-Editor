@@ -4,10 +4,12 @@
 #define TINYEXR_USE_MINIZ 0
 #include "tinyexr.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QImageReader>
 #include <QColorSpace>
 #include <QSettings>
@@ -274,6 +276,34 @@ QString canonicalTexturePath(QString path)
     return path;
 }
 
+// BA2 archives sitting in the texture root (a game Data folder) join the
+// resolution chain automatically — `--texture-root <Data>` works against a
+// vanilla install with nothing extracted. Cached per root, mtime-checked.
+QStringList rootArchives(const QString& textureRoot)
+{
+    const QString root = QFileInfo(textureRoot.trimmed()).absoluteFilePath();
+    if (root.isEmpty() || !QFileInfo(root).isDir()) return {};
+    struct CacheEntry { QDateTime modified; QStringList archives; };
+    static QHash<QString, CacheEntry> cache;
+    const QDateTime modified = QFileInfo(root).lastModified();
+    const auto found = cache.constFind(root.toLower());
+    if (found != cache.constEnd() && found->modified == modified) return found->archives;
+    QStringList archives;
+    const QDir dir(root);
+    for (const QFileInfo& info : dir.entryInfoList({QStringLiteral("*.ba2")}, QDir::Files, QDir::Name))
+        archives.append(info.absoluteFilePath());
+    cache.insert(root.toLower(), {modified, archives});
+    return archives;
+}
+
+QStringList resolutionArchives(const QString& textureRoot)
+{
+    QStringList result = archivePaths();
+    for (const QString& archive : rootArchives(textureRoot))
+        if (!result.contains(archive, Qt::CaseInsensitive)) result.append(archive);
+    return result;
+}
+
 QString loosePath(const QString& authoredPath, const QString& textureRoot)
 {
     const QString native = canonicalTexturePath(authoredPath);
@@ -303,7 +333,7 @@ QByteArray textureBytes(const QString& authoredPath, const QString& textureRoot,
         return file.readAll();
     }
     const QString virtualPath = canonicalTexturePath(authoredPath);
-    for (const QString& archive : archivePaths()) {
+    for (const QString& archive : resolutionArchives(textureRoot)) {
         if (!TextureArchive::contains(archive, virtualPath)) continue;
         QByteArray bytes = TextureArchive::extract(archive, virtualPath, error);
         if (!bytes.isEmpty() && resolved) *resolved = archive + QStringLiteral(" :: ") + virtualPath;
@@ -400,7 +430,7 @@ QString resolvePath(const QString& authoredPath, const QString& textureRoot)
     const QString loose = loosePath(authoredPath, textureRoot);
     if (!loose.isEmpty()) return loose;
     const QString virtualPath = canonicalTexturePath(authoredPath);
-    for (const QString& archive : archivePaths())
+    for (const QString& archive : resolutionArchives(textureRoot))
         if (TextureArchive::contains(archive, virtualPath)) return archive + QStringLiteral(" :: ") + virtualPath;
     return {};
 }

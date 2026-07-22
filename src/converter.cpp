@@ -1,6 +1,7 @@
 #include "converter.h"
 
 #include "bgsmreader.h"
+#include "texturearchive.h"
 #include "textureimage.h"
 #include "texturewriter.h"
 
@@ -161,6 +162,28 @@ void wireSlot(Pbr::MaterialDocument* document, const QString& key, const QString
 
 } // namespace
 
+namespace {
+
+// BA2 archives beside the data/texture roots join the root-chain lookup so
+// template parents resolve straight out of a vanilla install.
+QStringList chainArchives(const QString& dataRoot, const QString& textureRoot)
+{
+    QStringList archives;
+    for (const QString& root : {dataRoot, textureRoot}) {
+        if (root.trimmed().isEmpty() || !QFileInfo(root).isDir()) continue;
+        const QDir dir(root);
+        for (const QFileInfo& info : dir.entryInfoList({QStringLiteral("*.ba2")}, QDir::Files, QDir::Name))
+            if (!archives.contains(info.absoluteFilePath(), Qt::CaseInsensitive))
+                archives.append(info.absoluteFilePath());
+    }
+    return archives;
+}
+
+JobResult convertParsed(Bgsm::Material& material, JobResult result, const QString& materialRelative,
+    const QString& dataRoot, const JobOptions& options, TextureCache* cache);
+
+} // namespace
+
 JobResult convertMaterial(const QString& materialPath, const JobOptions& options, TextureCache* cache)
 {
     JobResult result;
@@ -174,8 +197,34 @@ JobResult convertMaterial(const QString& materialPath, const JobOptions& options
         result.errors.append(error);
         return result;
     }
+    return convertParsed(material, result, materialsRelativePath(materialPath), dataRootFor(materialPath), options, cache);
+}
+
+JobResult convertMaterialData(const QString& archivePath, const QString& entryPath, const QByteArray& data,
+    const JobOptions& options, TextureCache* cache)
+{
+    JobResult result;
+    result.materialPath = archivePath + QStringLiteral(" :: ") + entryPath;
+    TextureCache localCache;
+    if (!cache) cache = &localCache;
+
+    Bgsm::Material material;
+    QString error;
+    if (!Bgsm::read(data, &material, &error)) {
+        result.errors.append(error);
+        return result;
+    }
+    return convertParsed(material, result, materialsRelativePath(entryPath),
+        QFileInfo(archivePath).absolutePath(), options, cache);
+}
+
+namespace {
+
+JobResult convertParsed(Bgsm::Material& material, JobResult result, const QString& materialRelative,
+    const QString& dataRoot, const JobOptions& options, TextureCache* cache)
+{
+    QString error;
     // Root template chains: children are frequently texture-sparse.
-    const QString dataRoot = dataRootFor(materialPath);
     const auto lookup = [&dataRoot, &options](const QString& path, QByteArray* data) {
         const QString normalized = QDir::fromNativeSeparators(path);
         for (const QString& candidate : {dataRoot + QLatin1Char('/') + normalized,
@@ -187,6 +236,11 @@ JobResult convertMaterial(const QString& materialPath, const JobOptions& options
                 return true;
             }
         }
+        for (const QString& archive : chainArchives(dataRoot, options.textureRoot)) {
+            if (!TextureArchive::contains(archive, normalized)) continue;
+            *data = TextureArchive::extract(archive, normalized, nullptr);
+            if (!data->isEmpty()) return true;
+        }
         return false;
     };
     QString chainError;
@@ -195,7 +249,6 @@ JobResult convertMaterial(const QString& materialPath, const JobOptions& options
         result.flagged = true;
     }
 
-    const QString materialRelative = materialsRelativePath(materialPath);
     result.pbrmPath = options.outputRoot + QStringLiteral("/Materials/") + materialRelative;
     result.pbrmPath.replace(QRegularExpression(QStringLiteral("\\.(bgsm|bgem)$"), QRegularExpression::CaseInsensitiveOption),
         QStringLiteral(".pbrm"));
@@ -389,5 +442,7 @@ JobResult convertMaterial(const QString& materialPath, const JobOptions& options
     result.converted = result.errors.isEmpty();
     return result;
 }
+
+} // namespace
 
 } // namespace Converter

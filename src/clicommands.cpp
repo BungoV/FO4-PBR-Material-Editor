@@ -2,6 +2,7 @@
 
 #include "converter.h"
 #include "materialdocument.h"
+#include "texturearchive.h"
 #include "texturecache.h"
 #include "textureimage.h"
 #include "texturewriter.h"
@@ -524,7 +525,7 @@ int runConvert(const QStringList& args)
         out() << "usage: pbrm convert --out <mod folder> [--texture-root <dir>] [--dry-run] [--json]\n"
                  "                    [--force] [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]\n"
                  "                    [--recovery <0-1>] [--gloss-curve <v>] [--derivation-size <px>]\n"
-                 "                    <materials or folders...>\n"
+                 "                    <materials, folders, or .ba2 archives...>\n"
                  "       pbrm convert --out <mod folder> --clean   # remove exactly the recorded output\n" << Qt::flush;
         return 2;
     }
@@ -586,15 +587,31 @@ int runConvert(const QStringList& args)
     if (options.has(QStringLiteral("--derivation-size")))
         job.derive.derivationSize = options.value(QStringLiteral("--derivation-size")).toInt();
 
-    QStringList materials;
+    struct MaterialSource {
+        QString path;      // loose file, or the BA2 archive
+        QString entry;     // empty = loose; else the material's path inside the archive
+        QString display() const { return entry.isEmpty() ? path : path + QStringLiteral(" :: ") + entry; }
+    };
+    QVector<MaterialSource> materials;
     for (const QString& target : options.paths) {
         const QFileInfo info(target);
         if (info.isDir()) {
             QDirIterator it(info.absoluteFilePath(), {QStringLiteral("*.bgsm"), QStringLiteral("*.bgem")},
                 QDir::Files, QDirIterator::Subdirectories);
-            while (it.hasNext()) materials.append(it.next());
+            while (it.hasNext()) materials.append({it.next(), {}});
+        } else if (info.isFile() && target.endsWith(QStringLiteral(".ba2"), Qt::CaseInsensitive)) {
+            // Archive-direct: convert every material the BA2 carries.
+            QString archiveError;
+            QStringList entries = TextureArchive::entryPaths(info.absoluteFilePath(), QStringLiteral(".bgsm"), &archiveError);
+            entries += TextureArchive::entryPaths(info.absoluteFilePath(), QStringLiteral(".bgem"), nullptr);
+            if (!archiveError.isEmpty()) {
+                out() << target << ": error: " << archiveError << "\n";
+                continue;
+            }
+            entries.sort(Qt::CaseInsensitive);
+            for (const QString& entry : entries) materials.append({info.absoluteFilePath(), entry});
         } else if (info.isFile()) {
-            materials.append(info.absoluteFilePath());
+            materials.append({info.absoluteFilePath(), {}});
         } else {
             out() << target << ": error: path does not exist\n";
         }
@@ -627,8 +644,10 @@ int runConvert(const QStringList& args)
     QVector<Finding> findings;
     QJsonArray manifestEntries;
     int converted = 0, flagged = 0, failed = 0, upToDate = 0;
-    for (const QString& material : materials) {
-        const QString sourceModified = QFileInfo(material).lastModified().toString(Qt::ISODateWithMs);
+    for (const MaterialSource& source : materials) {
+        const QString material = source.display();
+        // Archive entries inherit the archive's timestamp for skip checks.
+        const QString sourceModified = QFileInfo(source.path).lastModified().toString(Qt::ISODateWithMs);
         const QJsonObject previous = previousEntries.value(QDir::cleanPath(material).toLower());
         if (!force && !job.dryRun && previous.value(QStringLiteral("converted")).toBool(false)
             && previous.value(QStringLiteral("sourceModified")).toString() == sourceModified
@@ -638,7 +657,20 @@ int runConvert(const QStringList& args)
             manifestEntries.append(previous);
             continue;
         }
-        const Converter::JobResult jobResult = Converter::convertMaterial(material, job, &textureCache);
+        Converter::JobResult jobResult;
+        if (source.entry.isEmpty()) {
+            jobResult = Converter::convertMaterial(source.path, job, &textureCache);
+        } else {
+            QString extractError;
+            const QByteArray data = TextureArchive::extract(source.path, source.entry, &extractError);
+            if (data.isEmpty()) {
+                jobResult.materialPath = material;
+                jobResult.errors.append(extractError.isEmpty()
+                    ? QStringLiteral("could not extract the material from the archive") : extractError);
+            } else {
+                jobResult = Converter::convertMaterialData(source.path, source.entry, data, job, &textureCache);
+            }
+        }
         for (const QString& note : jobResult.notes) findings.append({material, false, note});
         for (const QString& jobError : jobResult.errors) findings.append({material, true, jobError});
         if (jobResult.converted) {

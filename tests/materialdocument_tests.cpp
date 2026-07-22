@@ -4,6 +4,7 @@
 #include "normalderive.h"
 #include "materialdocument.h"
 #include "disclosureicon.h"
+#include "texturearchive.h"
 #include "texturecache.h"
 #include "textureimage.h"
 #include "texturewriter.h"
@@ -1030,6 +1031,56 @@ int main(int argc, char* argv[])
             && markerBase.values.value(QStringLiteral("overrideColor")).toBool(false)
             && QColor(markerBase.values.value(QStringLiteral("color")).toString()).blue() > 200,
             QStringLiteral("constants-only sibling carries the effect color with no texture"));
+
+        // ---- BA2-direct: a hand-built v7 GNRL archive (the FO76 layout is
+        // identical to v1) carrying the marker BGEM, converted straight from
+        // the archive.
+        {
+            QByteArray ba2;
+            const auto putU32 = [&ba2](quint32 value) {
+                for (int i = 0; i < 4; ++i) ba2.append(char((value >> (8 * i)) & 0xFF));
+            };
+            const auto putU64 = [&ba2](quint64 value) {
+                for (int i = 0; i < 8; ++i) ba2.append(char((value >> (8 * i)) & 0xFF));
+            };
+            const QByteArray entryName = QByteArrayLiteral("materials\\effects\\ba2marker.bgem");
+            const QByteArray payload = markerBuilder.data;
+            const quint64 dataOffset = 24 + 36;                 // header + one GNRL record
+            const quint64 namesOffset = dataOffset + quint64(payload.size());
+            ba2.append("BTDX");
+            putU32(7);                                          // FO76 version, same layout
+            ba2.append("GNRL");
+            putU32(1);                                          // one file
+            putU64(namesOffset);
+            putU32(0); putU32(0); putU32(0); putU32(0);         // hashes/ext (unused by the reader)
+            putU64(dataOffset);
+            putU32(0);                                          // packed = 0 (stored)
+            putU32(quint32(payload.size()));
+            putU32(0xBAADF00Du);                                // alignment field
+            ba2.append(payload);
+            ba2.append(char(entryName.size() & 0xFF));
+            ba2.append(char((entryName.size() >> 8) & 0xFF));
+            ba2.append(entryName);
+            const QString ba2Path = QDir(convRoot.path()).filePath(QStringLiteral("test - Materials.ba2"));
+            QFile ba2File(ba2Path);
+            ba2File.open(QIODevice::WriteOnly);
+            ba2File.write(ba2);
+            ba2File.close();
+
+            QString archiveError;
+            const QStringList archiveMaterials = TextureArchive::entryPaths(ba2Path, QStringLiteral(".bgem"), &archiveError);
+            check(archiveMaterials.size() == 1 && archiveMaterials.first().compare(
+                    QStringLiteral("materials/effects/ba2marker.bgem"), Qt::CaseInsensitive) == 0,
+                QStringLiteral("v7 GNRL archive enumerates its material: %1").arg(archiveError));
+            const QByteArray extracted = TextureArchive::extract(ba2Path, archiveMaterials.value(0), &archiveError);
+            check(extracted == payload, QStringLiteral("archive extraction round-trips the material bytes"));
+            const Converter::JobResult fromArchive = Converter::convertMaterialData(ba2Path, archiveMaterials.value(0),
+                extracted, jobOptions, &textureCache);
+            check(fromArchive.converted && fromArchive.errors.isEmpty()
+                && fromArchive.pbrmPath.endsWith(QStringLiteral("Materials/effects/ba2marker.pbrm")),
+                QStringLiteral("archive-direct conversion writes the materials-relative sibling: %1")
+                    .arg(fromArchive.errors.join(QStringLiteral("; "))));
+        }
     }
 
     {
