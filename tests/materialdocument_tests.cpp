@@ -1,5 +1,6 @@
 #include "bgsmreader.h"
 #include "convertercore.h"
+#include "normalderive.h"
 #include "materialdocument.h"
 #include "disclosureicon.h"
 #include "texturecache.h"
@@ -1054,6 +1055,86 @@ int main(int argc, char* argv[])
         check(effectConverted.shaderMode() == Pbr::ShaderMode::UnlitEffect
             && std::abs(effectConverted.setting(QStringLiteral("Shading/Unlit"), QStringLiteral("intensity")).toDouble() - 6.0) < 1e-6,
             QStringLiteral("unlit BGEM maps its diffuse-as-emission scale to Unlit intensity"));
+    }
+
+    {
+        // Normal-map derivations: a synthetic pit (inverted Gaussian) has
+        // fully known signs — normals converge toward the center, the
+        // reconstructed height dips, AO darkens inside, and signed curvature
+        // reads concave in the bowl.
+        const int size = 96;
+        const auto makeField = [size](float amplitude) {
+            QImage normal(size, size, QImage::Format_RGBA8888);
+            const float sigma = size / 7.0f;
+            for (int y = 0; y < size; ++y)
+                for (int x = 0; x < size; ++x) {
+                    const float dx = x - size / 2.0f, dy = y - size / 2.0f;
+                    const float r2 = dx * dx + dy * dy;
+                    const float gaussian = amplitude * std::exp(-r2 / (2.0f * sigma * sigma));
+                    // h = -gaussian (a pit for positive amplitude); slope = dh.
+                    const float gx = gaussian * dx / (sigma * sigma);
+                    const float gy = gaussian * dy / (sigma * sigma);
+                    // n = normalize(-gx, -gy, 1)
+                    const float inverseLength = 1.0f / std::sqrt(gx * gx + gy * gy + 1.0f);
+                    const float nx = -gx * inverseLength, ny = -gy * inverseLength;
+                    normal.setPixelColor(x, y, QColor(
+                        int(std::lround((nx * 0.5f + 0.5f) * 255.0f)),
+                        int(std::lround((ny * 0.5f + 0.5f) * 255.0f)),
+                        int(std::lround((inverseLength * 0.5f + 0.5f) * 255.0f))));
+                }
+            return normal;
+        };
+        const QImage pitNormal = makeField(6.0f);
+        NormalDerive::Options deriveOptions;
+        deriveOptions.derivationSize = 96;
+        deriveOptions.autoDenoise = false;
+        const NormalDerive::Results pit = NormalDerive::derive(pitNormal, deriveOptions);
+        check(!pit.curvature.isNull() && !pit.height.isNull() && !pit.ao.isNull(),
+            QStringLiteral("derivations produce curvature, height, and AO"));
+        const int center = size / 2, corner = 6;
+        check(pit.height.pixelColor(center, center).redF() < pit.height.pixelColor(corner, corner).redF() - 0.2,
+            QStringLiteral("Poisson height reconstructs the pit below the surrounding surface"));
+        check(pit.ao.pixelColor(center, center).redF() < pit.ao.pixelColor(corner, corner).redF() - 0.05,
+            QStringLiteral("horizon AO darkens inside the pit and stays open on the flat"));
+        check(pit.curvature.pixelColor(center, center).redF() > 0.5,
+            QStringLiteral("pit floor reads concave (curvature above the 0.5 neutral)"));
+        check(std::abs(pit.curvature.pixelColor(corner, corner).redF() - 0.5) < 0.02,
+            QStringLiteral("flat regions stay at the signed-curvature neutral"));
+        // The dome is the mirror: convex crown, no self-occlusion at the top.
+        const QImage domeNormal = makeField(-6.0f);
+        const NormalDerive::Results dome = NormalDerive::derive(domeNormal, deriveOptions);
+        check(dome.curvature.pixelColor(center, center).redF() < 0.5,
+            QStringLiteral("dome crown reads convex (curvature below neutral)"));
+        check(dome.height.pixelColor(center, center).redF() > dome.height.pixelColor(corner, corner).redF() + 0.2,
+            QStringLiteral("Poisson height reconstructs the dome above the surrounding surface"));
+
+        // Noise metric and derivation-side denoise: checkerboard XY noise
+        // scores far above a clean gradient and cleans up measurably.
+        QImage noisy = pitNormal;
+        for (int y = 0; y < size; ++y)
+            for (int x = 0; x < size; ++x) {
+                QColor texel = noisy.pixelColor(x, y);
+                // Hash jitter approximates compression garbage (a perfect
+                // checkerboard would be both the median's and the bilateral's
+                // blind spot, and real noise is not phase-perfect).
+                const int jitter = int((uint(x) * 73u ^ uint(y) * 151u) % 29u) - 14;
+                texel.setRed(std::clamp(texel.red() + jitter, 0, 255));
+                texel.setGreen(std::clamp(texel.green() - jitter, 0, 255));
+                noisy.setPixelColor(x, y, texel);
+            }
+        const float cleanMetric = NormalDerive::noiseMetric(pitNormal);
+        const float noisyMetric = NormalDerive::noiseMetric(noisy);
+        check(noisyMetric > cleanMetric * 3.0f && noisyMetric > deriveOptions.denoiseThreshold,
+            QStringLiteral("the noise metric separates dithered normals from clean ones"));
+        NormalDerive::Options medianOptions = deriveOptions;
+        medianOptions.forceMedian = true;
+        const QImage cleaned = NormalDerive::denoiseNormal(noisy, medianOptions);
+        check(NormalDerive::noiseMetric(cleaned) < noisyMetric * 0.5f,
+            QStringLiteral("median + bilateral denoising removes most of the dither energy"));
+        deriveOptions.autoDenoise = true;
+        const NormalDerive::Results denoisedRun = NormalDerive::derive(noisy, deriveOptions);
+        check(denoisedRun.denoised && denoisedRun.noiseMetric > deriveOptions.denoiseThreshold,
+            QStringLiteral("derive() auto-gates the derivation-side denoise on the metric"));
     }
 
     {

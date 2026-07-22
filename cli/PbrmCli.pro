@@ -12,6 +12,7 @@ SOURCES += main_cli.cpp \
     ../src/bgsmreader.cpp \
     ../src/clicommands.cpp \
     ../src/convertercore.cpp \
+    ../src/normalderive.cpp \
     ../src/materialdocument.cpp \
     ../src/texturearchive.cpp \
     ../src/texturecache.cpp \
