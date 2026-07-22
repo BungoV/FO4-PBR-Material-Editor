@@ -37,6 +37,7 @@
 #include <QSettings>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QSplitter>
 #include <QStackedWidget>
 #include <QTabWidget>
 #include <QToolButton>
@@ -212,6 +213,9 @@ PbrPreviewGL::PbrPreviewGL(QWidget* parent) : QOpenGLWidget(parent)
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
+    m_freeTimer = new QTimer(this);
+    m_freeTimer->setInterval(16);
+    connect(m_freeTimer, &QTimer::timeout, this, [this] { freeCameraTick(); });
     m_previewClock.start();
     m_animationTimer = new QTimer(this);
     m_animationTimer->setInterval(16);
@@ -241,9 +245,10 @@ PbrPreviewGL::~PbrPreviewGL()
     m_prefilteredEnvironmentTexture.reset(); m_brdfLutTexture.reset();
     m_secondaryBaseTexture.reset(); m_secondaryNormalTexture.reset(); m_secondaryRmaosTexture.reset(); m_secondaryEmissiveTexture.reset(); m_layerCoverageTexture.reset(); m_gradientTexture.reset();m_specialTextureArray.reset();
     m_vertexBuffer.destroy(); m_indexBuffer.destroy(); m_groundVertexBuffer.destroy(); m_groundIndexBuffer.destroy();
+    m_gridBuffer.destroy();
     if (m_shadowDepthTexture) glDeleteTextures(1, &m_shadowDepthTexture);
     if (m_shadowFramebuffer) glDeleteFramebuffers(1, &m_shadowFramebuffer);
-    m_vao.reset(); m_groundVao.reset(); m_program.reset(); m_backgroundProgram.reset();
+    m_vao.reset(); m_groundVao.reset(); m_gridVao.reset(); m_lineProgram.reset(); m_program.reset(); m_backgroundProgram.reset();
     m_environmentPrefilterProgram.reset(); m_brdfIntegrationProgram.reset(); m_shadowProgram.reset();
     doneCurrent();
 }
@@ -1107,7 +1112,7 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
     m_program->setUniformValue("uDiffuseScale", companion.diffuseScale);
     m_program->setUniformValue("uSpecularScale", companion.specularScale);
 }
-void PbrPreviewGL::setProjection(Projection value) { m_projection = value; update(); emit cameraChanged(); }
+void PbrPreviewGL::setProjection(Projection value) { if(m_projection==value)return; m_projection = value; update(); emit cameraChanged(); emit projectionChanged(); }
 void PbrPreviewGL::setBackground(Background value) { m_background = value; update(); }
 void PbrPreviewGL::setDebugView(DebugView value) { m_debugView = value; update(); }
 void PbrPreviewGL::setGroundEnabled(bool value) { m_groundEnabled = value; update(); }
@@ -1219,6 +1224,11 @@ void PbrPreviewGL::setAxisView(AxisView value)
     case AxisView::Top: m_yaw = 0; m_pitch = -90; break;
     case AxisView::Bottom: m_yaw = 0; m_pitch = 90; break;
     }
+    // Blender/NifSkope semantics: snapping to an axis view goes orthographic.
+    if (m_projection != Projection::Orthographic) {
+        m_projection = Projection::Orthographic;
+        emit projectionChanged();
+    }
     update(); emit cameraChanged();
 }
 
@@ -1283,6 +1293,27 @@ void PbrPreviewGL::initializeGL()
     m_vao = std::make_unique<QOpenGLVertexArrayObject>(); m_vao->create();
     m_groundVao = std::make_unique<QOpenGLVertexArrayObject>(); m_groundVao->create();
     m_vertexBuffer.create(); m_indexBuffer.create(); m_groundVertexBuffer.create(); m_groundIndexBuffer.create();
+
+    // Flat line program for the ground grid (position + color, no lighting).
+    m_lineProgram = std::make_unique<QOpenGLShaderProgram>();
+    m_lineProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, R"GLSL(
+        #version 330 core
+        layout(location=0) in vec3 aPosition;
+        layout(location=1) in vec4 aColor;
+        uniform mat4 uViewProjection;
+        out vec4 vColor;
+        void main(){vColor=aColor;gl_Position=uViewProjection*vec4(aPosition,1.0);}
+    )GLSL");
+    m_lineProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, R"GLSL(
+        #version 330 core
+        in vec4 vColor;
+        out vec4 fragColor;
+        void main(){fragColor=vColor;}
+    )GLSL");
+    m_lineProgram->link();
+    m_gridVao = std::make_unique<QOpenGLVertexArrayObject>(); m_gridVao->create();
+    m_gridBuffer.create();
+    buildGridGeometry();
 
     m_program = std::make_unique<QOpenGLShaderProgram>();
     static const char* vertexShader = R"GLSL(
@@ -2791,7 +2822,278 @@ void PbrPreviewGL::uploadMesh()
 
 QMatrix4x4 PbrPreviewGL::viewMatrix() const
 {
+    if(m_freeCamera){QMatrix4x4 view;view.rotate(m_pitch,1,0,0);view.rotate(m_yaw,0,1,0);view.translate(-m_freeEye);return view;}
     QMatrix4x4 view; view.translate(m_pan.x(),m_pan.y(),-m_distance); view.rotate(m_pitch,1,0,0); view.rotate(m_yaw,0,1,0); return view;
+}
+
+QVector3D PbrPreviewGL::cameraEye() const
+{
+    return (viewMatrix().inverted()*QVector4D(0,0,0,1)).toVector3DAffine();
+}
+
+void PbrPreviewGL::buildGridGeometry()
+{
+    // NifSkope-style ground grid in the XZ plane (this preview is Y-up):
+    // faint minor lines, brighter majors, vivid axis rows through the origin
+    // (X red, Z blue — matching the navigation gizmo), sitting just above
+    // the shadow-catcher quad (y=-1.08) to avoid z-fighting.
+    constexpr float y=-1.075f,half=5.0f;
+    constexpr int majors=10,sub=4; // 1.0 cells, 0.25 subdivisions
+    const QVector4D minorColor(.36f,.38f,.41f,.28f),majorColor(.45f,.47f,.5f,.5f);
+    const QVector4D xAxisColor(.85f,.30f,.30f,.95f),zAxisColor(.32f,.5f,.9f,.95f);
+    QVector<float> data;
+    const auto line=[&data](const QVector3D& a,const QVector3D& b,const QVector4D& color){
+        for(const QVector3D& p:{a,b}){data<<p.x()<<p.y()<<p.z()<<color.x()<<color.y()<<color.z()<<color.w();}
+    };
+    const int lines=majors*sub;
+    for(int i=-lines;i<=lines;++i){
+        const float t=float(i)*half/float(lines);
+        const bool axis=i==0,major=(i%sub)==0;
+        const QVector4D& colorX=axis?zAxisColor:(major?majorColor:minorColor); // lines of constant X run along Z
+        const QVector4D& colorZ=axis?xAxisColor:(major?majorColor:minorColor);
+        line({t,y,-half},{t,y,half},colorX);
+        line({-half,y,t},{half,y,t},colorZ);
+    }
+    m_gridVertexCount=int(data.size()/7);
+    m_gridVao->bind();
+    m_gridBuffer.bind();
+    m_gridBuffer.allocate(data.constData(),int(data.size()*sizeof(float)));
+    m_lineProgram->bind();
+    m_lineProgram->enableAttributeArray(0);m_lineProgram->setAttributeBuffer(0,GL_FLOAT,0,3,7*sizeof(float));
+    m_lineProgram->enableAttributeArray(1);m_lineProgram->setAttributeBuffer(1,GL_FLOAT,3*sizeof(float),4,7*sizeof(float));
+    m_lineProgram->release();
+    m_gridVao->release();
+}
+
+void PbrPreviewGL::drawGrid()
+{
+    if(!m_gridEnabled||!m_lineProgram||!m_lineProgram->isLinked()||m_shape==Shape::Plane)return;
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    m_lineProgram->bind();
+    m_lineProgram->setUniformValue("uViewProjection",projectionMatrix()*viewMatrix());
+    m_gridVao->bind();
+    glDrawArrays(GL_LINES,0,m_gridVertexCount);
+    m_gridVao->release();
+    m_lineProgram->release();
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+/*
+ *  Blender-style navigation gizmo (top-right axis-ball widget), ported from
+ *  the ClaudeNifskope build and adapted to this viewport's Y-up orbit camera.
+ */
+
+void PbrPreviewGL::navGizmoLayout(QPointF& center,float& radius,float& ballRadius) const
+{
+    radius=38.0f;
+    ballRadius=10.0f;
+    center=QPointF(width()-radius-18.0,radius+18.0);
+}
+
+void PbrPreviewGL::navGizmoBalls(QPointF positions[6],float depths[6]) const
+{
+    QPointF center;float radius,ballRadius;
+    navGizmoLayout(center,radius,ballRadius);
+    QMatrix4x4 rotation;rotation.rotate(m_pitch,1,0,0);rotation.rotate(m_yaw,0,1,0);
+    const float d=radius-ballRadius;
+    // World axis k appears in view space at column k; screen y is flipped,
+    // view-space +z points toward the camera.
+    for(int k=0;k<3;++k){
+        const float sx=rotation(0,k),sy=rotation(1,k),dz=rotation(2,k);
+        positions[k*2]=center+QPointF(sx*d,-sy*d);depths[k*2]=dz;
+        positions[k*2+1]=center+QPointF(-sx*d,sy*d);depths[k*2+1]=-dz;
+    }
+}
+
+int PbrPreviewGL::navGizmoHitTest(const QPointF& position) const
+{
+    QPointF center;float radius,ballRadius;
+    navGizmoLayout(center,radius,ballRadius);
+    QPointF positions[6];float depths[6];
+    navGizmoBalls(positions,depths);
+    int best=-1;float bestDepth=-1.0e9f;
+    const float hitRadius=ballRadius+3.0f;
+    for(int i=0;i<6;++i){
+        const QPointF d=position-positions[i];
+        if(d.x()*d.x()+d.y()*d.y()<=hitRadius*hitRadius&&depths[i]>bestDepth){best=i;bestDepth=depths[i];}
+    }
+    if(best>=0)return best;
+    const QPointF dc=position-center;
+    if(dc.x()*dc.x()+dc.y()*dc.y()<=radius*radius)return 6;
+    return -1;
+}
+
+void PbrPreviewGL::drawNavGizmo(QPainter& painter)
+{
+    QPointF center;float radius,ballRadius;
+    navGizmoLayout(center,radius,ballRadius);
+    QPointF positions[6];float depths[6];
+    navGizmoBalls(positions,depths);
+    painter.setRenderHint(QPainter::Antialiasing,true);
+    painter.setRenderHint(QPainter::TextAntialiasing,true);
+    if(m_navHover>=0||m_navDrag){
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(255,255,255,26));
+        painter.drawEllipse(center,radius+3.0,radius+3.0);
+    }
+    static const QColor axisColors[3]={QColor(226,87,87),QColor(140,200,75),QColor(70,138,235)};
+    static const char* axisLabels[3]={"X","Y","Z"};
+    int order[6]={0,1,2,3,4,5};
+    std::sort(order,order+6,[&depths](int a,int b){return depths[a]<depths[b];});
+    QFont font=painter.font();
+    font.setPixelSize(int(ballRadius*1.35f));
+    font.setBold(true);
+    painter.setFont(font);
+    for(int index=0;index<6;++index){
+        const int i=order[index];
+        const int k=i/2;
+        const bool positive=!(i&1);
+        const bool hover=i==m_navHover;
+        const float t=(depths[i]+1.0f)*0.5f;
+        const float alpha=0.35f+0.65f*t;
+        const QColor color=axisColors[k];
+        if(positive){
+            QColor lineColor=color;lineColor.setAlphaF(alpha);
+            QPen pen(lineColor,2.2);
+            pen.setCapStyle(Qt::RoundCap);
+            painter.setPen(pen);
+            painter.drawLine(center,positions[i]);
+        }
+        if(positive||hover){
+            QColor fill=color;fill.setAlphaF(positive?alpha:(0.25f+0.5f*t));
+            painter.setBrush(fill);
+            painter.setPen(hover?QPen(QColor(255,255,255,230),1.6):QPen(Qt::NoPen));
+            painter.drawEllipse(positions[i],double(ballRadius),double(ballRadius));
+            if(positive){
+                painter.setPen(QColor(20,20,20,int(255*alpha)));
+                painter.drawText(QRectF(positions[i].x()-ballRadius,positions[i].y()-ballRadius,ballRadius*2,ballRadius*2),
+                    Qt::AlignCenter,QLatin1String(axisLabels[k]));
+            }
+        }else{
+            QColor ring=color;ring.setAlphaF(alpha);
+            painter.setBrush(QColor(0,0,0,int(90*alpha)));
+            painter.setPen(QPen(ring,1.8));
+            painter.drawEllipse(positions[i],double(ballRadius),double(ballRadius));
+        }
+    }
+}
+
+void PbrPreviewGL::drawViewportOverlays()
+{
+    QPainter painter(this);
+    drawNavGizmo(painter);
+    if(m_gridEnabled&&m_shape!=Shape::Plane&&!m_freeCamera){
+        // Direction labels at the grid's axis ends, depth-ignoring on purpose.
+        painter.setRenderHint(QPainter::TextAntialiasing,true);
+        QFont font=painter.font();font.setPixelSize(11);font.setBold(true);painter.setFont(font);
+        const QMatrix4x4 viewProjection=projectionMatrix()*viewMatrix();
+        const auto label=[&](const QVector3D& world,const QColor& color,const QString& text){
+            const QVector4D clip=viewProjection*QVector4D(world,1.0f);
+            if(clip.w()<=0.01f)return;
+            const QPointF screen((clip.x()/clip.w()*0.5f+0.5f)*width(),(0.5f-clip.y()/clip.w()*0.5f)*height());
+            if(!rect().adjusted(4,4,-4,-4).contains(screen.toPoint()))return;
+            painter.setPen(QColor(0,0,0,170));
+            painter.drawText(QRectF(screen.x()-19,screen.y()-9,40,18).translated(1,1),Qt::AlignCenter,text);
+            painter.setPen(color);
+            painter.drawText(QRectF(screen.x()-20,screen.y()-10,40,18),Qt::AlignCenter,text);
+        };
+        constexpr float y=-1.075f,half=5.0f;
+        label({half+.25f,y,0},QColor(226,96,96),QStringLiteral("+X"));
+        label({-half-.25f,y,0},QColor(226,96,96),QStringLiteral("-X"));
+        label({0,y,half+.25f},QColor(96,150,236),QStringLiteral("+Z"));
+        label({0,y,-half-.25f},QColor(96,150,236),QStringLiteral("-Z"));
+    }
+    if(m_freeCamera){
+        // FPS crosshair + flight hint.
+        painter.setRenderHint(QPainter::Antialiasing,true);
+        const QPointF center(width()*0.5,height()*0.5);
+        painter.setPen(QPen(QColor(240,240,240,220),1.4));
+        painter.drawLine(center-QPointF(7,0),center-QPointF(2,0));
+        painter.drawLine(center+QPointF(2,0),center+QPointF(7,0));
+        painter.drawLine(center-QPointF(0,7),center-QPointF(0,2));
+        painter.drawLine(center+QPointF(0,2),center+QPointF(0,7));
+        painter.setPen(QColor(223,226,230,220));
+        painter.drawText(QRectF(8,height()-24,width()-16,18),Qt::AlignLeft|Qt::AlignVCenter,
+            tr("Free camera — WASD fly · Q/E down/up · Shift boost · wheel speed %1x · LMB confirm · RMB/Esc back")
+                .arg(double(m_freeCamSpeed),0,'f',2));
+    }
+}
+
+void PbrPreviewGL::setGridEnabled(bool enabled)
+{
+    if(m_gridEnabled==enabled)return;
+    m_gridEnabled=enabled;update();
+}
+
+void PbrPreviewGL::setFreeCamera(bool enabled)
+{
+    if(m_freeCamera==enabled)return;
+    if(enabled){
+        m_freeEye=cameraEye(); // still the orbit camera: seamless hand-off
+        m_freeEntryYaw=m_yaw;m_freeEntryPitch=m_pitch;m_freeEntryPan=m_pan;m_freeEntryDistance=m_distance;
+    }
+    m_freeCamera=enabled;
+    m_freeKeys=0;
+    if(enabled){
+        setFocus();
+        grabKeyboard();
+        setCursor(Qt::BlankCursor);
+        m_recentering=true;
+        QCursor::setPos(mapToGlobal(QPoint(width()/2,height()/2)));
+        m_freeClock.start();
+        m_freeTimer->start();
+    }else{
+        m_freeTimer->stop();
+        releaseKeyboard();
+        unsetCursor();
+        // Fold the flight back into the orbit model: same rotation, the orbit
+        // target sits m_distance ahead of the eye.
+        QMatrix4x4 rotation;rotation.rotate(m_pitch,1,0,0);rotation.rotate(m_yaw,0,1,0);
+        const QVector3D v=rotation.map(m_freeEye);
+        m_distance=std::clamp(v.z(),.25f,25.0f);
+        m_pan=QVector2D(-v.x(),-v.y());
+        emit cameraChanged();
+    }
+    update();
+}
+
+void PbrPreviewGL::cancelFreeCamera()
+{
+    if(!m_freeCamera)return;
+    m_freeCamera=false;
+    m_freeKeys=0;
+    m_freeTimer->stop();
+    releaseKeyboard();
+    unsetCursor();
+    // Return to the pose the flight started from.
+    m_yaw=m_freeEntryYaw;m_pitch=m_freeEntryPitch;m_pan=m_freeEntryPan;m_distance=m_freeEntryDistance;
+    emit cameraChanged();
+    update();
+}
+
+void PbrPreviewGL::freeCameraTick()
+{
+    if(!m_freeCamera)return;
+    const float dt=std::min(float(m_freeClock.restart())/1000.0f,.1f);
+    if(!m_freeKeys){update();return;}
+    QMatrix4x4 rotation;rotation.rotate(m_pitch,1,0,0);rotation.rotate(m_yaw,0,1,0);
+    const QMatrix4x4 inverse=rotation.inverted();
+    const QVector3D forward=inverse.mapVector(QVector3D(0,0,-1));
+    const QVector3D right=inverse.mapVector(QVector3D(1,0,0));
+    QVector3D move;
+    if(m_freeKeys&1u)move+=forward;
+    if(m_freeKeys&4u)move-=forward;
+    if(m_freeKeys&2u)move-=right;
+    if(m_freeKeys&8u)move+=right;
+    if(m_freeKeys&16u)move-=QVector3D(0,1,0);
+    if(m_freeKeys&32u)move+=QVector3D(0,1,0);
+    if(!move.isNull()){
+        const float boost=(m_freeKeys&64u)?3.0f:1.0f;
+        m_freeEye+=move.normalized()*(2.2f*m_freeCamSpeed*boost*dt);
+        update();
+    }
 }
 
 QMatrix4x4 PbrPreviewGL::projectionMatrix() const
@@ -2853,11 +3155,18 @@ void PbrPreviewGL::paintGL()
     renderShadowMap();
     const int pixelWidth=int(width()*devicePixelRatioF()),pixelHeight=int(height()*devicePixelRatioF());
     if(m_msaaSamples>1){
-        if(!m_msaaFbo||m_msaaFbo->size()!=QSize(pixelWidth,pixelHeight)||m_msaaFbo->format().samples()!=m_msaaSamples){
+        // Compare against the REQUESTED count: drivers may clamp the actual
+        // sample count, and comparing against format().samples() would then
+        // recreate the FBO every frame.
+        if(!m_msaaFbo||m_msaaFbo->size()!=QSize(pixelWidth,pixelHeight)||m_msaaRequested!=m_msaaSamples){
             QOpenGLFramebufferObjectFormat msaaFormat;
             msaaFormat.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
             msaaFormat.setSamples(m_msaaSamples);
             m_msaaFbo=std::make_unique<QOpenGLFramebufferObject>(pixelWidth,pixelHeight,msaaFormat);
+            m_msaaRequested=m_msaaSamples;
+            if(m_msaaFbo->format().samples()<2)
+                qWarning("Preview MSAA: driver clamped %d requested samples to %d — anti-aliasing unavailable",
+                    m_msaaSamples,m_msaaFbo->format().samples());
         }
         m_msaaFbo->bind();
         glClearColor(.1f,.1f,.1f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
@@ -3173,22 +3482,60 @@ void PbrPreviewGL::paintGL()
     }
     if(m_debugView==DebugView::Wireframe)glPolygonMode(GL_FRONT_AND_BACK,GL_FILL);
     m_vao->release();m_program->release();
+    drawGrid(); // inside the MSAA pass so the lines resolve smooth
     if(m_msaaSamples>1&&m_msaaFbo){
         glBindFramebuffer(GL_READ_FRAMEBUFFER,m_msaaFbo->handle());
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER,defaultFramebufferObject());
         glBlitFramebuffer(0,0,pixelWidth,pixelHeight,0,0,pixelWidth,pixelHeight,GL_COLOR_BUFFER_BIT,GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER,defaultFramebufferObject());
     }
+    drawViewportOverlays(); // QPainter, after the resolve
 }
 
 void PbrPreviewGL::mousePressEvent(QMouseEvent* event)
 {
-    setFocus();m_lastMouse=event->position();m_dragButton=event->button();event->accept();
+    setFocus();
+    if(m_freeCamera){
+        if(event->button()==Qt::LeftButton)setFreeCamera(false);      // confirm the flown position
+        else if(event->button()==Qt::RightButton)cancelFreeCamera();  // back to where the flight started
+        event->accept();return;
+    }
+    if(event->button()==Qt::LeftButton){
+        const int hit=navGizmoHitTest(event->position());
+        if(hit>=0&&hit<6){
+            static const AxisView axisViews[6]={AxisView::Right,AxisView::Left,AxisView::Top,AxisView::Bottom,AxisView::Front,AxisView::Back};
+            setAxisView(axisViews[hit]);
+            event->accept();return;
+        }
+        if(hit==6){m_navDrag=true;m_lastMouse=event->position();update();event->accept();return;}
+    }
+    m_lastMouse=event->position();m_dragButton=event->button();event->accept();
 }
 
 void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
 {
+    if(m_freeCamera){
+        if(m_recentering){m_recentering=false;m_lastMouse=event->position();return;}
+        const QPointF center(width()*0.5,height()*0.5);
+        const QPointF delta=event->position()-center;
+        if(!delta.isNull()){
+            m_yaw+=float(delta.x())*.2f;
+            m_pitch=std::clamp(m_pitch+float(delta.y())*.2f,-89.9f,89.9f);
+            m_recentering=true;
+            QCursor::setPos(mapToGlobal(QPoint(width()/2,height()/2)));
+            update();
+        }
+        event->accept();return;
+    }
     const QPointF delta=event->position()-m_lastMouse;m_lastMouse=event->position();
+    if(m_navDrag){
+        m_yaw+=float(delta.x())*.5f;m_pitch=std::clamp(m_pitch+float(delta.y())*.5f,-89.9f,89.9f);
+        update();emit cameraChanged();return;
+    }
+    if(m_dragButton==Qt::NoButton){
+        const int hover=navGizmoHitTest(event->position());
+        if(hover!=m_navHover){m_navHover=hover;update();}
+    }
     if(m_dragButton==Qt::MiddleButton){
         if(event->modifiers()&Qt::ShiftModifier){const float scale=.0035f*m_distance;m_pan+=QVector2D(float(delta.x())*scale,float(-delta.y())*scale);}
         else{m_yaw+=float(delta.x())*.5f;m_pitch=std::clamp(m_pitch+float(delta.y())*.5f,-89.9f,89.9f);}
@@ -3197,19 +3544,99 @@ void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
     else if(m_dragButton==Qt::LeftButton&&(event->modifiers()&Qt::ShiftModifier)){m_keyYaw+=float(delta.x())*.5f;m_keyPitch=std::clamp(m_keyPitch-float(delta.y())*.5f,-89.0f,89.0f);update();emit lightAnglesChanged(m_keyYaw,m_keyPitch);}
 }
 
-void PbrPreviewGL::mouseReleaseEvent(QMouseEvent* event){if(event->button()==m_dragButton)m_dragButton=Qt::NoButton;event->accept();}
-void PbrPreviewGL::wheelEvent(QWheelEvent* event){m_distance=std::clamp(m_distance*std::pow(.85f,float(event->angleDelta().y())/120.0f),.25f,25.0f);update();emit cameraChanged();event->accept();}
+void PbrPreviewGL::mouseReleaseEvent(QMouseEvent* event)
+{
+    if(m_navDrag&&event->button()==Qt::LeftButton){m_navDrag=false;update();}
+    if(event->button()==m_dragButton)m_dragButton=Qt::NoButton;
+    event->accept();
+}
+
+void PbrPreviewGL::wheelEvent(QWheelEvent* event)
+{
+    if(m_freeCamera){
+        m_freeCamSpeed=std::clamp(m_freeCamSpeed*(event->angleDelta().y()>0?1.25f:0.8f),.05f,50.0f);
+        update();event->accept();return;
+    }
+    m_distance=std::clamp(m_distance*std::pow(.85f,float(event->angleDelta().y())/120.0f),.25f,25.0f);update();emit cameraChanged();event->accept();
+}
 
 void PbrPreviewGL::keyPressEvent(QKeyEvent* event)
 {
+    if(event->key()==Qt::Key_F&&(event->modifiers()&Qt::ShiftModifier)){setFreeCamera(!m_freeCamera);event->accept();return;}
+    if(m_freeCamera){
+        switch(event->key()){
+        case Qt::Key_Escape:cancelFreeCamera();event->accept();return;
+        case Qt::Key_W:m_freeKeys|=1u;event->accept();return;
+        case Qt::Key_A:m_freeKeys|=2u;event->accept();return;
+        case Qt::Key_S:m_freeKeys|=4u;event->accept();return;
+        case Qt::Key_D:m_freeKeys|=8u;event->accept();return;
+        case Qt::Key_Q:m_freeKeys|=16u;event->accept();return;
+        case Qt::Key_E:m_freeKeys|=32u;event->accept();return;
+        case Qt::Key_Shift:m_freeKeys|=64u;event->accept();return;
+        default:event->accept();return; // the flight owns the keyboard
+        }
+    }
     const bool ctrl=event->modifiers()&Qt::ControlModifier;
+    const bool shift=event->modifiers()&Qt::ShiftModifier;
+    const bool keypad=event->modifiers()&Qt::KeypadModifier;
     if(event->key()==Qt::Key_F){frameObject();event->accept();return;}
     if(event->key()==Qt::Key_Home){resetView();event->accept();return;}
     if(event->key()==Qt::Key_5){setProjection(m_projection==Projection::Perspective?Projection::Orthographic:Projection::Perspective);event->accept();return;}
     if(event->key()==Qt::Key_1){setAxisView(ctrl?AxisView::Back:AxisView::Front);event->accept();return;}
     if(event->key()==Qt::Key_3){setAxisView(ctrl?AxisView::Left:AxisView::Right);event->accept();return;}
     if(event->key()==Qt::Key_7){setAxisView(ctrl?AxisView::Bottom:AxisView::Top);event->accept();return;}
+    if(keypad){
+        // The rest of the Blender numpad block (as in the NifSkope build):
+        // 2/4/6/8 orbit steps (Shift pans), 9 opposite view, +/- zoom steps.
+        const auto orbitStep=[this](float pitchDelta,float yawDelta){
+            m_yaw+=yawDelta;m_pitch=std::clamp(m_pitch+pitchDelta,-89.9f,89.9f);update();emit cameraChanged();
+        };
+        const auto panStep=[this](float x,float y){
+            m_pan+=QVector2D(x,y)*(0.10f*m_distance);update();emit cameraChanged();
+        };
+        switch(event->key()){
+        case Qt::Key_2:if(shift)panStep(0,1);else orbitStep(15,0);event->accept();return;
+        case Qt::Key_8:if(shift)panStep(0,-1);else orbitStep(-15,0);event->accept();return;
+        case Qt::Key_4:if(shift)panStep(1,0);else orbitStep(0,-15);event->accept();return;
+        case Qt::Key_6:if(shift)panStep(-1,0);else orbitStep(0,15);event->accept();return;
+        case Qt::Key_9:m_yaw+=180.0f;m_pitch=-m_pitch;update();emit cameraChanged();event->accept();return;
+        case Qt::Key_Plus:m_distance=std::clamp(m_distance/1.2f,.25f,25.0f);update();emit cameraChanged();event->accept();return;
+        case Qt::Key_Minus:m_distance=std::clamp(m_distance*1.2f,.25f,25.0f);update();emit cameraChanged();event->accept();return;
+        case Qt::Key_Period:frameObject();event->accept();return;
+        default:break;
+        }
+    }
     QOpenGLWidget::keyPressEvent(event);
+}
+
+void PbrPreviewGL::keyReleaseEvent(QKeyEvent* event)
+{
+    if(m_freeCamera&&!event->isAutoRepeat()){
+        switch(event->key()){
+        case Qt::Key_W:m_freeKeys&=~1u;break;
+        case Qt::Key_A:m_freeKeys&=~2u;break;
+        case Qt::Key_S:m_freeKeys&=~4u;break;
+        case Qt::Key_D:m_freeKeys&=~8u;break;
+        case Qt::Key_Q:m_freeKeys&=~16u;break;
+        case Qt::Key_E:m_freeKeys&=~32u;break;
+        case Qt::Key_Shift:m_freeKeys&=~64u;break;
+        default:break;
+        }
+        event->accept();return;
+    }
+    QOpenGLWidget::keyReleaseEvent(event);
+}
+
+void PbrPreviewGL::focusOutEvent(QFocusEvent* event)
+{
+    if(m_freeCamera)setFreeCamera(false); // never leave the keyboard grabbed
+    QOpenGLWidget::focusOutEvent(event);
+}
+
+void PbrPreviewGL::leaveEvent(QEvent* event)
+{
+    if(m_navHover!=-1){m_navHover=-1;update();}
+    QOpenGLWidget::leaveEvent(event);
 }
 
 MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent) : QFrame(parent)
@@ -3230,22 +3657,48 @@ MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent) : QFrame(parent)
     m_referenceCanvas->hide();
     previewSplit->addWidget(m_materialCanvas,1);previewSplit->addWidget(m_referenceCanvas,1);
     m_textureCanvas=new TexturePreviewCanvas(m_stack);
-    m_stack->addWidget(m_previewContainer);m_stack->addWidget(m_textureCanvas);layout->addWidget(m_stack,1);
+    m_stack->addWidget(m_previewContainer);m_stack->addWidget(m_textureCanvas);
     connect(m_materialCanvas,&PbrPreviewGL::shaderErrorsChanged,this,[shaderErrorLabel](const QString& log){
         shaderErrorLabel->setText(tr("Shader error — the preview may be incomplete:\n")+log.left(600));
         shaderErrorLabel->setVisible(!log.isEmpty());
     });
     connect(m_materialCanvas,&PbrPreviewGL::cameraChanged,this,[this]{if(m_referenceCanvas->isVisible())m_referenceCanvas->copyCameraFrom(m_materialCanvas);});
     connect(m_referenceCanvas,&PbrPreviewGL::cameraChanged,this,[this]{if(m_referenceCanvas->isVisible())m_materialCanvas->copyCameraFrom(m_referenceCanvas);});
-    m_buttonHost=new QWidget(this);m_buttons=new QHBoxLayout(m_buttonHost);m_buttons->setContentsMargins(0,0,0,0);m_buttons->setSpacing(5);layout->addWidget(m_buttonHost);
-    buildPreviewControls(layout);
+    m_buttonHost=new QWidget(this);m_buttons=new QHBoxLayout(m_buttonHost);m_buttons->setContentsMargins(0,0,0,0);m_buttons->setSpacing(5);
+    // Viewport above, settings below, with a user-draggable divider so the
+    // settings sit at whatever height the user wants.
+    m_previewSplitter=new QSplitter(Qt::Vertical,this);
+    auto* canvasHost=new QWidget(m_previewSplitter);
+    auto* canvasLayout=new QVBoxLayout(canvasHost);
+    canvasLayout->setContentsMargins(0,0,0,0);canvasLayout->setSpacing(6);
+    canvasLayout->addWidget(m_stack,1);
+    canvasLayout->addWidget(m_buttonHost);
+    m_settingsBottom=new QWidget(m_previewSplitter);
+    auto* settingsLayout=new QVBoxLayout(m_settingsBottom);
+    settingsLayout->setContentsMargins(0,0,0,0);settingsLayout->setSpacing(6);
+    buildPreviewControls(settingsLayout);
+    m_previewSplitter->addWidget(canvasHost);
+    m_previewSplitter->addWidget(m_settingsBottom);
+    m_previewSplitter->setStretchFactor(0,1);
+    m_previewSplitter->setStretchFactor(1,0);
+    m_previewSplitter->setCollapsible(0,false);
+    layout->addWidget(m_previewSplitter,1);
+    {
+        QSettings settings;
+        const QByteArray state=settings.value(QStringLiteral("Preview/settingsSplitter")).toByteArray();
+        if(!state.isEmpty())m_previewSplitter->restoreState(state);
+        else m_previewSplitter->setSizes({420,460});
+    }
+    connect(m_previewSplitter,&QSplitter::splitterMoved,this,[this]{
+        QSettings().setValue(QStringLiteral("Preview/settingsSplitter"),m_previewSplitter->saveState());
+    });
     // The settings tabs live in scroll areas; without the guard, scrolling the
     // panel silently changes any combo under the cursor and savePreviewSettings
     // persists the accident (this is how projection kept flipping to ortho).
     for(QComboBox* combo:m_controls->findChildren<QComboBox*>())WheelFocusGuard::install(combo);
-    auto* help=new QLabel(tr("Viewport: MMB orbit • Shift+MMB pan • RMB dolly • wheel zoom • F frame"),this);
+    auto* help=new QLabel(tr("Viewport: MMB orbit • Shift+MMB pan • RMB dolly • wheel zoom • F frame • Shift+F fly"),this);
     help->setObjectName(QStringLiteral("Muted"));help->setWordWrap(true);
-    help->setToolTip(tr("Viewport controls: MMB orbit; Shift+MMB pan; RMB dolly; wheel zoom; Shift+LMB rotate the key light; F frame; Numpad 1/3/7 axis views; Numpad 5 toggle projection."));
+    help->setToolTip(tr("Viewport controls: MMB orbit; Shift+MMB pan; RMB dolly; wheel zoom; Shift+LMB rotate the key light; F frame; Shift+F free camera (WASD fly, Q/E down/up, wheel = speed); the top-right gizmo snaps axis views and orbits by drag; Numpad 1/3/7 axis views; Numpad 5 toggle projection."));
     layout->addWidget(help);
     connect(m_materialCanvas,&PbrPreviewGL::lightAnglesChanged,this,[this](float yaw,float pitch){QSignalBlocker a(m_keyYaw),b(m_keyPitch);m_keyYaw->setValue(yaw);m_keyPitch->setValue(pitch);savePreviewSettings();});
     loadPreviewSettings();showFullMaterial();
@@ -3267,11 +3720,19 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     m_settingsToggle->setChecked(settingsExpanded);
     m_settingsToggle->setIcon(disclosureArrowIcon(settingsExpanded,14,QColor(223,226,230)));
     m_controls->setVisible(settingsExpanded);
-    connect(m_settingsToggle,&QToolButton::toggled,this,[this](bool expanded){
+    // Collapsing caps the splitter pane at the toggle's height so the freed
+    // space actually goes to the viewport; expanding lifts the cap.
+    const auto applySettingsCap=[this](bool expanded){
+        if(!m_settingsBottom)return;
+        m_settingsBottom->setMaximumHeight(expanded?QWIDGETSIZE_MAX:m_settingsToggle->sizeHint().height()+4);
+    };
+    connect(m_settingsToggle,&QToolButton::toggled,this,[this,applySettingsCap](bool expanded){
         m_controls->setVisible(expanded);
+        applySettingsCap(expanded);
         m_settingsToggle->setIcon(disclosureArrowIcon(expanded,14,QColor(223,226,230)));
         QSettings().setValue(QStringLiteral("Preview/settingsCollapsed"),!expanded);
     });
+    if(!settingsExpanded)QTimer::singleShot(0,this,[applySettingsCap]{applySettingsCap(false);});
     auto* box=new QVBoxLayout(m_controls);box->setContentsMargins(6,8,6,6);box->setSpacing(0);
     auto* tabs=new QTabWidget(m_controls);tabs->setObjectName(QStringLiteral("PreviewSettingsTabs"));
     // The tab pages outgrew the fixed panel height; scrolling beats letting
@@ -3408,7 +3869,8 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     addRenderMode(tr("UV Checker"),PbrPreviewGL::DebugView::UvChecker);addRenderMode(tr("Wireframe"),PbrPreviewGL::DebugView::Wireframe);addRenderMode(tr("Tangent Basis"),PbrPreviewGL::DebugView::TangentBasis);
     m_antiAliasing=new QComboBox(display);m_antiAliasing->addItem(tr("Off"),1);m_antiAliasing->addItem(tr("MSAA 2x"),2);m_antiAliasing->addItem(tr("MSAA 4x"),4);m_antiAliasing->addItem(tr("MSAA 8x"),8);m_antiAliasing->setCurrentIndex(2);m_antiAliasing->setToolTip(tr("Multisampled viewport rendering. Editor preference only; never stored in the material."));
     m_ground=new QCheckBox(tr("Show ground plane"),display);m_ground->setChecked(true);m_compare=new QCheckBox(tr("Compare with defaults (split view)"),display);m_compare->setToolTip(tr("Split the object between the current material and its default values."));
-    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_compare);
+    m_grid=new QCheckBox(tr("Ground grid with axis directions"),display);m_grid->setChecked(true);m_grid->setToolTip(tr("NifSkope-style grid on the ground: X axis red, Z axis blue, direction labels at the ends."));
+    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
     auto* referenceRow=new QWidget(display);auto* referenceLayout=new QHBoxLayout(referenceRow);referenceLayout->setContentsMargins(0,0,0,0);referenceLayout->setSpacing(5);
     auto* referenceLoad=new QPushButton(tr("Load…"),referenceRow);referenceLoad->setToolTip(tr("Show a second read-only material beside this one with a synchronized camera. Lighting and environment are snapshotted when the reference loads."));
     auto* referenceClear=new QPushButton(tr("Clear"),referenceRow);referenceClear->setEnabled(false);
@@ -3524,6 +3986,14 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     connect(m_background,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int i){m_materialCanvas->setBackground(static_cast<PbrPreviewGL::Background>(i));savePreviewSettings();});
     connect(m_debug,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int i){m_materialCanvas->setDebugView(static_cast<PbrPreviewGL::DebugView>(m_debug->itemData(i).toInt()));savePreviewSettings();});
     connect(m_ground,&QCheckBox::toggled,this,[this](bool v){m_materialCanvas->setGroundEnabled(v);savePreviewSettings();});connect(m_compare,&QCheckBox::toggled,this,[this](bool v){m_materialCanvas->setComparisonEnabled(v);savePreviewSettings();});
+    connect(m_grid,&QCheckBox::toggled,this,[this](bool v){m_materialCanvas->setGridEnabled(v);m_referenceCanvas->setGridEnabled(v);savePreviewSettings();});
+    // Axis-view snaps (numpad or gizmo) force orthographic; keep the combo honest.
+    connect(m_materialCanvas,&PbrPreviewGL::projectionChanged,this,[this]{
+        QSignalBlocker blocker(m_projection);
+        m_projection->setCurrentIndex(m_materialCanvas->projection()==PbrPreviewGL::Projection::Perspective?0:1);
+        m_referenceCanvas->setProjection(m_materialCanvas->projection());
+        savePreviewSettings();
+    });
 }
 
 void MaterialPreviewWidget::refreshMeshControls()
@@ -3707,12 +4177,12 @@ void MaterialPreviewWidget::loadPreviewSettings()
     if (s.value(QStringLiteral("Preview/settingsVersion"), 0).toInt() != 1) {
         s.beginGroup(QStringLiteral("Preview")); s.remove(QString()); s.endGroup();
     }
-    QSignalBlocker a(m_shape),b(m_projection),c(m_background),d(m_debug),e(m_ground),f(m_compare),h(m_planeOrientation),i(m_twoSided),j(m_allSubmeshes),k(m_uvSet),landscapeBlocker(m_landscapeLayer),aaBlocker(m_antiAliasing);
+    QSignalBlocker a(m_shape),b(m_projection),c(m_background),d(m_debug),e(m_ground),f(m_compare),gridBlocker(m_grid),h(m_planeOrientation),i(m_twoSided),j(m_allSubmeshes),k(m_uvSet),landscapeBlocker(m_landscapeLayer),aaBlocker(m_antiAliasing);
     QSignalBlocker l(m_keyIntensity),m(m_keyYaw),n(m_keyPitch),o(m_environmentIntensity),p(m_environmentYaw),q(m_exposure),r(m_temperature),shadowBlocker(m_shadows),shadowIntensityBlocker(m_shadowIntensity),deriveBlocker(m_deriveExrLighting),presetBlocker(m_lightingPreset);
     m_shape->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/shape"),0).toInt(),0,3));
     m_planeOrientation->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/planeOrientation"),0).toInt(),0,2));m_twoSided->setChecked(s.value(QStringLiteral("Preview/twoSided"),true).toBool());
     m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(QStringLiteral("Preview/debug"),0).toInt(),0,18));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
-    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
+    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
     const int aaIndex=m_antiAliasing->findData(s.value(QStringLiteral("Preview/antiAliasing"),4).toInt());m_antiAliasing->setCurrentIndex(aaIndex>=0?aaIndex:2);m_materialCanvas->setMsaaSamples(m_antiAliasing->currentData().toInt());
     {
         const auto restoreField=[&s](DragNumericEdit* field,const QString& key){QSignalBlocker blocker(field);field->setValue(s.value(key,0.0).toDouble());};
@@ -3736,7 +4206,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
 void MaterialPreviewWidget::savePreviewSettings() const
 {
     const bool preserveManual=m_manualLightStored&&m_deriveExrLighting->isChecked();
-    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
+    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
 }
 
 void MaterialPreviewWidget::reloadPreviewCubemaps()

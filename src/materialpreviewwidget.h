@@ -30,6 +30,7 @@ class QSlider;
 class QStackedWidget;
 class QTabWidget;
 class QToolButton;
+class QSplitter;
 class QTimer;
 class QVBoxLayout;
 class QOpenGLShaderProgram;
@@ -99,6 +100,7 @@ public:
     void setSubmesh(int index, bool applyAll);
     void setCompanionMaterials(const QVector<QPair<QString, QString>>& assignments);
     void setProjection(Projection projection);
+    Projection projection() const { return m_projection; }
     void setAxisView(AxisView view);
     void frameObject();
     void resetView();
@@ -107,6 +109,10 @@ public:
     void setBackground(Background background);
     void setDebugView(DebugView view);
     void setGroundEnabled(bool enabled);
+    void setGridEnabled(bool enabled);
+    void setFreeCamera(bool enabled);
+    void cancelFreeCamera();
+    bool freeCamera() const { return m_freeCamera; }
     void setShadows(bool enabled, float intensity);
     void setDerivedEnvironmentShadow(bool enabled, float directionalWeight);
     float effectiveKeyIntensity() const { return m_derivedEnvironmentShadow ? 0.0f : m_keyIntensity; }
@@ -117,6 +123,7 @@ public:
 
 signals:
     void cameraChanged();
+    void projectionChanged();
     void lightAnglesChanged(float yawDegrees, float pitchDegrees);
     void shaderErrorsChanged(const QString& log);
 
@@ -129,6 +136,9 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
+    void keyReleaseEvent(QKeyEvent* event) override;
+    void focusOutEvent(QFocusEvent* event) override;
+    void leaveEvent(QEvent* event) override;
 
 private:
     // Companion material: another .pbrm rendered on assigned submeshes through
@@ -169,6 +179,18 @@ private:
     QMatrix4x4 projectionMatrix() const;
     QVector3D keyDirection() const;
     void applyCommonUniforms(QOpenGLShaderProgram& program);
+    QVector3D cameraEye() const;
+
+    // Viewport aids ported from the ClaudeNifskope build: ground grid with
+    // axis directions, top-right navigation gizmo, Shift+F free camera.
+    void buildGridGeometry();
+    void drawGrid();
+    void drawViewportOverlays();
+    void navGizmoLayout(QPointF& center, float& radius, float& ballRadius) const;
+    void navGizmoBalls(QPointF positions[6], float depths[6]) const;
+    int navGizmoHitTest(const QPointF& position) const;
+    void drawNavGizmo(QPainter& painter);
+    void freeCameraTick();
 
     std::unique_ptr<QOpenGLShaderProgram> m_program;
     std::unique_ptr<QOpenGLShaderProgram> m_backgroundProgram;
@@ -177,6 +199,10 @@ private:
     std::unique_ptr<QOpenGLShaderProgram> m_shadowProgram;
     std::unique_ptr<QOpenGLVertexArrayObject> m_vao;
     std::unique_ptr<QOpenGLVertexArrayObject> m_groundVao;
+    std::unique_ptr<QOpenGLShaderProgram> m_lineProgram;
+    std::unique_ptr<QOpenGLVertexArrayObject> m_gridVao;
+    QOpenGLBuffer m_gridBuffer{QOpenGLBuffer::VertexBuffer};
+    int m_gridVertexCount = 0;
     QOpenGLBuffer m_vertexBuffer{QOpenGLBuffer::VertexBuffer};
     QOpenGLBuffer m_indexBuffer{QOpenGLBuffer::IndexBuffer};
     QOpenGLBuffer m_groundVertexBuffer{QOpenGLBuffer::VertexBuffer};
@@ -197,6 +223,7 @@ private:
     std::unique_ptr<QOpenGLTexture> m_specialTextureArray;
     std::unique_ptr<QOpenGLFramebufferObject> m_msaaFbo;
     int m_msaaSamples = 4;
+    int m_msaaRequested = 0; // guard against per-frame recreation when the driver clamps samples
     std::unique_ptr<QOpenGLTexture> m_interiorTexture;
     QVector<QImage> m_interiorFaces;
     bool m_interiorEnabled = false;
@@ -309,6 +336,21 @@ private:
     Background m_background = Background::Cubemap;
     DebugView m_debugView = DebugView::Shaded;
     bool m_groundEnabled = true, m_shadowsEnabled = true, m_comparisonEnabled = false;
+    bool m_gridEnabled = true;
+    // Navigation gizmo interaction state.
+    int m_navHover = -1;      // 0..5 axis balls, 6 orbit ring, -1 none
+    bool m_navDrag = false;
+    // Shift+F free camera (WASD fly, mouse look; LMB confirms, RMB returns
+    // to the pose the flight started from).
+    bool m_freeCamera = false;
+    QVector3D m_freeEye;
+    float m_freeCamSpeed = 1.0f;
+    quint32 m_freeKeys = 0;  // bit 0..5 = W A S D Q E, bit 6 = Shift
+    QTimer* m_freeTimer = nullptr;
+    QElapsedTimer m_freeClock;
+    bool m_recentering = false;
+    float m_freeEntryYaw = 0, m_freeEntryPitch = 0, m_freeEntryDistance = 3.2f;
+    QVector2D m_freeEntryPan;
     float m_shadowIntensity = .75f;
     bool m_derivedEnvironmentShadow = false;
     float m_derivedEnvironmentShadowWeight = 0;
@@ -407,6 +449,8 @@ private:
     QWidget* m_buttonHost = nullptr;
     QHBoxLayout* m_buttons = nullptr;
     QToolButton* m_settingsToggle = nullptr;
+    QSplitter* m_previewSplitter = nullptr; // viewport above, settings below — user-draggable height
+    QWidget* m_settingsBottom = nullptr;
     QGroupBox* m_controls = nullptr;
     QComboBox* m_shape = nullptr;
     QLabel* m_planeOptionsLabel = nullptr;
@@ -450,6 +494,7 @@ private:
     QComboBox* m_antiAliasing = nullptr;
     QComboBox* m_debug = nullptr;
     QCheckBox* m_ground = nullptr;
+    QCheckBox* m_grid = nullptr;
     QCheckBox* m_compare = nullptr;
     QLabel* m_importStatus = nullptr;
     // Dynamic surface-state simulation controls (States tab): one slider per
