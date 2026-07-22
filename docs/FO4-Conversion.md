@@ -61,14 +61,28 @@ mask, and spec strength). PBR metal base color *is* the reflectance color,
 so recovered texels take **hue from the diffuse, brightness from spec**:
 
 ```
-m          = metallic confidence (below)
-metalAlbedo = normalize(diffuseHue) * lerp(F0min, F0max, specR)
+m           = metallic confidence (below)
+cubemapTint = mean color of the material's referenced _e cubemap
+reliability = saturate(diffuseLuma / threshold)
+hueSource   = mix(cubemapTint, diffuseHue, reliability)
+metalAlbedo = normalize(hueSource) * lerp(F0min, F0max, specR)
 baseColor   = mix(diffuse, metalAlbedo, m * recoveryStrength)
 ```
 
-`recoveryStrength`, `F0min`, `F0max` are conversion options (defaults tuned
-on the X01 set). Recovery runs in linear space; output BC7 sRGB (BC1 when
-alpha is unused and composition is opaque).
+The cubemap term exists because some vanilla metals are authored **fully
+black** — the chosen cubemap *is* their entire appearance (gold trim =
+black diffuse + warm cubemap), so the cubemap choice is the color
+authoring. The mean is computed from the actual referenced cubemap
+(luminance-weighted, mid mip, cached per cubemap, loaded through the
+existing cubemap-face loader) with a **saturation clamp** so scene-neutral
+cubemaps (`DefaultOutside1`'s sky blue) cannot tint metals — deliberately
+tinted cubemaps pass through. The review panel shows the derived metal
+color as an overridable swatch per material.
+
+`recoveryStrength`, `F0min`, `F0max`, the reliability threshold, and the
+tint saturation clamp are conversion options (defaults tuned on the X01
+set). Recovery runs in linear space; output BC7 sRGB (BC1 when alpha is
+unused and composition is opaque).
 
 ### Normal + derived physics ← `_n`
 
@@ -227,9 +241,10 @@ field that could not be honored — nothing drops silently:
 4. **Flagged for review** — grayscale-to-palette, external emittance, and
    anything unrepresentable.
 
-Also explicitly superseded: per-material custom cubemaps (`_e`) — the PBR
-runtime owns environment lighting; they inform nothing and convert to
-nothing, deliberately.
+Per-material custom cubemaps (`_e`) are an **inference input**: their mean
+color feeds metal albedo recovery (black-diffuse metals are colored
+entirely by their chosen cubemap). As textures they still convert to
+nothing — the PBR runtime owns environment lighting.
 
 **Root material chains**: `sRootMaterialPath` template inheritance is
 resolved before any conversion math (child overrides over the resolved
