@@ -1290,6 +1290,9 @@ void PbrPreviewGL::initializeGL()
 {
     initializeOpenGLFunctions();
     glEnable(GL_DEPTH_TEST); glEnable(GL_MULTISAMPLE); glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+    // GL_DITHER defaults ON; some drivers order-dither 8-bit targets, which
+    // reads as a faint 4x4 dot lattice ("seams") on smooth surfaces.
+    glDisable(GL_DITHER);
     m_vao = std::make_unique<QOpenGLVertexArrayObject>(); m_vao->create();
     m_groundVao = std::make_unique<QOpenGLVertexArrayObject>(); m_groundVao->create();
     m_vertexBuffer.create(); m_indexBuffer.create(); m_groundVertexBuffer.create(); m_groundIndexBuffer.create();
@@ -1735,11 +1738,22 @@ void PbrPreviewGL::initializeGL()
         }
         float shadowVisibility(vec3 worldPosition,vec3 normal){
             if(!uShadowsEnabled||uShadowIntensity<=0.0)return 1.0;
-            vec4 lightPosition=uShadowMatrix*vec4(worldPosition,1.0);
+            // Normal-offset shadows: push the sample a couple of shadow texels
+            // along the surface normal before projecting. This clears the
+            // self-shadow acne (the faint texel-grid lattice on lit faces,
+            // worst at grazing angles) without the Peter-panning a large flat
+            // depth bias would cause. The offset grows as the surface turns
+            // away from the light, exactly where acne is strongest.
+            vec3 n=normalize(normal);
+            float NoL=max(dot(n,normalize(uKeyDirection)),0.0);
+            float slope=clamp(1.0-NoL,0.0,1.0);
+            float texelWorld=4.8/float(textureSize(uShadowMap,0).x); // ortho frustum is 4.8 world wide
+            vec3 offsetPosition=worldPosition+n*texelWorld*(1.5+2.5*slope);
+            vec4 lightPosition=uShadowMatrix*vec4(offsetPosition,1.0);
             vec3 coordinate=lightPosition.xyz/lightPosition.w*.5+.5;
             if(any(lessThan(coordinate,vec3(0.0)))||any(greaterThan(coordinate,vec3(1.0))))return 1.0;
             vec2 texel=1.0/vec2(textureSize(uShadowMap,0));
-            float bias=max(.00035*(1.0-max(dot(normalize(normal),normalize(uKeyDirection)),0.0)),.00008);
+            float bias=mix(.0006,.0025,slope);
             float occlusion=0.0;
             for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x)
                 occlusion+=coordinate.z-bias>texture(uShadowMap,coordinate.xy+vec2(x,y)*texel).r?1.0:0.0;
