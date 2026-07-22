@@ -316,12 +316,18 @@ JobResult convertMaterial(const QString& materialPath, const JobOptions& options
         + material.specularTexture.toLower() + QLatin1Char('+') + material.lightingTexture.toLower()
         + QLatin1Char('+') + material.envmapTexture.toLower() + optionsSignature;
 
+    const auto recordTexture = [&result](const QString& portable) {
+        if (!portable.isEmpty() && !result.writtenTextures.contains(portable))
+            result.writtenTextures.append(portable);
+    };
     const QString basePortable = writeConverted(converted.baseColor, pairSignature, portableDirectory, baseName,
         QStringLiteral("_BC.dds"), TextureWriter::DdsFormat::Bc7Srgb, QImage(), options, cache,
         cache->baseColorBySignature, &result.notes, &result.errors);
+    recordTexture(basePortable);
     const QString rmaosPortable = writeConverted(rmaos, pairSignature + QStringLiteral("#rmaos"), portableDirectory,
         baseName, QStringLiteral("_RMAOS.dds"), TextureWriter::DdsFormat::Bc7, normal, options, cache,
         cache->rmaosBySignature, &result.notes, &result.errors);
+    recordTexture(rmaosPortable);
     QString normalPortable;
     if (!packedNormal.isNull()) {
         const QString normalSignature = material.normalTexture.toLower() + QStringLiteral("#n")
@@ -329,16 +335,19 @@ JobResult convertMaterial(const QString& materialPath, const JobOptions& options
         normalPortable = writeConverted(packedNormal, normalSignature, portableDirectory, baseName,
             QStringLiteral("_N.dds"), TextureWriter::DdsFormat::Bc7, QImage(), options, cache,
             cache->normalBySignature, &result.notes, &result.errors);
+        recordTexture(normalPortable);
     }
     QString emissivePortable;
-    if (!converted.emissive.isNull())
+    if (!converted.emissive.isNull()) {
         emissivePortable = writeConverted(converted.emissive, pairSignature + QStringLiteral("#e"), portableDirectory,
             baseName, QStringLiteral("_E.dds"), TextureWriter::DdsFormat::Bc7Srgb, QImage(), options, cache,
             cache->emissiveBySignature, &result.notes, &result.errors);
+        recordTexture(emissivePortable);
+    }
     if (options.writeMetallicDiagnostic && !converted.metallic.isNull())
-        writeConverted(converted.metallic, pairSignature + QStringLiteral("#m"), portableDirectory, baseName,
+        recordTexture(writeConverted(converted.metallic, pairSignature + QStringLiteral("#m"), portableDirectory, baseName,
             QStringLiteral("_MetalMask.dds"), TextureWriter::DdsFormat::Bc4, QImage(), options, cache,
-            cache->emissiveBySignature, &result.notes, &result.errors);
+            cache->emissiveBySignature, &result.notes, &result.errors));
 
     // ---- The sibling .pbrm ----
     Pbr::MaterialDocument document;

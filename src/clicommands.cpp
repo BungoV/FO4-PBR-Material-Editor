@@ -7,13 +7,16 @@
 #include "texturewriter.h"
 
 #include <QDataStream>
+#include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSet>
 #include <QSettings>
 #include <QTextStream>
 
@@ -516,12 +519,58 @@ int runConvert(const QStringList& args)
     const Options options = parseOptions(args, {QStringLiteral("--out"), QStringLiteral("--texture-root"),
         QStringLiteral("--recovery"), QStringLiteral("--gloss-curve"), QStringLiteral("--derivation-size")});
     const QString outputRoot = options.value(QStringLiteral("--out"));
-    if (outputRoot.isEmpty() || options.paths.isEmpty()) {
+    const QString manifestName = QStringLiteral("/pbrm-conversion-manifest.json");
+    if (outputRoot.isEmpty() || (options.paths.isEmpty() && !options.has(QStringLiteral("--clean")))) {
         out() << "usage: pbrm convert --out <mod folder> [--texture-root <dir>] [--dry-run] [--json]\n"
-                 "                    [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]\n"
+                 "                    [--force] [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]\n"
                  "                    [--recovery <0-1>] [--gloss-curve <v>] [--derivation-size <px>]\n"
-                 "                    <materials or folders...>\n" << Qt::flush;
+                 "                    <materials or folders...>\n"
+                 "       pbrm convert --out <mod folder> --clean   # remove exactly the recorded output\n" << Qt::flush;
         return 2;
+    }
+
+    // --clean: roll back exactly what the manifest records — nothing else.
+    if (options.has(QStringLiteral("--clean"))) {
+        const QString cleanRoot = QDir::cleanPath(QDir::fromNativeSeparators(outputRoot));
+        QFile manifestFile(cleanRoot + manifestName);
+        if (!manifestFile.open(QIODevice::ReadOnly)) {
+            out() << cleanRoot << ": error: no conversion manifest to clean against\n" << Qt::flush;
+            return 1;
+        }
+        const QJsonObject manifest = QJsonDocument::fromJson(manifestFile.readAll()).object();
+        manifestFile.close();
+        int removed = 0, missing = 0;
+        QSet<QString> pruneDirs;
+        const auto removeOutput = [&](const QString& absolute) {
+            const QString cleaned = QDir::cleanPath(absolute);
+            if (!cleaned.startsWith(cleanRoot + QLatin1Char('/'), Qt::CaseInsensitive)) return; // never step outside
+            if (QFile::exists(cleaned)) {
+                QFile::remove(cleaned);
+                ++removed;
+            } else {
+                ++missing;
+            }
+            pruneDirs.insert(QFileInfo(cleaned).absolutePath());
+        };
+        const QJsonArray entries = manifest.value(QStringLiteral("entries")).toArray();
+        for (const QJsonValue& value : entries) {
+            const QJsonObject entry = value.toObject();
+            removeOutput(entry.value(QStringLiteral("pbrm")).toString());
+            const QJsonArray textures = entry.value(QStringLiteral("textures")).toArray();
+            for (const QJsonValue& texture : textures)
+                removeOutput(cleanRoot + QStringLiteral("/Textures/") + texture.toString());
+        }
+        QFile::remove(cleanRoot + manifestName);
+        // Prune now-empty directories upward (rmdir refuses non-empty ones).
+        for (const QString& start : pruneDirs) {
+            QDir dir(start);
+            while (dir.absolutePath().startsWith(cleanRoot + QLatin1Char('/'), Qt::CaseInsensitive)
+                && dir.rmdir(dir.absolutePath())) {
+                if (!dir.cdUp()) break;
+            }
+        }
+        out() << removed << " file(s) removed, " << missing << " already gone; manifest cleared\n" << Qt::flush;
+        return 0;
     }
     Converter::JobOptions job;
     job.outputRoot = QDir::fromNativeSeparators(outputRoot);
@@ -555,11 +604,40 @@ int runConvert(const QStringList& args)
         return 1;
     }
 
+    // Incremental re-runs: an entry is up-to-date when the source is
+    // unchanged, the same options produced it, and its sibling still exists.
+    const QString jobSignature = QStringLiteral("v1|%1|%2|%3|%4|%5|%6|%7")
+        .arg(job.math.recoveryStrength).arg(job.math.glossCurve).arg(job.derive.derivationSize)
+        .arg(job.heightInBlue).arg(job.detailAo).arg(job.writeMetallicDiagnostic).arg(job.textureRoot.toLower());
+    QHash<QString, QJsonObject> previousEntries;
+    {
+        QFile manifestFile(job.outputRoot + manifestName);
+        if (manifestFile.open(QIODevice::ReadOnly)) {
+            const QJsonArray entries = QJsonDocument::fromJson(manifestFile.readAll()).object()
+                .value(QStringLiteral("entries")).toArray();
+            for (const QJsonValue& value : entries) {
+                const QJsonObject entry = value.toObject();
+                previousEntries.insert(QDir::cleanPath(entry.value(QStringLiteral("material")).toString()).toLower(), entry);
+            }
+        }
+    }
+    const bool force = options.has(QStringLiteral("--force"));
+
     Converter::TextureCache textureCache;
     QVector<Finding> findings;
     QJsonArray manifestEntries;
-    int converted = 0, flagged = 0, failed = 0;
+    int converted = 0, flagged = 0, failed = 0, upToDate = 0;
     for (const QString& material : materials) {
+        const QString sourceModified = QFileInfo(material).lastModified().toString(Qt::ISODateWithMs);
+        const QJsonObject previous = previousEntries.value(QDir::cleanPath(material).toLower());
+        if (!force && !job.dryRun && previous.value(QStringLiteral("converted")).toBool(false)
+            && previous.value(QStringLiteral("sourceModified")).toString() == sourceModified
+            && previous.value(QStringLiteral("optionsSignature")).toString() == jobSignature
+            && QFileInfo::exists(previous.value(QStringLiteral("pbrm")).toString())) {
+            ++upToDate;
+            manifestEntries.append(previous);
+            continue;
+        }
         const Converter::JobResult jobResult = Converter::convertMaterial(material, job, &textureCache);
         for (const QString& note : jobResult.notes) findings.append({material, false, note});
         for (const QString& jobError : jobResult.errors) findings.append({material, true, jobError});
@@ -578,21 +656,27 @@ int runConvert(const QStringList& args)
             {QStringLiteral("converted"), jobResult.converted},
             {QStringLiteral("flagged"), jobResult.flagged},
             {QStringLiteral("metalCoverage"), double(jobResult.metalCoverage)},
+            {QStringLiteral("sourceModified"), sourceModified},
+            {QStringLiteral("optionsSignature"), jobSignature},
+            {QStringLiteral("textures"), QJsonArray::fromStringList(jobResult.writtenTextures)},
             {QStringLiteral("notes"), QJsonArray::fromStringList(jobResult.notes)},
             {QStringLiteral("errors"), QJsonArray::fromStringList(jobResult.errors)}});
     }
     if (!job.dryRun) {
         QDir().mkpath(job.outputRoot);
-        QFile manifest(job.outputRoot + QStringLiteral("/pbrm-conversion-manifest.json"));
+        QFile manifest(job.outputRoot + manifestName);
         if (manifest.open(QIODevice::WriteOnly | QIODevice::Truncate))
             manifest.write(QJsonDocument(QJsonObject{
                 {QStringLiteral("schema"), QStringLiteral("FO4.PBRM.ConversionManifest")},
                 {QStringLiteral("schemaVersion"), 1},
                 {QStringLiteral("entries"), manifestEntries}}).toJson(QJsonDocument::Indented));
     }
-    if (!options.has(QStringLiteral("--json")))
+    if (!options.has(QStringLiteral("--json"))) {
         out() << converted << (job.dryRun ? " material(s) would convert, " : " material(s) converted, ")
-              << flagged << " flagged for review, " << failed << " failed\n";
+              << flagged << " flagged for review, " << failed << " failed";
+        if (upToDate) out() << ", " << upToDate << " up-to-date (skipped)";
+        out() << "\n";
+    }
     const int findingsCode = reportFindings(findings, materials.size(), options.has(QStringLiteral("--json")), QStringLiteral("convert"));
     return failed > 0 ? 1 : findingsCode;
 }
@@ -675,6 +759,7 @@ QString helpText()
         "  pack                composite a slot's channel sources into a game-ready DDS\n"
         "  inspect             texture diagnostics + per-channel statistics\n"
         "  convert             convert FO4/FO76 .bgsm/.bgem materials + textures to PBR\n"
+        "                      (incremental via the manifest; --force re-runs, --clean rolls back)\n"
         "  material-info       dump parsed .bgsm/.bgem fields (textures, scalars, flags)\n"
         "\n"
         "common options: --json (machine-readable reports), --dry-run (report only),\n"

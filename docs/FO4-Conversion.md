@@ -395,10 +395,16 @@ subcommand grammar `pbrm <verb> [options]`:
 
 `pbrm convert --out <mod folder>` writes `Materials/` + `Textures/` mirrors,
 the sibling `.pbrm` set, and `pbrm-conversion-manifest.json` (one entry per
-material: outputs, flags, notes, errors, metal coverage). Options:
-`--texture-root`, `--dry-run`, `--json`, `--height-in-blue`,
-`--no-detail-ao`, `--metal-diagnostic`, `--recovery`, `--gloss-curve`,
-`--derivation-size`. Live-verified 2026-07-23 on FO76 (alien dielectric 0%,
+material: outputs incl. written texture list, flags, notes, errors, metal
+coverage, source mtime, options signature). Options: `--texture-root`,
+`--dry-run`, `--json`, `--force`, `--height-in-blue`, `--no-detail-ao`,
+`--metal-diagnostic`, `--recovery`, `--gloss-curve`, `--derivation-size`.
+**Incremental + rollback shipped**: unchanged (source mtime + options
+signature + sibling exists) materials skip on re-run; `--force` overrides;
+`pbrm convert --out X --clean` removes exactly the recorded outputs (path
+containment enforced, foreign files untouched, empty dirs pruned).
+Texture-free constant-color BGEMs convert to constants-only siblings
+(overrideColor/opacity), not failures. Live-verified 2026-07-23 on FO76 (alien dielectric 0%,
 gold Protectron 90% metal reconstructed warm from black diffuse), FO4 BGSM
 v1/v2 (X-02 metal trim + auto-denoise engagement + dangling-reference
 warnings surfaced honestly), and FO4 BGEM (Unlit Effect emission via

@@ -213,9 +213,10 @@ pbrm pack --material <m.pbrm> --slot <key> --out <f.dds>
           [--no-mips] [--toksvig <normal>] [--texture-root <dir>]
 pbrm inspect [--texture-root <dir>] <textures> # diagnostics + channel statistics
 pbrm convert --out <mod folder> [--texture-root <dir>] [--dry-run] [--json]
-             [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]
+             [--force] [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]
              [--recovery <0-1>] [--gloss-curve <v>] [--derivation-size <px>]
              <.bgsm/.bgem files or folders>   # FO4/FO76 -> PBR conversion
+pbrm convert --out <mod folder> --clean       # roll back exactly the recorded output
 pbrm material-info <.bgsm/.bgem files>        # parsed material field dump
 ```
 
@@ -223,6 +224,10 @@ pbrm material-info <.bgsm/.bgem files>        # parsed material field dump
 `.pbrm` files (sources untouched), and `pbrm-conversion-manifest.json`;
 identical source pairings dedup to one converted texture set, and
 divergent pairings get a hash suffix instead of a silent overwrite.
+Re-runs are incremental: materials whose source, options, and sibling are
+unchanged since the recorded run are skipped (`--force` re-runs them);
+`--clean` removes exactly the files the manifest records — foreign files
+in the output folder are never touched.
 
 Reporting verbs accept `--json`; exit codes are 0 (clean), 1 (findings or
 failures), 2 (usage). `--texture-root` overrides the editor's configured

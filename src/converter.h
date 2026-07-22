@@ -43,6 +43,7 @@ struct JobResult {
     bool converted = false;
     bool flagged = false;      // wants manual review in the workspace
     float metalCoverage = 0.0f;
+    QStringList writtenTextures; // portable paths under <out>/Textures (dedup-shared entries included)
     QStringList notes;
     QStringList errors;
 };
