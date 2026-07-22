@@ -53,6 +53,33 @@ int runHeadlessValidation(const QStringList& targets)
             ++errorCount;
             continue;
         }
+        // v5: legacy per-material surface state data blocks export in the GUI
+        // validation; surface the same errors here so scripted pipelines and
+        // batch checks see them too.
+        bool legacyGroups = false;
+        for (const QString& legacyName : {QStringLiteral("Wetness"), QStringLiteral("Dust"), QStringLiteral("Frost"), QStringLiteral("Heat"), QStringLiteral("Blood")})
+            legacyGroups = legacyGroups || !document.settingGroup(QStringLiteral("SurfaceStates/") + legacyName).isEmpty();
+        for (int slot = 0; slot < Pbr::MaxSurfaceStates; ++slot)
+            legacyGroups = legacyGroups || !document.settingGroup(QStringLiteral("SurfaceStates/State%1").arg(slot)).isEmpty();
+        if (legacyGroups) {
+            out << file << ": error: legacy per-material surface state groups; extract to a definitions JSON and strip them via Batch Operations\n";
+            ++errorCount;
+        }
+        for (const QString& setName : {QStringLiteral("UV0"), QStringLiteral("UV1"), QStringLiteral("UV2")}) {
+            const QJsonObject set = document.textureSet(setName);
+            for (auto it = set.constBegin(); it != set.constEnd(); ++it) {
+                if (it.key().endsWith(QStringLiteral("SurfaceStateResponse"))) {
+                    out << file << ": error: " << setName << ": retired Surface State Response input; repack R into RMAOS alpha and B into Normal alpha, then strip legacy surface data\n";
+                    ++errorCount;
+                }
+                const QJsonObject slotValues = it.value().toObject().value(QStringLiteral("values")).toObject();
+                if (it.key().endsWith(QStringLiteral("Normal")) && slotValues.value(QStringLiteral("layerMaskInAlpha")).toBool(false)) {
+                    out << file << ": warning: " << setName << '/' << it.key()
+                        << ": retired layer-modulation-in-alpha flag; repack the mask to a Layer Coverage texture or use Height Blend coverage\n";
+                    ++warningCount;
+                }
+            }
+        }
         const auto checkSet = [&](const QString& setName, const QJsonObject& set) {
             for (auto it = set.constBegin(); it != set.constEnd(); ++it) {
                 const auto state = Pbr::TextureSlotState::fromJson(it.value().toObject());

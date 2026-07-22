@@ -618,8 +618,19 @@ int main(int argc, char* argv[])
         QFile v5In(v5File);
         check(v5In.open(QIODevice::ReadOnly), QStringLiteral("migrated v5 file reopens"));
         const QJsonObject v5Root = QJsonDocument::fromJson(payloadFromEnvelope(v5In.readAll())).object();
+        v5In.close();
         check(v5Root.value(QStringLiteral("schemaVersion")).toInt() == 5,
             QStringLiteral("migrated documents serialize as schema version 5"));
+        // Idempotency: reloading and re-saving the migrated document must be
+        // byte-identical — the migration never re-fires on its own output.
+        Pbr::MaterialDocument reloadedV5;
+        check(reloadedV5.load(v5File, &error), QStringLiteral("migrated v5 reloads: %1").arg(error));
+        const QString v5FileAgain = directory.filePath(QStringLiteral("migrated-v5-again.pbrm"));
+        check(reloadedV5.save(v5FileAgain, &error), QStringLiteral("reloaded v5 re-saves: %1").arg(error));
+        QFile firstSave(v5File), secondSave(v5FileAgain);
+        check(firstSave.open(QIODevice::ReadOnly) && secondSave.open(QIODevice::ReadOnly)
+            && firstSave.readAll() == secondSave.readAll(),
+            QStringLiteral("v4->v5 migration is idempotent: the second save is byte-identical"));
     }
 
     {
