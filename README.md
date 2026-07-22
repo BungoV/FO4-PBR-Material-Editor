@@ -12,7 +12,8 @@ scratch for this project and do not depend on Bethesda's Material Editor.
 
 ## Current scope
 
-- Creates, opens, edits, and atomically saves `.pbrm` version 4 materials.
+- Creates, opens, edits, and atomically saves `.pbrm` version 5 materials
+  (version 4 files load through an in-memory migration).
 - Eleven focused shader families plus the `Advanced` validation/authoring superset.
 - Primary plus optional Secondary and Tertiary UV texture sets, including
   explicit overlay-to-UV0 layout mirroring and independently authored
@@ -37,26 +38,26 @@ scratch for this project and do not depend on Bethesda's Material Editor.
   overlays settle into recesses; the preview BRDF applies Kulla-Conty
   multi-scatter energy compensation and optional screen-space specular
   anti-aliasing.
-- A generic Surface State system: up to eight authorable state slots, each
-  with a runtime binding name, behavior tags (liquid, particulate, frozen,
-  thermal, viscous) that drive the interaction physics (liquids wash
-  particulates, thermal dries liquids and melts frost into liquid), and a
-  generic response profile — albedo blend, roughness/F0 response, sparkle,
-  blackbody glow, up-facing directionality, vertical streaking, animated rain
-  ripples plus droplets dripping down vertical surfaces with wet trails,
-  per-state gain/dry rate multipliers (honored by the weather simulation, so
-  cloth soaks fast and stays damp long after the storm), porosity retention
-  (porous areas collect first and dry last), map-guided accumulation from
-  channels every material already carries (AO crevice collection, height-map
-  puddling, roughness grip, metallic absorption sealing, emissive-hot
-  drying), vertex-color sheltering, and an optional dedicated placement mask
-  channel. One shared packed response map (porosity, adhesion, cavity,
-  variation) serves every state, with a procedural AO+noise fallback when
-  none is authored. Wetness/Dust/Frost/Heat/Blood ship as factory presets,
-  legacy materials resolve transparently, and the preview's States tab
-  simulates amounts per state with a looping weather timeline (rain storm,
-  dust storm, blizzard, heat wave); landscape materials additionally offer
-  stochastic hex-tile anti-tiling.
+- Runtime-owned Surface States (PBRM v5): state behavior — behavior tags and
+  interaction physics (liquids wash particulates, thermal dries liquids and
+  melts frost into liquid), albedo/roughness/F0 responses, sparkle, blackbody
+  glow, directionality, streaking, animated rain ripples and drips, gain/dry
+  rates, retention, and map-guidance weights — lives in a
+  `FO4.PBRM.SurfaceStateDefinitions` JSON defined once globally, never per
+  material. The material contributes physical inputs only: porosity in RMAOS
+  alpha (or a constant, or the `saturate(roughness × (1 − metallic))`
+  heuristic), signed curvature in Normal alpha (edge shedding, cavity
+  collection, cavity specular occlusion on direct light, subsurface scatter
+  broadening), plus AO/height/roughness/metallic/emissive read directly, and
+  the small Surface Response bindings (adhesion constant, shelter vertex
+  channel, StateMasks name bindings for hero placement). Wetness / Dust /
+  Frost / Heat / Blood ship as built-in defaults; Settings can export the
+  starter definitions JSON or preview a modded set; the preview's States tab
+  simulates amounts with a looping weather timeline (rain storm, dust storm,
+  blizzard, heat wave). Legacy v4 materials migrate on load, with batch
+  operations to extract authored states to a definitions JSON and strip the
+  retired data; landscape materials additionally offer stochastic hex-tile
+  anti-tiling.
 - Multi-material asset preview: imported multi-submesh models can assign a
   saved .pbrm to each submesh (Scene tab → Materials…). Assigned submeshes
   render their material through the standard PBR path while the edited
@@ -82,9 +83,11 @@ scratch for this project and do not depend on Bethesda's Material Editor.
   blackbody self-illumination ramp, flipbooks accept an optional motion-vector
   map that advects frame cross-fades, a tiling detail normal covers close-range
   micro-surface, landscape layers pack surface-state porosity into the normal
-  array's alpha, the response map's cavity channel doubles as signed curvature
-  for per-state edge shedding, and single-channel inputs get BC4 bake
-  suggestions plus validation when fed multi-channel textures.
+  array's alpha, and single-channel inputs get BC4 bake suggestions plus
+  validation when fed multi-channel textures. Packed-texture export generates
+  mean-preserving per-channel mips and can fold a paired normal map's
+  variance into the roughness chain (Toksvig) so minified speculars stop
+  aliasing.
 - A particle compositing stack for the effect families: per-layer flipbooks
   (grid, age/time/constant drivers, loop modes, frame cross-fade), polar
   coordinates, extended layer blends (Screen, Subtract, Min, Max, Overlay),
