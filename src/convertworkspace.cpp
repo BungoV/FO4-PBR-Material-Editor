@@ -17,6 +17,7 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QThread>
@@ -89,8 +90,23 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     m_queue->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_queue->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_queue->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    connect(m_queue, &QTreeWidget::currentItemChanged, this, [this] { updateDetail(); });
+    connect(m_queue, &QTreeWidget::currentItemChanged, this, [this] { loadOverrideControls(); updateDetail(); });
     sideLayout->addWidget(m_queue, 1);
+
+    // The review loop: walk exactly the materials that need eyes.
+    auto* flaggedRow = new QHBoxLayout();
+    flaggedRow->setSpacing(4);
+    m_prevFlagged = new QPushButton(tr("◀ Flagged"), side);
+    m_prevFlagged->setToolTip(tr("Select the previous flagged or failed material."));
+    connect(m_prevFlagged, &QPushButton::clicked, this, [this] { stepFlagged(-1); });
+    flaggedRow->addWidget(m_prevFlagged);
+    m_nextFlagged = new QPushButton(tr("Flagged ▶"), side);
+    m_nextFlagged->setToolTip(tr("Select the next flagged or failed material."));
+    connect(m_nextFlagged, &QPushButton::clicked, this, [this] { stepFlagged(1); });
+    flaggedRow->addWidget(m_nextFlagged);
+    m_flaggedSummary = new QLabel(side);
+    flaggedRow->addWidget(m_flaggedSummary, 1);
+    sideLayout->addLayout(flaggedRow);
 
     m_queueSummary = new QLabel(tr("Scan a source folder to build the queue."), side);
     m_queueSummary->setWordWrap(true);
@@ -146,13 +162,13 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     actionsRow->setSpacing(5);
     m_dryRunButton = new QPushButton(tr("Dry Run"), main);
     m_dryRunButton->setToolTip(tr("Run the full pipeline without writing anything; statuses and findings fill in."));
-    connect(m_dryRunButton, &QPushButton::clicked, this, [this] { startRun(true, false); });
+    connect(m_dryRunButton, &QPushButton::clicked, this, [this] { startRun(true, RunScope::All); });
     actionsRow->addWidget(m_dryRunButton);
     m_convertSelectedButton = new QPushButton(tr("Convert Selected"), main);
-    connect(m_convertSelectedButton, &QPushButton::clicked, this, [this] { startRun(false, true); });
+    connect(m_convertSelectedButton, &QPushButton::clicked, this, [this] { startRun(false, RunScope::Checked); });
     actionsRow->addWidget(m_convertSelectedButton);
     m_convertAllButton = new QPushButton(tr("Convert All"), main);
-    connect(m_convertAllButton, &QPushButton::clicked, this, [this] { startRun(false, false); });
+    connect(m_convertAllButton, &QPushButton::clicked, this, [this] { startRun(false, RunScope::All); });
     actionsRow->addWidget(m_convertAllButton);
     m_cancelButton = new QPushButton(tr("Cancel"), main);
     m_cancelButton->setEnabled(false);
@@ -171,6 +187,49 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     });
     actionsRow->addWidget(m_openInAuthor);
     mainLayout->addLayout(actionsRow);
+
+    // Per-material tuning: the manual half of the spec's review loop.
+    auto* overrideRow = new QHBoxLayout();
+    overrideRow->setSpacing(9);
+    m_overrideEnabled = new QCheckBox(tr("Override for this material"), main);
+    m_overrideEnabled->setToolTip(tr("Tune the conversion math for the selected material only; batch runs keep the global options."));
+    overrideRow->addWidget(m_overrideEnabled);
+    const auto addOverrideSpin = [&](const QString& label, double value, double min, double max, double step) {
+        overrideRow->addWidget(new QLabel(label, main));
+        auto* spin = new QDoubleSpinBox(main);
+        spin->setRange(min, max);
+        spin->setSingleStep(step);
+        spin->setDecimals(2);
+        spin->setValue(value);
+        overrideRow->addWidget(spin);
+        return spin;
+    };
+    m_overrideRecovery = addOverrideSpin(tr("Recovery"), 1.0, 0.0, 1.0, 0.05);
+    m_overrideGlossCurve = addOverrideSpin(tr("Gloss curve"), 1.0, 0.25, 4.0, 0.05);
+    m_overrideSpecPercentile = addOverrideSpin(tr("Spec clamp %"), 0.98, 0.5, 1.0, 0.01);
+    m_overrideSpecPercentile->setToolTip(tr("Percentile used to tame blown-out FO4 spec maps; lower clamps harder."));
+    m_reconvertButton = new QPushButton(tr("Reconvert This"), main);
+    m_reconvertButton->setToolTip(tr("Convert only the selected material with these overrides."));
+    connect(m_reconvertButton, &QPushButton::clicked, this, [this] { startRun(false, RunScope::CurrentRow); });
+    overrideRow->addWidget(m_reconvertButton);
+    overrideRow->addStretch();
+    mainLayout->addLayout(overrideRow);
+    const auto storeOverride = [this] {
+        QTreeWidgetItem* item = m_queue->currentItem();
+        const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
+        if (row < 0 || row >= m_entries.size()) return;
+        const QString key = m_entries[row].materialPath.toLower();
+        if (m_overrideEnabled->isChecked()) {
+            m_overrides.insert(key, {float(m_overrideRecovery->value()), float(m_overrideGlossCurve->value()),
+                float(m_overrideSpecPercentile->value())});
+        } else {
+            m_overrides.remove(key);
+        }
+    };
+    connect(m_overrideEnabled, &QCheckBox::toggled, this, storeOverride);
+    connect(m_overrideRecovery, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
+    connect(m_overrideGlossCurve, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
+    connect(m_overrideSpecPercentile, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
 
     auto* detailTitle = new QLabel(tr("Findings"), main);
     mainLayout->addWidget(detailTitle);
@@ -261,6 +320,8 @@ void ConvertWorkspace::scanSources()
         item->setCheckState(0, Qt::Unchecked);
     }
     m_queueSummary->setText(tr("%n material(s) queued.", nullptr, int(m_entries.size())));
+    updateFlaggedSummary();
+    loadOverrideControls();
     updateButtons();
 }
 
@@ -279,7 +340,7 @@ Converter::JobOptions ConvertWorkspace::collectOptions(bool dryRun) const
     return job;
 }
 
-void ConvertWorkspace::startRun(bool dryRun, bool selectedOnly)
+void ConvertWorkspace::startRun(bool dryRun, RunScope scope)
 {
     if (m_running || m_entries.isEmpty()) return;
     if (!dryRun && m_outputEdit->text().trimmed().isEmpty()) {
@@ -287,25 +348,37 @@ void ConvertWorkspace::startRun(bool dryRun, bool selectedOnly)
         return;
     }
     persistSettings();
+    const int currentRow = m_queue->currentItem() ? m_queue->indexOfTopLevelItem(m_queue->currentItem()) : -1;
     QVector<int> rows;
     for (int row = 0; row < m_entries.size(); ++row) {
-        if (selectedOnly && m_queue->topLevelItem(row)->checkState(0) != Qt::Checked) continue;
+        if (scope == RunScope::Checked && m_queue->topLevelItem(row)->checkState(0) != Qt::Checked) continue;
+        if (scope == RunScope::CurrentRow && row != currentRow) continue;
         rows.append(row);
         m_queue->topLevelItem(row)->setText(1, tr("Queued"));
         m_queue->topLevelItem(row)->setText(2, QString());
         m_entries[row].hasResult = false;
     }
     if (rows.isEmpty()) {
-        m_queueSummary->setText(tr("Check at least one material for a selected run."));
+        m_queueSummary->setText(scope == RunScope::CurrentRow
+            ? tr("Select a material to reconvert.") : tr("Check at least one material for a selected run."));
         return;
     }
 
     const Converter::JobOptions job = collectOptions(dryRun);
-    const QVector<QString> paths = [this, &rows] {
-        QVector<QString> list;
-        for (int row : rows) list.append(m_entries[row].materialPath);
-        return list;
-    }();
+    // Per-material tuning: overridden rows convert with their own math.
+    QVector<Converter::JobOptions> jobs;
+    QVector<QString> paths;
+    for (int row : rows) {
+        paths.append(m_entries[row].materialPath);
+        Converter::JobOptions rowJob = job;
+        const auto override = m_overrides.constFind(m_entries[row].materialPath.toLower());
+        if (override != m_overrides.constEnd()) {
+            rowJob.math.recoveryStrength = override->recovery;
+            rowJob.math.glossCurve = override->glossCurve;
+            rowJob.math.specNormalizePercentile = override->specPercentile;
+        }
+        jobs.append(rowJob);
+    }
 
     m_running = true;
     m_lastRunDry = dryRun;
@@ -314,7 +387,7 @@ void ConvertWorkspace::startRun(bool dryRun, bool selectedOnly)
     m_queueSummary->setText(dryRun ? tr("Dry run in progress…") : tr("Converting…"));
     updateButtons();
 
-    m_worker = QThread::create([this, job, rows, paths, dryRun] {
+    m_worker = QThread::create([this, jobs, rows, paths] {
         Converter::TextureCache cache;
         for (int index = 0; index < rows.size(); ++index) {
             if (m_cancelRequested) {
@@ -326,7 +399,7 @@ void ConvertWorkspace::startRun(bool dryRun, bool selectedOnly)
                 if (row < m_queue->topLevelItemCount())
                     m_queue->topLevelItem(row)->setText(1, tr("Converting…"));
             }, Qt::QueuedConnection);
-            const Converter::JobResult result = Converter::convertMaterial(paths[index], job, &cache);
+            const Converter::JobResult result = Converter::convertMaterial(paths[index], jobs[index], &cache);
             QMetaObject::invokeMethod(this, [this, row, result] {
                 handleResult(row, result);
             }, Qt::QueuedConnection);
@@ -334,6 +407,49 @@ void ConvertWorkspace::startRun(bool dryRun, bool selectedOnly)
         QMetaObject::invokeMethod(this, [this] { finishRun(); }, Qt::QueuedConnection);
     });
     m_worker->start();
+}
+
+void ConvertWorkspace::updateFlaggedSummary()
+{
+    int flagged = 0;
+    for (const QueueEntry& entry : m_entries)
+        if (entry.hasResult && (entry.result.flagged || !entry.result.errors.isEmpty())) ++flagged;
+    m_flaggedSummary->setText(flagged ? tr("%n to review", nullptr, flagged) : QString());
+    m_prevFlagged->setEnabled(flagged > 0);
+    m_nextFlagged->setEnabled(flagged > 0);
+}
+
+void ConvertWorkspace::stepFlagged(int direction)
+{
+    if (m_entries.isEmpty()) return;
+    const int count = int(m_entries.size());
+    const int start = m_queue->currentItem() ? m_queue->indexOfTopLevelItem(m_queue->currentItem()) : -1;
+    for (int step = 1; step <= count; ++step) {
+        const int row = ((start + direction * step) % count + count) % count;
+        const QueueEntry& entry = m_entries[row];
+        if (entry.hasResult && (entry.result.flagged || !entry.result.errors.isEmpty())) {
+            m_queue->setCurrentItem(m_queue->topLevelItem(row));
+            m_queue->scrollToItem(m_queue->topLevelItem(row));
+            return;
+        }
+    }
+}
+
+void ConvertWorkspace::loadOverrideControls()
+{
+    QTreeWidgetItem* item = m_queue->currentItem();
+    const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
+    const bool valid = row >= 0 && row < m_entries.size();
+    const QSignalBlocker a(m_overrideEnabled), b(m_overrideRecovery), c(m_overrideGlossCurve), d(m_overrideSpecPercentile);
+    m_overrideEnabled->setEnabled(valid);
+    m_reconvertButton->setEnabled(valid && !m_running);
+    if (!valid) { m_overrideEnabled->setChecked(false); return; }
+    const auto override = m_overrides.constFind(m_entries[row].materialPath.toLower());
+    const bool has = override != m_overrides.constEnd();
+    m_overrideEnabled->setChecked(has);
+    m_overrideRecovery->setValue(has ? override->recovery : m_recovery->value());
+    m_overrideGlossCurve->setValue(has ? override->glossCurve : m_glossCurve->value());
+    m_overrideSpecPercentile->setValue(has ? override->specPercentile : 0.98);
 }
 
 void ConvertWorkspace::cancelRun()
@@ -369,6 +485,7 @@ void ConvertWorkspace::handleResult(int row, const Converter::JobResult& result)
     if (row < 0 || row >= m_entries.size()) return;
     m_entries[row].result = result;
     m_entries[row].hasResult = true;
+    updateFlaggedSummary();
     QTreeWidgetItem* item = m_queue->topLevelItem(row);
     if (!item) return;
     item->setText(1, statusText(result, m_lastRunDry));
@@ -432,4 +549,5 @@ void ConvertWorkspace::updateButtons()
     m_convertSelectedButton->setEnabled(!m_running && haveQueue);
     m_convertAllButton->setEnabled(!m_running && haveQueue);
     m_cancelButton->setEnabled(m_running);
+    m_reconvertButton->setEnabled(!m_running && haveQueue && m_queue->currentItem());
 }

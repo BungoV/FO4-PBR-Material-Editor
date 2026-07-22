@@ -2,6 +2,7 @@
 
 #include "converter.h"
 
+#include <QHash>
 #include <QWidget>
 
 #include <atomic>
@@ -39,16 +40,28 @@ private:
         Converter::JobResult result;
         bool hasResult = false;
     };
+    // Per-material tuning for the manual half of the review loop ("spec maps
+    // need clamping, sometimes manually"): overrides the batch math for one
+    // material only.
+    struct MaterialOverride {
+        float recovery = 1.0f;
+        float glossCurve = 1.0f;
+        float specPercentile = 0.98f;
+    };
+    enum class RunScope { All, Checked, CurrentRow };
 
     void browseFolder(QLineEdit* edit, const QString& title);
     void scanSources();
-    void startRun(bool dryRun, bool selectedOnly);
+    void startRun(bool dryRun, RunScope scope);
     void cancelRun();
     void finishRun();
     void handleResult(int row, const Converter::JobResult& result);
     void updateDetail();
     void updatePreview(const QueueEntry* entry);
     void updateButtons();
+    void updateFlaggedSummary();
+    void stepFlagged(int direction);
+    void loadOverrideControls();
     Converter::JobOptions collectOptions(bool dryRun) const;
     void persistSettings() const;
 
@@ -71,7 +84,16 @@ private:
     QCheckBox* m_heightInBlue = nullptr;
     QCheckBox* m_detailAo = nullptr;
     QCheckBox* m_metalDiagnostic = nullptr;
+    QPushButton* m_prevFlagged = nullptr;
+    QPushButton* m_nextFlagged = nullptr;
+    QLabel* m_flaggedSummary = nullptr;
+    QCheckBox* m_overrideEnabled = nullptr;
+    QDoubleSpinBox* m_overrideRecovery = nullptr;
+    QDoubleSpinBox* m_overrideGlossCurve = nullptr;
+    QDoubleSpinBox* m_overrideSpecPercentile = nullptr;
+    QPushButton* m_reconvertButton = nullptr;
 
+    QHash<QString, MaterialOverride> m_overrides;
     QVector<QueueEntry> m_entries;
     QThread* m_worker = nullptr;
     std::atomic<bool> m_cancelRequested{false};
