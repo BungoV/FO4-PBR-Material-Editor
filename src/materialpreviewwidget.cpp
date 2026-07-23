@@ -2698,6 +2698,7 @@ void PbrPreviewGL::initializeGL()
         uniform sampler2D uDepth;
         uniform mat4 uProjectionMatrix,uInvProjectionMatrix;
         uniform vec3 uKernel[16];
+        uniform vec2 uDepthTexel;
         uniform float uRadius,uBias;
         vec3 viewPos(vec2 uv){
             float d=texture(uDepth,uv).r;
@@ -2709,7 +2710,12 @@ void PbrPreviewGL::initializeGL()
             float depth=texture(uDepth,vUv).r;
             if(depth>=0.9999){fragColor=vec4(1);return;} // background never occludes
             vec3 P=viewPos(vUv);
-            vec3 N=normalize(cross(dFdx(P),dFdy(P)));
+            // Central-difference normals: dFdx-of-position is faceted per
+            // triangle and paints the mesh triangulation (spiral banding on
+            // UV spheres); symmetric differences stay smooth.
+            vec3 pR=viewPos(vUv+vec2(uDepthTexel.x,0.0)),pL=viewPos(vUv-vec2(uDepthTexel.x,0.0));
+            vec3 pU=viewPos(vUv+vec2(0.0,uDepthTexel.y)),pD=viewPos(vUv-vec2(0.0,uDepthTexel.y));
+            vec3 N=normalize(cross(pR-pL,pU-pD));
             float a=fract(sin(dot(gl_FragCoord.xy,vec2(12.9898,78.233)))*43758.5453)*6.2831853;
             vec3 rnd=vec3(cos(a),sin(a),0.0);
             vec3 T=normalize(rnd-N*dot(rnd,N));
@@ -4252,9 +4258,12 @@ void PbrPreviewGL::paintGL()
     }
     renderShadowMap();
     const int pixelWidth=int(width()*devicePixelRatioF()),pixelHeight=int(height()*devicePixelRatioF());
-    const bool bloomActive=m_bloomEnabled&&m_bloomStrength>0.001f
+    // Post effects are for the SHADED image; channel-inspection views are
+    // data displays and must reach the screen untouched (no glow, no AO).
+    const bool shadedOnly=m_debugView==DebugView::Shaded&&m_debugViewLeft==DebugView::Shaded;
+    const bool bloomActive=shadedOnly&&m_bloomEnabled&&m_bloomStrength>0.001f
         &&m_bloomProgram&&m_bloomProgram->isLinked()&&m_compositeProgram&&m_compositeProgram->isLinked();
-    const bool ssaoActive=m_ssaoEnabled&&m_ssaoStrength>0.001f
+    const bool ssaoActive=shadedOnly&&m_ssaoEnabled&&m_ssaoStrength>0.001f
         &&m_ssaoProgram&&m_ssaoProgram->isLinked()&&m_compositeProgram&&m_compositeProgram->isLinked();
     const bool postActive=bloomActive||ssaoActive;
     if(postActive){
@@ -4666,6 +4675,7 @@ void PbrPreviewGL::paintGL()
             m_ssaoProgram->setUniformValue("uInvProjectionMatrix",projection.inverted());
             m_ssaoProgram->setUniformValue("uRadius",0.32f);
             m_ssaoProgram->setUniformValue("uBias",0.02f);
+            m_ssaoProgram->setUniformValue("uDepthTexel",QVector2D(1.0f/float(pixelWidth),1.0f/float(pixelHeight)));
             glBindTexture(GL_TEXTURE_2D,m_sceneDepthTexture);
             glDrawArrays(GL_TRIANGLES,0,3);
             m_ssaoProgram->release();
