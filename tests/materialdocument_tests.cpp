@@ -1586,7 +1586,10 @@ int main(int argc, char* argv[])
         QFile saved(savedFixture);
         check(saved.open(QIODevice::ReadOnly), QStringLiteral("saved golden envelope can be read: %1").arg(goldenName));
         const QByteArray savedPayload = payloadFromEnvelope(saved.readAll());
-        check(savedPayload == QJsonDocument(expected).toJson(QJsonDocument::Compact),
+        // The payload is Indented for human readability (formatting is free —
+        // both the editor and the FO4CS runtime parser skip whitespace), so
+        // exactness is judged on the parsed document, not the bytes.
+        check(QJsonDocument::fromJson(savedPayload).object() == expected,
             QStringLiteral("golden PBRM round-trip payload is exact: %1").arg(goldenName));
     }
 

@@ -267,6 +267,8 @@ PbrPreviewGL::~PbrPreviewGL()
     m_accumFboA.reset(); m_accumFboB.reset(); m_denoiseFboA.reset(); m_denoiseFboB.reset();
     if (m_auxTextureA) { glDeleteTextures(1, &m_auxTextureA); m_auxTextureA = 0; }
     if (m_auxTextureB) { glDeleteTextures(1, &m_auxTextureB); m_auxTextureB = 0; }
+    if (m_albedoTextureA) { glDeleteTextures(1, &m_albedoTextureA); m_albedoTextureA = 0; }
+    if (m_albedoTextureB) { glDeleteTextures(1, &m_albedoTextureB); m_albedoTextureB = 0; }
     if (m_bvhNodesTexture) { glDeleteTextures(1, &m_bvhNodesTexture); m_bvhNodesTexture = 0; }
     if (m_bvhTrianglesTexture) { glDeleteTextures(1, &m_bvhTrianglesTexture); m_bvhTrianglesTexture = 0; }
     if (m_bvhNodesBuffer) { glDeleteBuffers(1, &m_bvhNodesBuffer); m_bvhNodesBuffer = 0; }
@@ -2703,7 +2705,8 @@ void PbrPreviewGL::initializeGL()
         #version 330 core
         in vec2 vUv;
         layout(location=0) out vec4 fragColor;
-        layout(location=1) out vec4 fragAux; // first-hit shading normal + linear hit distance (denoiser guide)
+        layout(location=1) out vec4 fragAux;    // first-hit shading normal + linear hit distance (denoiser guide)
+        layout(location=2) out vec4 fragAlbedo; // first-hit albedo (denoiser demodulation)
         uniform samplerBuffer uBvhNodes,uBvhTriangles;
         uniform sampler2D uBase,uNormal,uRmaos,uEmissive,uAccum;
         uniform samplerCube uEnvironment;
@@ -2895,6 +2898,7 @@ void PbrPreviewGL::initializeGL()
             vec3 radiance=vec3(0),throughput=vec3(1);
             bool specularPath=true; // camera rays count as specular for the NEE split
             fragAux=vec4(0,0,0,1e8);
+            fragAlbedo=vec4(1);
             for(int bounce=0;bounce<3;++bounce){
                 Hit hit;
                 if(!traceScene(ro,rd,1e30,false,hit)){radiance+=throughput*envRadiance(rd);break;}
@@ -2904,7 +2908,7 @@ void PbrPreviewGL::initializeGL()
                 vec3 v=-rd;
                 vec3 base;float rough,metal,ao;vec3 emission;
                 material(hit,base,rough,metal,ao,emission);
-                if(bounce==0)fragAux=vec4(n,hit.t);
+                if(bounce==0){fragAux=vec4(n,hit.t);fragAlbedo=vec4(base+emission,1.0);}
                 // NEE covers the diffuse response, so diffuse-continued paths
                 // skip implicit emission; specular paths keep it (mirror glows).
                 if(specularPath||!uNeeEnabled)radiance+=throughput*emission;
@@ -2944,14 +2948,15 @@ void PbrPreviewGL::initializeGL()
     static const char* denoiseFragment = R"GLSL(
         #version 330 core
         in vec2 vUv;out vec4 fragColor;
-        uniform sampler2D uColor,uAux;
+        uniform sampler2D uColor,uAux,uAlbedo;
         uniform vec2 uTexel;
-        uniform int uStepSize;
+        uniform int uStepSize,uDemodPhase; // bit 0: inputs are radiance, divide by albedo; bit 1: multiply albedo back into the output
         void main(){
             vec4 caux=texture(uAux,vUv);
             vec3 cn=caux.xyz;float cd=caux.w;
             bool cbg=dot(cn,cn)<0.25; // background pixels only mix with background
             const float kernel[3]=float[3](0.375,0.25,0.0625);
+            bool demodIn=(uDemodPhase&1)!=0,demodOut=(uDemodPhase&2)!=0;
             vec3 sum=vec3(0);float wsum=0.0;
             for(int j=-2;j<=2;++j)for(int i=-2;i<=2;++i){
                 vec2 suv=vUv+vec2(float(i),float(j))*uTexel*float(uStepSize);
@@ -2961,10 +2966,15 @@ void PbrPreviewGL::initializeGL()
                 float dw=exp(-abs(cd-saux.w)/(abs(cd)*0.25+0.05)); // loose: grazing ground has steep per-texel depth slope
                 float w=kernel[abs(i)]*kernel[abs(j)]*nw*dw;
                 if(isnan(w)||isinf(w))w=0.0;
-                sum+=texture(uColor,suv).rgb*w;wsum+=w;
+                vec3 sample_=texture(uColor,suv).rgb;
+                if(demodIn)sample_/=texture(uAlbedo,suv).rgb+vec3(0.004); // filter irradiance, not texture
+                sum+=sample_*w;wsum+=w;
             }
-            vec3 result=wsum>1e-6?sum/wsum:texture(uColor,vUv).rgb;
-            if(any(isnan(result)))result=texture(uColor,vUv).rgb;
+            vec3 fallback=texture(uColor,vUv).rgb;
+            if(demodIn)fallback/=texture(uAlbedo,vUv).rgb+vec3(0.004);
+            vec3 result=wsum>1e-6?sum/wsum:fallback;
+            if(any(isnan(result)))result=fallback;
+            if(demodOut)result*=texture(uAlbedo,vUv).rgb+vec3(0.004);
             fragColor=vec4(result,1.0);
         }
     )GLSL";
@@ -3943,10 +3953,11 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
         m_accumFboB = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
         m_denoiseFboA = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
         m_denoiseFboB = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
-        // Attachment 1 = first-hit normal + distance, the denoiser's edge
-        // guide. Hand-attached (same pattern as the scene depth texture) so
-        // there is no ambiguity about who owns or binds it.
-        const auto makeAux = [this, pixelWidth, pixelHeight](QOpenGLFramebufferObject& fbo, GLuint& texture) {
+        // Attachment 1 = first-hit normal + distance (the denoiser's edge
+        // guide), attachment 2 = first-hit albedo (demodulation, so the filter
+        // smooths lighting rather than texture detail). Hand-attached, same
+        // pattern as the scene depth texture.
+        const auto makeAux = [this, pixelWidth, pixelHeight](QOpenGLFramebufferObject& fbo, GLuint& texture, GLenum attachment) {
             if (texture) glDeleteTextures(1, &texture);
             glGenTextures(1, &texture);
             glBindTexture(GL_TEXTURE_2D, texture);
@@ -3957,10 +3968,12 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glBindTexture(GL_TEXTURE_2D, 0);
             glBindFramebuffer(GL_FRAMEBUFFER, fbo.handle());
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, texture, 0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, texture, 0);
         };
-        makeAux(*m_accumFboA, m_auxTextureA);
-        makeAux(*m_accumFboB, m_auxTextureB);
+        makeAux(*m_accumFboA, m_auxTextureA, GL_COLOR_ATTACHMENT1);
+        makeAux(*m_accumFboB, m_auxTextureB, GL_COLOR_ATTACHMENT1);
+        makeAux(*m_accumFboA, m_albedoTextureA, GL_COLOR_ATTACHMENT2);
+        makeAux(*m_accumFboB, m_albedoTextureB, GL_COLOR_ATTACHMENT2);
         glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
         m_accumSamples = 0;
     }
@@ -3986,8 +3999,8 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     glDisable(GL_SCISSOR_TEST);
     m_accumFboB->bind();
     glViewport(0, 0, pixelWidth, pixelHeight);
-    static const GLenum traceBuffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-    glDrawBuffers(2, traceBuffers);
+    static const GLenum traceBuffers[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
+    glDrawBuffers(3, traceBuffers);
     m_traceProgram->bind();
     m_traceProgram->setUniformValue("uBvhNodes", 22);
     m_traceProgram->setUniformValue("uBvhTriangles", 23);
@@ -4059,28 +4072,35 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     m_traceProgram->release();
     static const GLenum singleBuffer[1] = { GL_COLOR_ATTACHMENT0 };
     glDrawBuffers(1, singleBuffer);
-    std::swap(m_accumFboA, m_accumFboB); // A now holds the freshest average + aux
+    std::swap(m_accumFboA, m_accumFboB); // A now holds the freshest average + aux + albedo
     std::swap(m_auxTextureA, m_auxTextureB);
+    std::swap(m_albedoTextureA, m_albedoTextureB);
 
-    // Edge-aware a-trous passes while the image is young; the guide buffer is
-    // the freshest first-hit normal/depth. Fades out by 96 spp.
+    // Edge-aware a-trous over the DEMODULATED radiance (radiance/albedo), so
+    // the filter smooths lighting noise while texture detail stays sharp. The
+    // footprint shrinks as samples accumulate; the blend fades out by 96 spp.
     const float denoiseMix = (m_traceDenoise && m_denoiseProgram && m_denoiseProgram->isLinked())
-        ? std::clamp(1.33f * (1.0f - float(m_accumSamples) / 128.0f), 0.0f, 1.0f) : 0.0f; // fully filtered below 32 spp, gone by 128
+        ? std::clamp(1.2f * (1.0f - float(m_accumSamples) / 96.0f), 0.0f, 1.0f) : 0.0f;
     GLuint filteredTexture = m_accumFboA->texture();
     const GLuint auxTexture = m_auxTextureA;
     if (denoiseMix > 0.001f) {
+        const int passCount = m_accumSamples < 16 ? 4 : (m_accumSamples < 32 ? 3 : (m_accumSamples < 64 ? 2 : 1));
         m_denoiseProgram->bind();
         m_denoiseProgram->setUniformValue("uColor", 0);
         m_denoiseProgram->setUniformValue("uAux", 9);
+        m_denoiseProgram->setUniformValue("uAlbedo", 10);
         m_denoiseProgram->setUniformValue("uTexel", QVector2D(1.0f / float(pixelWidth), 1.0f / float(pixelHeight)));
         glActiveTexture(GL_TEXTURE9); glBindTexture(GL_TEXTURE_2D, auxTexture);
+        glActiveTexture(GL_TEXTURE10); glBindTexture(GL_TEXTURE_2D, m_albedoTextureA);
         glActiveTexture(GL_TEXTURE0);
         const int steps[4] = { 1, 2, 4, 8 };
         GLuint sourceTexture = filteredTexture;
-        for (int pass = 0; pass < 4; ++pass) {
+        for (int pass = 0; pass < passCount; ++pass) {
             QOpenGLFramebufferObject* target = (pass % 2 == 0) ? m_denoiseFboA.get() : m_denoiseFboB.get();
             target->bind();
             m_denoiseProgram->setUniformValue("uStepSize", steps[pass]);
+            m_denoiseProgram->setUniformValue("uDemodPhase",
+                (pass == 0 ? 1 : 0) | (pass == passCount - 1 ? 2 : 0));
             glBindTexture(GL_TEXTURE_2D, sourceTexture);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             sourceTexture = target->texture();

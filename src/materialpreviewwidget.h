@@ -229,7 +229,8 @@ private:
     std::unique_ptr<QOpenGLShaderProgram> m_traceProgram, m_presentProgram, m_denoiseProgram;
     std::unique_ptr<QOpenGLFramebufferObject> m_accumFboA, m_accumFboB;
     std::unique_ptr<QOpenGLFramebufferObject> m_denoiseFboA, m_denoiseFboB;
-    GLuint m_auxTextureA = 0, m_auxTextureB = 0; // first-hit normal+distance, paired with the accum FBOs
+    GLuint m_auxTextureA = 0, m_auxTextureB = 0;       // first-hit normal+distance, paired with the accum FBOs
+    GLuint m_albedoTextureA = 0, m_albedoTextureB = 0; // first-hit albedo: the denoiser filters radiance/albedo so texture detail survives
     bool m_traceDenoise = true;
     GLuint m_bvhNodesBuffer = 0, m_bvhNodesTexture = 0;         // 2 RGBA32F texels per node
     GLuint m_bvhTrianglesBuffer = 0, m_bvhTrianglesTexture = 0; // 8 RGBA32F texels per triangle

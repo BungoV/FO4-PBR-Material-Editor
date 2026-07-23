@@ -296,7 +296,11 @@ bool MaterialDocument::load(const QString& fileName, QString* error)
 
 bool MaterialDocument::save(const QString& fileName, QString* error) const
 {
-    const QByteArray payload = QJsonDocument(toJson()).toJson(QJsonDocument::Compact);
+    // Indented so the payload is human-readable in a text editor. The FO4CS
+    // runtime's JSON parser skips inter-token whitespace (PBRM.cpp
+    // SkipWhitespace), so formatting is free; only the header's payload
+    // length must match, and it is computed from the actual bytes below.
+    const QByteArray payload = QJsonDocument(toJson()).toJson(QJsonDocument::Indented);
     constexpr qsizetype MaximumPayloadSize = 64u * 1024u * 1024u;
     if (payload.size() > MaximumPayloadSize
         || payload.size() > static_cast<qsizetype>(std::numeric_limits<quint32>::max())) {
