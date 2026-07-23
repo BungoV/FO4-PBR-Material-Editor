@@ -2708,8 +2708,9 @@ void PbrPreviewGL::initializeGL()
         layout(location=1) out vec4 fragAux;    // first-hit shading normal + linear hit distance (denoiser guide)
         layout(location=2) out vec4 fragAlbedo; // first-hit albedo (denoiser demodulation)
         uniform samplerBuffer uBvhNodes,uBvhTriangles;
-        uniform sampler2D uBase,uNormal,uRmaos,uEmissive,uAccum;
-        uniform samplerCube uEnvironment;
+        uniform sampler2D uBase,uNormal,uRmaos,uEmissive,uAccum,uBrdfLut;
+        uniform samplerCube uEnvironment,uPrefilteredEnvironment;
+        uniform float uPrefilteredEnvironmentMaxLod;
         uniform mat4 uInvViewProjection;
         uniform vec3 uCameraPosition,uKeyDirection,uKeyColor,uBaseFallback,uTint,uEmissiveColorFallback;
         uniform vec3 uSubsurfaceProfileColor,uTransmissionTint;
@@ -2897,11 +2898,21 @@ void PbrPreviewGL::initializeGL()
             vec3 ro=uCameraPosition;
             vec3 radiance=vec3(0),throughput=vec3(1);
             bool specularPath=true; // camera rays count as specular for the NEE split
+            float pathRoughness=-1.0; // >=0 after a specular continuation: prefiltered env lookup on miss
             fragAux=vec4(0,0,0,1e8);
             fragAlbedo=vec4(1);
             for(int bounce=0;bounce<3;++bounce){
                 Hit hit;
-                if(!traceScene(ro,rd,1e30,false,hit)){radiance+=throughput*envRadiance(rd);break;}
+                if(!traceScene(ro,rd,1e30,false,hit)){
+                    // Split-sum specular: a reflected ray that reaches the sky
+                    // reads the roughness-matched prefiltered mip - the same
+                    // integral the raster uses - so glossy reflections are
+                    // noise-free at 1 spp. Camera rays keep the sharp source.
+                    radiance+=throughput*(pathRoughness>=0.0
+                        ?textureLod(uPrefilteredEnvironment,environmentDirection(rd),pathRoughness*uPrefilteredEnvironmentMaxLod).rgb*uEnvironmentIntensity
+                        :envRadiance(rd));
+                    break;
+                }
                 vec3 p=ro+rd*hit.t;
                 vec3 gn=hit.n;if(dot(gn,rd)>0.0)gn=-gn;
                 vec3 n=shadingNormal(hit,gn);
@@ -2918,17 +2929,28 @@ void PbrPreviewGL::initializeGL()
                 // Russian-roulette-free continuation: pick diffuse or specular
                 // with equal probability and compensate by 2x.
                 vec3 f0=mix(vec3(0.04),base,metal);
-                if(rnd(seed)<0.5){
+                // Energy-proportional lobe choice: pure metals always take the
+                // specular branch (their diffuse term is zero, so a 50/50 pick
+                // wastes half the samples on black - visible 1 spp speckle).
+                float pd=dot(base,vec3(0.333))*(1.0-metal);
+                float ps=dot(f0,vec3(0.333));
+                float pDiffuse=clamp(pd/max(pd+ps,1e-4),0.0,1.0);
+                if(rnd(seed)<pDiffuse){
                     rd=cosineSample(n,seed);
                     if(dot(rd,gn)<=0.0)break; // shading normal sent it under the surface
-                    throughput*=base*(1.0-metal)*2.0*mix(1.0,ao,0.85); // cosine pdf cancels NoL/PI
+                    throughput*=base*(1.0-metal)*mix(1.0,ao,0.85)/max(pDiffuse,1e-4); // cosine pdf cancels NoL/PI
                     specularPath=false;
+                    pathRoughness=-1.0;
                 }else{
-                    rd=ggxSample(n,v,rough,seed);
+                    // Deterministic mirror direction + split-sum energy (BRDF
+                    // LUT), lobe width deferred to the prefiltered env on miss.
+                    // No stochastic lobe sampling = no specular sparkle.
+                    rd=reflect(-v,n);
                     if(dot(rd,gn)<=0.0||dot(rd,n)<=0.0)break;
-                    vec3 h=normalize(v+rd);
-                    throughput*=fresnel(max(dot(v,h),0.0),f0)*g1(max(dot(n,rd),0.001),rough*rough*0.5)*2.0;
+                    vec2 envBrdf=texture(uBrdfLut,vec2(max(dot(n,v),0.001),rough)).rg;
+                    throughput*=(f0*envBrdf.x+vec3(envBrdf.y))/max(1.0-pDiffuse,1e-4);
                     specularPath=true;
+                    pathRoughness=rough;
                 }
                 if(max(throughput.r,max(throughput.g,throughput.b))<0.005)break;
                 ro=p+gn*0.002;
@@ -2959,7 +2981,9 @@ void PbrPreviewGL::initializeGL()
             // Roughness gates the filter: sharp speculars are lighting detail
             // demodulation cannot protect, and tight GGX lobes converge fast
             // anyway. Rough surfaces carry the actual Monte Carlo noise.
-            float gate=cbg?0.0:smoothstep(0.12,0.45,calb.a);
+            // Speculars are deterministic (split-sum) so gloss and mid-gloss
+            // need no filtering; only genuinely rough, diffuse-noise surfaces do.
+            float gate=cbg?0.0:smoothstep(0.35,0.65,calb.a);
             const float kernel[3]=float[3](0.375,0.25,0.0625);
             bool demodIn=(uDemodPhase&1)!=0,demodOut=(uDemodPhase&2)!=0;
             vec3 center=texture(uColor,vUv).rgb;
@@ -4017,6 +4041,7 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     glActiveTexture(GL_TEXTURE23); glBindTexture(GL_TEXTURE_BUFFER, m_bvhTrianglesTexture);
     glActiveTexture(GL_TEXTURE0);
     m_baseTexture->bind(0); m_normalTexture->bind(1); m_rmaosTexture->bind(2); m_emissiveTexture->bind(3); m_environmentTexture->bind(5);
+    m_prefilteredEnvironmentTexture->bind(12); m_brdfLutTexture->bind(13);
     glActiveTexture(GL_TEXTURE7); glBindTexture(GL_TEXTURE_2D, m_accumFboA->texture());
     glActiveTexture(GL_TEXTURE0);
     m_traceProgram->setUniformValue("uBase", 0);
@@ -4025,6 +4050,9 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     m_traceProgram->setUniformValue("uEmissive", 3);
     m_traceProgram->setUniformValue("uEnvironment", 5);
     m_traceProgram->setUniformValue("uAccum", 7);
+    m_traceProgram->setUniformValue("uPrefilteredEnvironment", 12);
+    m_traceProgram->setUniformValue("uBrdfLut", 13);
+    m_traceProgram->setUniformValue("uPrefilteredEnvironmentMaxLod", m_prefilteredEnvironmentMaxLod);
     m_traceProgram->setUniformValue("uInvViewProjection", inverse);
     m_traceProgram->setUniformValue("uCameraPosition", eye4.toVector3DAffine());
     m_traceProgram->setUniformValue("uResolution", QVector2D(float(pixelWidth), float(pixelHeight)));
