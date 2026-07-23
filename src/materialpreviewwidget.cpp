@@ -217,6 +217,17 @@ PbrPreviewGL::PbrPreviewGL(QWidget* parent) : QOpenGLWidget(parent)
     m_freeTimer->setInterval(16);
     connect(m_freeTimer, &QTimer::timeout, this, [this] { freeCameraTick(); });
     m_previewClock.start();
+    m_turntableTimer = new QTimer(this);
+    m_turntableTimer->setInterval(16);
+    connect(m_turntableTimer, &QTimer::timeout, this, [this] {
+        const qint64 now = m_previewClock.elapsed();
+        m_yaw += m_turntableSpeed * float(now - m_turntableLastMs) / 1000.0f;
+        while (m_yaw > 360.0f) m_yaw -= 360.0f;
+        while (m_yaw < -360.0f) m_yaw += 360.0f;
+        m_turntableLastMs = now;
+        emit cameraChanged();
+        update();
+    });
     m_animationTimer = new QTimer(this);
     m_animationTimer->setInterval(16);
     connect(m_animationTimer, &QTimer::timeout, this, [this] {
@@ -1117,6 +1128,26 @@ void PbrPreviewGL::setProjection(Projection value) { if(m_projection==value)retu
 void PbrPreviewGL::setBackground(Background value) { m_background = value; update(); }
 void PbrPreviewGL::setDebugView(DebugView value) { m_debugView = value; update(); }
 void PbrPreviewGL::setDebugSplit(float fraction) { m_debugSplit = std::clamp(fraction, 0.0f, 0.98f); update(); }
+void PbrPreviewGL::setTonemapOperator(int op) { m_tonemapOperator = std::clamp(op, 0, 3); update(); }
+
+void PbrPreviewGL::setTurntable(bool enabled, float degreesPerSecond)
+{
+    m_turntableSpeed = degreesPerSecond;
+    if (enabled == m_turntableTimer->isActive()) return;
+    if (enabled) { m_turntableLastMs = m_previewClock.elapsed(); m_turntableTimer->start(); }
+    else m_turntableTimer->stop();
+}
+
+QImage PbrPreviewGL::captureScreenshot()
+{
+    // grabFramebuffer re-runs paintGL into an offscreen buffer; the flag keeps
+    // the QPainter overlays (gizmo, hints, split divider) out of the capture.
+    m_screenshotMode = true;
+    QImage image = grabFramebuffer();
+    m_screenshotMode = false;
+    update();
+    return image;
+}
 void PbrPreviewGL::setBloom(bool enabled, float strength) { m_bloomEnabled = enabled; m_bloomStrength = std::clamp(strength, 0.0f, 3.0f); update(); }
 void PbrPreviewGL::setGroundEnabled(bool value) { m_groundEnabled = value; update(); }
 void PbrPreviewGL::setShadows(bool enabled, float intensity) { m_shadowsEnabled=enabled;m_shadowIntensity=std::clamp(intensity,0.0f,1.0f);update(); }
@@ -1493,6 +1524,7 @@ void PbrPreviewGL::initializeGL()
         uniform float uDecalAngleFade,uDecalDistanceFade;
         uniform bool uDynamicInvert,uGlassThinWalled,uWaterShoreFoam,uDecalEnabled;
         uniform bool uMirrorPrimaryUv;
+        uniform int uTonemapOperator;
         const float PI=3.14159265359;
         vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
         vec2 addressUv(vec2 uv,int mode){
@@ -1506,7 +1538,21 @@ void PbrPreviewGL::initializeGL()
             uv=mat2(c,-s,s,c)*(uv-vec2(.5))+vec2(.5);return addressUv(uv,addressMode);
         }
         vec3 environmentDirection(vec3 v){v=rotateY(v,radians(uEnvironmentYaw));return vec3(v.x,v.z,-v.y);}
-        vec3 tonemap(vec3 c){c*=exp2(uExposure);c=c/(c+vec3(1.0));return pow(max(c,vec3(0)),vec3(1.0/2.2));}
+        vec3 agxContrast(vec3 x){vec3 x2=x*x;vec3 x4=x2*x2;return 15.5*x4*x2-40.14*x4*x+31.96*x4-6.868*x2*x+0.4298*x2+0.1191*x-0.00232;}
+        vec3 tonemap(vec3 c){
+            c*=exp2(uExposure);
+            if(uTonemapOperator==0){const float a=2.51,b=.03,d=2.43,e=.59,f=.14;c=clamp((c*(a*c+b))/(c*(d*c+e)+f),0.0,1.0);}
+            else if(uTonemapOperator==1){
+                // AgX (Sobotka) minimal fit: inset matrix -> log2 range compress -> sigmoid -> outset.
+                const mat3 agxMat=mat3(0.842479062253094,0.0423282422610123,0.0423756549057051,0.0784335999999992,0.878468636469772,0.0784336,0.0792237451477643,0.0791661274605434,0.879142973793104);
+                const mat3 agxInv=mat3(1.19687900512017,-0.0528968517574562,-0.0529716355144438,-0.0980208811401368,1.15190312990417,-0.0980434501171241,-0.0990297440797205,-0.0989611768448433,1.15107367264116);
+                vec3 v=agxMat*c;v=clamp(log2(max(v,vec3(1e-10))),-12.47393,4.026069);v=(v+12.47393)/(12.47393+4.026069);
+                return clamp(agxInv*agxContrast(v),0.0,1.0); // sigmoid output is already display-encoded
+            }
+            else if(uTonemapOperator==2){c=c/(c+vec3(1.0));}
+            else{c=clamp(c,0.0,1.0);}
+            return pow(max(c,vec3(0)),vec3(1.0/2.2));
+        }
         vec3 diffuseIrradiance(vec3 n){
             vec3 up=abs(n.y)<.999?vec3(0,1,0):vec3(1,0,0);
             vec3 tangent=normalize(cross(up,n)),bitangent=cross(n,tangent);
@@ -2272,6 +2318,17 @@ void PbrPreviewGL::initializeGL()
             if(dbgView==17){fragColor=vec4(vec3(layerCoverage),1);return;}
             if(dbgView==18){fragColor=vec4(pow(max(emissionColor,vec3(0.0)),vec3(1.0/2.2)),1);return;}
             if(dbgView==19){fragColor=vec4(vec3(texture(uNormal,uv).a),1);return;} // signed curvature (Normal.A)
+            if(dbgView==20){
+                // PBR validation (Substance-style): flag non-physical authored values.
+                // Thresholds operate on sRGB-encoded albedo like SP/Marmoset validators.
+                float luma=dot(pow(max(base,vec3(0.0)),vec3(1.0/2.2)),vec3(0.2126,0.7152,0.0722));
+                vec3 flag=vec3(-1.0);
+                if(metal>0.1&&metal<0.9)flag=vec3(1.0,0.85,0.1);                    // ambiguous metallic
+                else if(metal>=0.9){if(luma<155.0/255.0)flag=vec3(1.0,0.45,0.05);}  // metal reflectance too low
+                else if(luma<30.0/255.0)flag=vec3(1.0,0.1,0.1);                     // dielectric albedo too dark
+                else if(luma>240.0/255.0)flag=vec3(0.2,0.55,1.0);                   // dielectric albedo too bright
+                fragColor=flag.r<0.0?vec4(vec3(luma*0.75),1.0):vec4(flag,1.0);return;
+            }
             if(unlitMaterial){vec3 unlit=base*uUnlitIntensity+particleEdgeGlow;if(uUnlitVertexColor)unlit*=vColor.rgb;fragColor=vec4(uUnlitExposure?tonemap(unlit):pow(max(unlit,vec3(0.0)),vec3(1.0/2.2)),opacity);return;}
             if(uSpecularAa&&!defaults){
                 // Tokuyoshi/Kaplanyan screen-space variance: widen the lobe where
@@ -2505,9 +2562,23 @@ void PbrPreviewGL::initializeGL()
         #version 330 core
         in vec2 vNdc;out vec4 fragColor;uniform samplerCube uEnvironment;uniform mat4 uInvViewProjection;
         uniform vec3 uCameraPosition;uniform int uBackground;uniform float uEnvironmentYaw,uEnvironmentIntensity,uExposure;
+        uniform int uTonemapOperator;
         vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
         vec3 environmentDirection(vec3 v){v=rotateY(v,radians(uEnvironmentYaw));return vec3(v.x,v.z,-v.y);}
-        vec3 tonemap(vec3 c){c*=exp2(uExposure);c=c/(c+vec3(1));return pow(max(c,vec3(0)),vec3(1.0/2.2));}
+        vec3 agxContrast(vec3 x){vec3 x2=x*x;vec3 x4=x2*x2;return 15.5*x4*x2-40.14*x4*x+31.96*x4-6.868*x2*x+0.4298*x2+0.1191*x-0.00232;}
+        vec3 tonemap(vec3 c){
+            c*=exp2(uExposure);
+            if(uTonemapOperator==0){const float a=2.51,b=.03,d=2.43,e=.59,f=.14;c=clamp((c*(a*c+b))/(c*(d*c+e)+f),0.0,1.0);}
+            else if(uTonemapOperator==1){
+                const mat3 agxMat=mat3(0.842479062253094,0.0423282422610123,0.0423756549057051,0.0784335999999992,0.878468636469772,0.0784336,0.0792237451477643,0.0791661274605434,0.879142973793104);
+                const mat3 agxInv=mat3(1.19687900512017,-0.0528968517574562,-0.0529716355144438,-0.0980208811401368,1.15190312990417,-0.0980434501171241,-0.0990297440797205,-0.0989611768448433,1.15107367264116);
+                vec3 v=agxMat*c;v=clamp(log2(max(v,vec3(1e-10))),-12.47393,4.026069);v=(v+12.47393)/(12.47393+4.026069);
+                return clamp(agxInv*agxContrast(v),0.0,1.0);
+            }
+            else if(uTonemapOperator==2){c=c/(c+vec3(1));}
+            else{c=clamp(c,0.0,1.0);}
+            return pow(max(c,vec3(0)),vec3(1.0/2.2));
+        }
         void main(){
             vec3 color;
             if(uBackground==0){vec4 p=uInvViewProjection*vec4(vNdc,1,1);vec3 ray=normalize(p.xyz/p.w-uCameraPosition);color=tonemap(texture(uEnvironment,environmentDirection(ray)).rgb*uEnvironmentIntensity);}
@@ -3129,6 +3200,7 @@ void PbrPreviewGL::drawNavGizmo(QPainter& painter)
 
 void PbrPreviewGL::drawViewportOverlays()
 {
+    if (m_screenshotMode) return; // captures show the clean render only
     QPainter painter(this);
     drawNavGizmo(painter); // orientation lives in the gizmo; the grid stays label-free
     if(m_debugView!=DebugView::Shaded&&m_debugView!=DebugView::Wireframe&&m_debugSplit>0.001f){
@@ -3329,6 +3401,7 @@ void PbrPreviewGL::applyCommonUniforms(QOpenGLShaderProgram& p)
     const QVector4D eye4=view.inverted()*QVector4D(0,0,0,1); const QVector3D eye=eye4.toVector3DAffine();
     p.setUniformValue("uViewProjection",projection*view);p.setUniformValue("uInvViewProjection",inverse);p.setUniformValue("uCameraPosition",eye);
     p.setUniformValue("uEnvironmentYaw",m_environmentYaw);p.setUniformValue("uEnvironmentIntensity",m_environmentIntensity);p.setUniformValue("uExposure",m_exposure);
+    p.setUniformValue("uTonemapOperator",m_tonemapOperator);
 }
 
 void PbrPreviewGL::paintGL()
@@ -4047,6 +4120,21 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
         for(DragNumericEdit* field:{m_objectRotationX,m_objectRotationY,m_objectRotationZ,m_objectPositionX,m_objectPositionY,m_objectPositionZ}){QSignalBlocker blocker(field);field->setValue(0);}
         applyObjectTransform();
     });
+    addHeading(sceneForm,tr("Turntable"));
+    auto* turntableRow=new QWidget(scene);auto* turntableLayout=new QHBoxLayout(turntableRow);turntableLayout->setContentsMargins(0,0,0,0);turntableLayout->setSpacing(7);
+    auto* turntable=new QCheckBox(tr("Spin"),turntableRow);
+    turntable->setToolTip(tr("Continuously orbit the camera around the object so speculars and state effects sweep past without dragging."));
+    auto* turntableSpeed=new DragNumericEdit(turntableRow);
+    turntableSpeed->setRange(-180,180);turntableSpeed->setDecimals(0);turntableSpeed->setSingleStep(5);turntableSpeed->setValue(20);turntableSpeed->setSuffix(tr(" °/s"));turntableSpeed->setEnabled(false);
+    turntableSpeed->setToolTip(tr("Orbit speed; negative reverses direction."));
+    turntableLayout->addWidget(turntable);turntableLayout->addWidget(turntableSpeed,1);
+    sceneForm->addRow(QString(),turntableRow);
+    const auto applyTurntable=[this,turntable,turntableSpeed]{
+        turntableSpeed->setEnabled(turntable->isChecked());
+        m_materialCanvas->setTurntable(turntable->isChecked(),float(turntableSpeed->value()));
+    };
+    connect(turntable,&QCheckBox::toggled,this,[applyTurntable](bool){applyTurntable();});
+    connect(turntableSpeed,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[applyTurntable](double){applyTurntable();});
     addHeading(sceneForm,tr("Time"));
     auto* timePause=new QCheckBox(tr("Pause animation"),scene);
     timePause->setToolTip(tr("Freezes UV animation, flipbooks, advection, water, and vegetation motion for inspection."));
@@ -4087,7 +4175,7 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     tabs->addTab(wrapSettingsTab(scene),tr("Scene"));
 
     auto* lighting=new QWidget(tabs);auto* lightingForm=new QFormLayout(lighting);lightingForm->setContentsMargins(8,8,8,8);lightingForm->setVerticalSpacing(6);
-    m_lightingPreset=new QComboBox(lighting);m_lightingPreset->addItems({tr("Studio"),tr("Direct Sun"),tr("Outdoor Shadow"),tr("Interior"),tr("Neutral Validation"),tr("Custom")});m_lightingPreset->setToolTip(tr("Apply a complete preview-lighting preset."));lightingForm->addRow(tr("Lighting preset"),m_lightingPreset);
+    m_lightingPreset=new QComboBox(lighting);m_lightingPreset->addItems({tr("Studio"),tr("Direct Sun"),tr("Outdoor Shadow"),tr("Interior"),tr("Neutral Validation"),tr("Rim Backlight"),tr("Overhead Softbox"),tr("Custom")});m_lightingPreset->setToolTip(tr("Apply a complete preview-lighting preset."));lightingForm->addRow(tr("Lighting preset"),m_lightingPreset);
     m_deriveExrLighting=new QCheckBox(tr("Lighting derived from the EXR"),lighting);m_deriveExrLighting->setObjectName(QStringLiteral("DeriveExrLighting"));m_deriveExrLighting->setEnabled(false);m_deriveExrLighting->setToolTip(tr("With an EXR environment loaded, the key light and shadow direction always derive from its dominant radiance — the EXR is the sole light source, so its bright region is never counted twice. Manual key-light controls return when a non-HDR cubemap is active."));lightingForm->addRow(QString(),m_deriveExrLighting);
     addHeading(lightingForm,tr("Key Light"));
     m_keyIntensity=spin(0,20,.25,QString(),lighting);m_keyYaw=spin(-360,360,1,tr("°"),lighting);m_keyPitch=spin(-89,89,1,tr("°"),lighting);
@@ -4103,6 +4191,9 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     auto* shadowField=new QWidget(lighting);auto* shadowRow=new QHBoxLayout(shadowField);shadowRow->setContentsMargins(0,0,0,0);shadowRow->setSpacing(7);shadowRow->addWidget(m_shadows);shadowRow->addWidget(new QLabel(tr("Strength"),shadowField));shadowRow->addWidget(m_shadowIntensity,1);lightingForm->addRow(tr("Shadows"),shadowField);
     addHeading(lightingForm,tr("Environment"));
     lightingForm->addRow(tr("Map"),m_cubemap);lightingForm->addRow(tr("Intensity"),m_environmentIntensity);lightingForm->addRow(tr("Rotation"),m_environmentYaw);lightingForm->addRow(tr("Scene exposure"),m_exposure);
+    m_tonemap=new QComboBox(lighting);m_tonemap->addItems({tr("ACES"),tr("AgX"),tr("Reinhard"),tr("Linear (None)")});m_tonemap->setCurrentIndex(2);
+    m_tonemap->setToolTip(tr("HDR-to-display transform. ACES is filmic and punchy, AgX keeps saturated emissives from skewing hue, Reinhard is the soft legacy curve, Linear clamps raw output for honest comparisons."));
+    lightingForm->addRow(tr("Tonemap"),m_tonemap);
     tabs->addTab(wrapSettingsTab(lighting),tr("Lighting"));
     auto* display=new QWidget(tabs);auto* displayForm=new QFormLayout(display);displayForm->setContentsMargins(8,8,8,8);displayForm->setVerticalSpacing(6);
     m_background=new QComboBox(display);m_background->addItems({tr("Environment"),tr("Neutral Gray"),tr("Black"),tr("White"),tr("Checkerboard")});
@@ -4114,6 +4205,7 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     addRenderMode(tr("Ambient Occlusion"),PbrPreviewGL::DebugView::AmbientOcclusion);addRenderMode(tr("Specular F0"),PbrPreviewGL::DebugView::F0);addRenderMode(tr("RMAOS (Packed RGB)"),PbrPreviewGL::DebugView::Rmaos);
     addRenderMode(tr("Emissive Color"),PbrPreviewGL::DebugView::EmissiveColor);addRenderMode(tr("Emissive Mask"),PbrPreviewGL::DebugView::EmissiveMask);addRenderMode(tr("Emissive (Final)"),PbrPreviewGL::DebugView::Emissive);addRenderMode(tr("Layer Coverage"),PbrPreviewGL::DebugView::LayerCoverage);
     addRenderMode(tr("Curvature (Normal.A)"),PbrPreviewGL::DebugView::Curvature);
+    addRenderMode(tr("PBR Validation"),PbrPreviewGL::DebugView::Validation);
     addRenderMode(tr("UV Checker"),PbrPreviewGL::DebugView::UvChecker);addRenderMode(tr("Wireframe"),PbrPreviewGL::DebugView::Wireframe);addRenderMode(tr("Tangent Basis"),PbrPreviewGL::DebugView::TangentBasis);
     m_debugSplit=new DragNumericEdit(display);
     m_debugSplit->setRange(0.0,98.0);
@@ -4138,6 +4230,19 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     m_referenceLabel=new QLabel(tr("None"),referenceRow);m_referenceLabel->setObjectName(QStringLiteral("Muted"));
     referenceLayout->addWidget(referenceLoad);referenceLayout->addWidget(referenceClear);referenceLayout->addWidget(m_referenceLabel,1);
     displayForm->addRow(tr("Reference"),referenceRow);
+    auto* screenshotButton=new QPushButton(tr("Save Screenshot…"),display);
+    screenshotButton->setToolTip(tr("Save the current viewport render to a PNG, without the gizmo and overlays."));
+    displayForm->addRow(QString(),screenshotButton);
+    connect(screenshotButton,&QPushButton::clicked,this,[this]{
+        QSettings settings;
+        const QString start=settings.value(QStringLiteral("Preview/screenshotDirectory"),settings.value(QStringLiteral("recentDirectory"))).toString();
+        const QString suggested=QDir(start.isEmpty()?QDir::homePath():start).filePath(QStringLiteral("material-preview.png"));
+        const QString fileName=QFileDialog::getSaveFileName(this,tr("Save viewport screenshot"),suggested,tr("PNG image (*.png)"));
+        if(fileName.isEmpty())return;
+        const QImage image=m_materialCanvas->captureScreenshot();
+        if(!image.save(fileName)){QMessageBox::warning(this,tr("Screenshot"),tr("Could not write %1").arg(fileName));return;}
+        settings.setValue(QStringLiteral("Preview/screenshotDirectory"),QFileInfo(fileName).absolutePath());
+    });
     connect(referenceLoad,&QPushButton::clicked,this,[this,referenceClear]{
         QSettings settings;
         const QString start=settings.value(QStringLiteral("Preview/referenceDirectory"),settings.value(QStringLiteral("recentDirectory"))).toString();
@@ -4223,24 +4328,24 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     connect(m_projection,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int i){m_materialCanvas->setProjection(static_cast<PbrPreviewGL::Projection>(i));savePreviewSettings();});
     connect(m_view,qOverload<int>(&QComboBox::activated),this,[this](int i){if(i>0)m_materialCanvas->setAxisView(static_cast<PbrPreviewGL::AxisView>(i-1));m_view->setCurrentIndex(0);});
     connect(frame,&QPushButton::clicked,m_materialCanvas,&PbrPreviewGL::frameObject);connect(reset,&QPushButton::clicked,m_materialCanvas,&PbrPreviewGL::resetView);
-    connect(m_lightingPreset,qOverload<int>(&QComboBox::activated),this,[this](int index){if(index<5)applyLightingPreset(index);});
+    connect(m_lightingPreset,qOverload<int>(&QComboBox::activated),this,[this](int index){if(index<m_lightingPreset->count()-1)applyLightingPreset(index);});
     auto updateLight=[this]{m_materialCanvas->setLighting(float(m_keyIntensity->value()),m_keyColor->color(),float(m_keyYaw->value()),float(m_keyPitch->value()),float(m_environmentIntensity->value()),float(m_environmentYaw->value()),float(m_exposure->value()));savePreviewSettings();};
     const auto overrideDerived=[this]{
         if(m_applyingLightingPreset||m_applyingDerivedLight)return;
         if(m_deriveExrLighting->isChecked()){
             m_deriveExrLightingPreferred=false;m_manualLightStored=false;QSignalBlocker blocker(m_deriveExrLighting);m_deriveExrLighting->setChecked(false);
         }
-        m_lightingPreset->setCurrentIndex(5);
+        m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);
     };
     for(auto* s:{m_keyIntensity,m_keyYaw,m_keyPitch})connect(s,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[overrideDerived,updateLight](double){overrideDerived();updateLight();});
-    for(auto* s:{m_environmentIntensity,m_exposure})connect(s,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this,updateLight](double){if(!m_applyingLightingPreset&&!m_deriveExrLighting->isChecked())m_lightingPreset->setCurrentIndex(5);updateLight();});
-    connect(m_environmentYaw,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this,updateLight](double){if(m_deriveExrLighting->isChecked())refreshDerivedEnvironmentLight(false);else{if(!m_applyingLightingPreset)m_lightingPreset->setCurrentIndex(5);updateLight();}});
+    for(auto* s:{m_environmentIntensity,m_exposure})connect(s,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this,updateLight](double){if(!m_applyingLightingPreset&&!m_deriveExrLighting->isChecked())m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);updateLight();});
+    connect(m_environmentYaw,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this,updateLight](double){if(m_deriveExrLighting->isChecked())refreshDerivedEnvironmentLight(false);else{if(!m_applyingLightingPreset)m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);updateLight();}});
     connect(m_temperature,qOverload<int>(&QComboBox::currentIndexChanged),this,[this,overrideDerived,updateLight](int){overrideDerived();m_keyColor->setColor(temperatureColor(m_temperature->currentData().toInt()));updateLight();});
     connect(m_keyColor,&ColorEdit::colorChanged,this,[overrideDerived,updateLight](const QColor&){overrideDerived();updateLight();});
     connect(m_deriveExrLighting,&QCheckBox::toggled,this,[this](bool checked){
         if(!m_deriveExrLighting->isEnabled()||m_applyingDerivedLight)return;
         m_deriveExrLightingPreferred=checked;
-        if(checked)refreshDerivedEnvironmentLight(true);else{restoreManualLight();m_lightingPreset->setCurrentIndex(5);savePreviewSettings();}
+        if(checked)refreshDerivedEnvironmentLight(true);else{restoreManualLight();m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);savePreviewSettings();}
     });
     auto updateShadows=[this]{m_shadowIntensity->setEnabled(m_shadows->isChecked());m_materialCanvas->setShadows(m_shadows->isChecked(),float(m_shadowIntensity->value()));savePreviewSettings();};
     connect(m_shadows,&QCheckBox::toggled,this,[updateShadows](bool){updateShadows();});connect(m_shadowIntensity,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[updateShadows](double){updateShadows();});
@@ -4257,6 +4362,11 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     };
     connect(m_bloom,&QCheckBox::toggled,this,applyBloom);
     connect(m_bloomStrength,qOverload<double>(&QDoubleSpinBox::valueChanged),this,applyBloom);
+    connect(m_tonemap,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int index){
+        m_materialCanvas->setTonemapOperator(index);
+        m_referenceCanvas->setTonemapOperator(index);
+        savePreviewSettings();
+    });
     // Ctrl+LMB in the viewport spins the environment; the spin drives the
     // whole chain, including the EXR-derived lighting refresh.
     connect(m_materialCanvas,&PbrPreviewGL::environmentYawDragged,this,[this](float delta){
@@ -4388,8 +4498,10 @@ void MaterialPreviewWidget::showSubmeshMaterialsDialog()
 void MaterialPreviewWidget::applyLightingPreset(int index)
 {
     struct Preset{double key,yaw,pitch,env,exposure;int temperature;};
-    static const Preset values[]={{4,-35,45,1,0,5500},{7,-45,55,.65,.25,6500},{1.4,-25,35,1.6,0,9000},{2.1,25,25,.55,-.25,3200},{3.2,-30,40,.8,0,6500}};
-    const auto& p=values[std::clamp(index,0,4)];m_applyingLightingPreset=true;m_deriveExrLightingPreferred=false;m_manualLightStored=false;
+    static const Preset values[]={{4,-35,45,1,0,5500},{7,-45,55,.65,.25,6500},{1.4,-25,35,1.6,0,9000},{2.1,25,25,.55,-.25,3200},{3.2,-30,40,.8,0,6500},
+        {6,155,35,.45,0,9000},   // Rim Backlight: strong cool key from behind-above, dim fill
+        {3.5,0,75,1.1,0,5500}};  // Overhead Softbox: near-vertical neutral key, bright ambient
+    const auto& p=values[std::clamp(index,0,int(std::size(values))-1)];m_applyingLightingPreset=true;m_deriveExrLightingPreferred=false;m_manualLightStored=false;
     QSignalBlocker deriveBlocker(m_deriveExrLighting),presetBlocker(m_lightingPreset),colorBlocker(m_keyColor),keyBlocker(m_keyIntensity),yawBlocker(m_keyYaw),pitchBlocker(m_keyPitch),environmentBlocker(m_environmentIntensity),exposureBlocker(m_exposure),temperatureBlocker(m_temperature);
     m_deriveExrLighting->setChecked(false);m_lightingPreset->setCurrentIndex(index);m_keyColor->setColor(temperatureColor(p.temperature));m_keyIntensity->setValue(p.key);m_keyYaw->setValue(p.yaw);m_keyPitch->setValue(p.pitch);m_environmentIntensity->setValue(p.env);m_exposure->setValue(p.exposure);
     const int tempIndex=m_temperature->findData(p.temperature);if(tempIndex>=0)m_temperature->setCurrentIndex(tempIndex);m_applyingLightingPreset=false;
@@ -4437,7 +4549,7 @@ void MaterialPreviewWidget::refreshDerivedEnvironmentLight(bool enableShadows)
     if(active){
         captureManualLight();
         QSignalBlocker intensityBlocker(m_keyIntensity),yawBlocker(m_keyYaw),pitchBlocker(m_keyPitch),colorBlocker(m_keyColor),temperatureBlocker(m_temperature),presetBlocker(m_lightingPreset),shadowBlocker(m_shadows);
-        m_keyIntensity->setValue(0);m_keyYaw->setValue(light.yaw);m_keyPitch->setValue(light.pitch);m_keyColor->setColor(light.color);m_temperature->setCurrentIndex(-1);m_lightingPreset->setCurrentIndex(5);if(enableShadows)m_shadows->setChecked(true);
+        m_keyIntensity->setValue(0);m_keyYaw->setValue(light.yaw);m_keyPitch->setValue(light.pitch);m_keyColor->setColor(light.color);m_temperature->setCurrentIndex(-1);m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);if(enableShadows)m_shadows->setChecked(true);
         const float directionalWeight=std::clamp((light.intensity-1.0f)/7.0f,.2f,.85f);setDerivedLightingControls(true);m_materialCanvas->setDerivedEnvironmentShadow(true,directionalWeight);
         m_materialCanvas->setLighting(0,m_keyColor->color(),float(m_keyYaw->value()),float(m_keyPitch->value()),float(m_environmentIntensity->value()),float(m_environmentYaw->value()),float(m_exposure->value()));m_materialCanvas->setShadows(m_shadows->isChecked(),float(m_shadowIntensity->value()));
     }else if(wasActive)restoreManualLight();else{setDerivedLightingControls(false);m_materialCanvas->setDerivedEnvironmentShadow(false,0);}
@@ -4462,8 +4574,8 @@ void MaterialPreviewWidget::loadPreviewSettings()
     QSignalBlocker l(m_keyIntensity),m(m_keyYaw),n(m_keyPitch),o(m_environmentIntensity),p(m_environmentYaw),q(m_exposure),r(m_temperature),shadowBlocker(m_shadows),shadowIntensityBlocker(m_shadowIntensity),deriveBlocker(m_deriveExrLighting),presetBlocker(m_lightingPreset);
     m_shape->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/shape"),0).toInt(),0,3));
     m_planeOrientation->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/planeOrientation"),0).toInt(),0,2));m_twoSided->setChecked(s.value(QStringLiteral("Preview/twoSided"),true).toBool());
-    m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(QStringLiteral("Preview/debug"),0).toInt(),0,18));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
-    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
+    m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(QStringLiteral("Preview/debug"),0).toInt(),0,20));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
+    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
     const int aaIndex=m_antiAliasing->findData(s.value(QStringLiteral("Preview/antiAliasing"),4).toInt());m_antiAliasing->setCurrentIndex(aaIndex>=0?aaIndex:2);m_materialCanvas->setMsaaSamples(m_antiAliasing->currentData().toInt());
     {
         const auto restoreField=[&s](DragNumericEdit* field,const QString& key){QSignalBlocker blocker(field);field->setValue(s.value(key,0.0).toDouble());};
@@ -4474,7 +4586,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
             QVector3D(float(m_objectPositionX->value()),float(m_objectPositionY->value()),float(m_objectPositionZ->value())));
     }
     m_keyIntensity->setValue(s.value(QStringLiteral("Preview/keyIntensity"),4).toDouble());m_keyYaw->setValue(s.value(QStringLiteral("Preview/keyYaw"),-35).toDouble());m_keyPitch->setValue(s.value(QStringLiteral("Preview/keyPitch"),45).toDouble());m_environmentIntensity->setValue(s.value(QStringLiteral("Preview/environmentIntensity"),1).toDouble());m_environmentYaw->setValue(s.value(QStringLiteral("Preview/environmentYaw"),0).toDouble());m_exposure->setValue(s.value(QStringLiteral("Preview/exposure"),0).toDouble());
-    m_shadows->setChecked(s.value(QStringLiteral("Preview/shadows"),true).toBool());m_shadowIntensity->setValue(s.value(QStringLiteral("Preview/shadowIntensity"),.75).toDouble());m_shadowIntensity->setEnabled(m_shadows->isChecked());m_deriveExrLightingPreferred=s.value(QStringLiteral("Preview/deriveExrLighting"),true).toBool();m_lightingPreset->setCurrentIndex(5);
+    m_shadows->setChecked(s.value(QStringLiteral("Preview/shadows"),true).toBool());m_shadowIntensity->setValue(s.value(QStringLiteral("Preview/shadowIntensity"),.75).toDouble());m_shadowIntensity->setEnabled(m_shadows->isChecked());m_deriveExrLightingPreferred=s.value(QStringLiteral("Preview/deriveExrLighting"),true).toBool();m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);
     const int temperature=m_temperature->findData(s.value(QStringLiteral("Preview/temperature"),5500).toInt());if(temperature>=0)m_temperature->setCurrentIndex(temperature);
     m_keyColor->setColor(QColor(s.value(QStringLiteral("Preview/keyColor"),temperatureColor(m_temperature->currentData().toInt()).name()).toString()));
     m_materialCanvas->setPlaneOptions(static_cast<PreviewMeshes::PlaneOrientation>(m_planeOrientation->currentIndex()),m_twoSided->isChecked());
@@ -4487,7 +4599,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
 void MaterialPreviewWidget::savePreviewSettings() const
 {
     const bool preserveManual=m_manualLightStored&&m_deriveExrLighting->isChecked();
-    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
+    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
 }
 
 void MaterialPreviewWidget::reloadPreviewCubemaps()

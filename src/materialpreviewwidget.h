@@ -64,7 +64,7 @@ public:
         AmbientOcclusion = 5, F0 = 6, Emissive = 7, UvChecker = 8,
         Wireframe = 9, TangentBasis = 10, Opacity = 11, TangentNormal = 12,
         Height = 13, RoughnessMetallic = 14, Rmaos = 15, EmissiveMask = 16,
-        LayerCoverage = 17, EmissiveColor = 18, Curvature = 19
+        LayerCoverage = 17, EmissiveColor = 18, Curvature = 19, Validation = 20
     };
     enum class AxisView { Front, Back, Left, Right, Top, Bottom };
     struct EnvironmentLight {
@@ -110,6 +110,9 @@ public:
     void setDebugView(DebugView view);
     void setDebugSplit(float fraction);
     void setBloom(bool enabled, float strength);
+    void setTonemapOperator(int op);
+    void setTurntable(bool enabled, float degreesPerSecond);
+    QImage captureScreenshot();
     void setGroundEnabled(bool enabled);
     void setGridEnabled(bool enabled);
     void setFreeCamera(bool enabled);
@@ -358,6 +361,11 @@ private:
     float m_debugSplit = 0.0f; // 0 = the map fills the view; else shaded left of the divider
     bool m_bloomEnabled = true;
     float m_bloomStrength = 0.4f;
+    int m_tonemapOperator = 2; // 0 ACES, 1 AgX, 2 Reinhard (legacy default), 3 None
+    QTimer* m_turntableTimer = nullptr;
+    float m_turntableSpeed = 20.0f;
+    qint64 m_turntableLastMs = 0;
+    bool m_screenshotMode = false; // true while grabFramebuffer captures without overlays
     bool m_groundEnabled = true, m_shadowsEnabled = true, m_comparisonEnabled = false;
     bool m_gridEnabled = true;
     // Navigation gizmo interaction state.
@@ -495,6 +503,7 @@ private:
     QComboBox* m_projection = nullptr;
     QComboBox* m_view = nullptr;
     QComboBox* m_lightingPreset = nullptr;
+    QComboBox* m_tonemap = nullptr;
     QCheckBox* m_deriveExrLighting = nullptr;
     DragNumericEdit* m_keyIntensity = nullptr;
     DragNumericEdit* m_keyYaw = nullptr;
