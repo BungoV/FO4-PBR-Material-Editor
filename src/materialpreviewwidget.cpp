@@ -261,6 +261,8 @@ PbrPreviewGL::~PbrPreviewGL()
     if (m_shadowFramebuffer) glDeleteFramebuffers(1, &m_shadowFramebuffer);
     m_vao.reset(); m_groundVao.reset(); m_gridVao.reset(); m_highlightVao.reset(); m_lineProgram.reset(); m_program.reset(); m_backgroundProgram.reset();
     m_bloomProgram.reset(); m_compositeProgram.reset(); m_sceneFbo.reset(); m_bloomFboA.reset(); m_bloomFboB.reset();
+    m_ssaoProgram.reset(); m_ssaoFboA.reset(); m_ssaoFboB.reset();
+    if (m_sceneDepthTexture) { glDeleteTextures(1, &m_sceneDepthTexture); m_sceneDepthTexture = 0; }
     m_environmentPrefilterProgram.reset(); m_brdfIntegrationProgram.reset(); m_shadowProgram.reset();
     doneCurrent();
 }
@@ -1149,6 +1151,7 @@ QImage PbrPreviewGL::captureScreenshot()
     return image;
 }
 void PbrPreviewGL::setBloom(bool enabled, float strength) { m_bloomEnabled = enabled; m_bloomStrength = std::clamp(strength, 0.0f, 3.0f); update(); }
+void PbrPreviewGL::setSsao(bool enabled, float strength) { m_ssaoEnabled = enabled; m_ssaoStrength = std::clamp(strength, 0.0f, 1.0f); update(); }
 void PbrPreviewGL::setGroundEnabled(bool value) { m_groundEnabled = value; update(); }
 void PbrPreviewGL::setShadows(bool enabled, float intensity) { m_shadowsEnabled=enabled;m_shadowIntensity=std::clamp(intensity,0.0f,1.0f);update(); }
 void PbrPreviewGL::setDerivedEnvironmentShadow(bool enabled, float directionalWeight) { m_derivedEnvironmentShadow=enabled;m_derivedEnvironmentShadowWeight=std::clamp(directionalWeight,0.0f,1.0f);update(); }
@@ -2629,17 +2632,75 @@ void PbrPreviewGL::initializeGL()
     static const char* compositeFragment = R"GLSL(
         #version 330 core
         in vec2 vUv;out vec4 fragColor;
-        uniform sampler2D uScene,uBloom;
-        uniform float uBloomStrength;
+        uniform sampler2D uScene,uBloom,uSsao;
+        uniform float uBloomStrength,uSsaoStrength;
         void main(){
             vec3 scene=texture(uScene,vUv).rgb;
+            float ao=mix(1.0,texture(uSsao,vUv).r,uSsaoStrength);
             vec3 bloom=texture(uBloom,vUv).rgb;
-            fragColor=vec4(scene+bloom*uBloomStrength,1);
+            fragColor=vec4((scene+bloom*uBloomStrength)*ao,1);
         }
     )GLSL";
     if (!m_compositeProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
         || !m_compositeProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, compositeFragment)
         || !m_compositeProgram->link()) recordShaderFailure("composite", m_compositeProgram->log());
+    // Depth-only SSAO: view-space position reconstruction, face normals from
+    // derivatives, 16-sample rotated hemisphere. Runs at half resolution and
+    // borrows the bloom Gaussian for its blur.
+    m_ssaoProgram = std::make_unique<QOpenGLShaderProgram>();
+    static const char* ssaoFragment = R"GLSL(
+        #version 330 core
+        in vec2 vUv;out vec4 fragColor;
+        uniform sampler2D uDepth;
+        uniform mat4 uProjectionMatrix,uInvProjectionMatrix;
+        uniform vec3 uKernel[16];
+        uniform float uRadius,uBias;
+        vec3 viewPos(vec2 uv){
+            float d=texture(uDepth,uv).r;
+            vec4 clip=vec4(uv*2.0-1.0,d*2.0-1.0,1.0);
+            vec4 v=uInvProjectionMatrix*clip;
+            return v.xyz/v.w;
+        }
+        void main(){
+            float depth=texture(uDepth,vUv).r;
+            if(depth>=0.9999){fragColor=vec4(1);return;} // background never occludes
+            vec3 P=viewPos(vUv);
+            vec3 N=normalize(cross(dFdx(P),dFdy(P)));
+            float a=fract(sin(dot(gl_FragCoord.xy,vec2(12.9898,78.233)))*43758.5453)*6.2831853;
+            vec3 rnd=vec3(cos(a),sin(a),0.0);
+            vec3 T=normalize(rnd-N*dot(rnd,N));
+            mat3 tbn=mat3(T,cross(N,T),N);
+            float occlusion=0.0;
+            for(int i=0;i<16;++i){
+                vec3 samplePos=P+tbn*uKernel[i]*uRadius;
+                vec4 clip=uProjectionMatrix*vec4(samplePos,1.0);
+                vec2 suv=clip.xy/clip.w*0.5+0.5;
+                if(suv.x<0.0||suv.x>1.0||suv.y<0.0||suv.y>1.0)continue;
+                float neighborZ=viewPos(suv).z;
+                float rangeCheck=smoothstep(0.0,1.0,uRadius/max(abs(P.z-neighborZ),1e-4));
+                occlusion+=(neighborZ>=samplePos.z+uBias?1.0:0.0)*rangeCheck;
+            }
+            fragColor=vec4(vec3(1.0-occlusion/16.0),1.0);
+        }
+    )GLSL";
+    if (!m_ssaoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
+        || !m_ssaoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, ssaoFragment)
+        || !m_ssaoProgram->link()) recordShaderFailure("ssao", m_ssaoProgram->log());
+    else {
+        // Deterministic cosine-weighted hemisphere kernel, denser near the origin.
+        m_ssaoProgram->bind();
+        for (int i = 0; i < 16; ++i) {
+            const float u = (float(i) + 0.5f) / 16.0f;
+            const float phi = float(i) * 2.39996323f;                 // golden angle
+            const float radius = std::sqrt(u);
+            const float z = std::sqrt(std::max(0.0f, 1.0f - u));     // bias toward the normal
+            QVector3D sample(radius * std::cos(phi), radius * std::sin(phi), 0.35f + 0.65f * z);
+            sample.normalize();
+            sample *= 0.1f + 0.9f * u * u;                            // cluster close to P
+            m_ssaoProgram->setUniformValue(QStringLiteral("uKernel[%1]").arg(i).toLatin1().constData(), sample);
+        }
+        m_ssaoProgram->release();
+    }
 
     static const char* integrationVertex = R"GLSL(
         #version 330 core
@@ -3417,7 +3478,10 @@ void PbrPreviewGL::paintGL()
     const int pixelWidth=int(width()*devicePixelRatioF()),pixelHeight=int(height()*devicePixelRatioF());
     const bool bloomActive=m_bloomEnabled&&m_bloomStrength>0.001f
         &&m_bloomProgram&&m_bloomProgram->isLinked()&&m_compositeProgram&&m_compositeProgram->isLinked();
-    if(bloomActive){
+    const bool ssaoActive=m_ssaoEnabled&&m_ssaoStrength>0.001f
+        &&m_ssaoProgram&&m_ssaoProgram->isLinked()&&m_compositeProgram&&m_compositeProgram->isLinked();
+    const bool postActive=bloomActive||ssaoActive;
+    if(postActive){
         const auto makeLinear=[this](QOpenGLFramebufferObject& fbo){
             glBindTexture(GL_TEXTURE_2D,fbo.texture());
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
@@ -3425,18 +3489,38 @@ void PbrPreviewGL::paintGL()
             glBindTexture(GL_TEXTURE_2D,0);
         };
         if(!m_sceneFbo||m_sceneFbo->size()!=QSize(pixelWidth,pixelHeight)){
-            QOpenGLFramebufferObjectFormat sceneFormat;
-            sceneFormat.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
-            m_sceneFbo=std::make_unique<QOpenGLFramebufferObject>(pixelWidth,pixelHeight,sceneFormat);
+            // Color-only wrapper; the depth-stencil attachment is our own
+            // TEXTURE (not a renderbuffer) so the SSAO pass can sample it.
+            m_sceneFbo=std::make_unique<QOpenGLFramebufferObject>(pixelWidth,pixelHeight);
             makeLinear(*m_sceneFbo);
+            if(m_sceneDepthTexture)glDeleteTextures(1,&m_sceneDepthTexture);
+            glGenTextures(1,&m_sceneDepthTexture);
+            glBindTexture(GL_TEXTURE_2D,m_sceneDepthTexture);
+            glTexImage2D(GL_TEXTURE_2D,0,GL_DEPTH24_STENCIL8,pixelWidth,pixelHeight,0,GL_DEPTH_STENCIL,GL_UNSIGNED_INT_24_8,nullptr);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D,0);
+            glBindFramebuffer(GL_FRAMEBUFFER,m_sceneFbo->handle());
+            glFramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,m_sceneDepthTexture,0);
+            glBindFramebuffer(GL_FRAMEBUFFER,defaultFramebufferObject());
         }
         const QSize half(std::max(1,pixelWidth/2),std::max(1,pixelHeight/2));
-        if(!m_bloomFboA||m_bloomFboA->size()!=half){
+        if(bloomActive&&(!m_bloomFboA||m_bloomFboA->size()!=half)){
             m_bloomFboA=std::make_unique<QOpenGLFramebufferObject>(half);
             m_bloomFboB=std::make_unique<QOpenGLFramebufferObject>(half);
             makeLinear(*m_bloomFboA);makeLinear(*m_bloomFboB);
         }
-    }else if(m_sceneFbo){m_sceneFbo.reset();m_bloomFboA.reset();m_bloomFboB.reset();}
+        if(ssaoActive&&(!m_ssaoFboA||m_ssaoFboA->size()!=half)){
+            m_ssaoFboA=std::make_unique<QOpenGLFramebufferObject>(half);
+            m_ssaoFboB=std::make_unique<QOpenGLFramebufferObject>(half);
+            makeLinear(*m_ssaoFboA);makeLinear(*m_ssaoFboB);
+        }
+    }else if(m_sceneFbo){
+        m_sceneFbo.reset();m_bloomFboA.reset();m_bloomFboB.reset();m_ssaoFboA.reset();m_ssaoFboB.reset();
+        if(m_sceneDepthTexture){glDeleteTextures(1,&m_sceneDepthTexture);m_sceneDepthTexture=0;}
+    }
     if(m_msaaSamples>1){
         // Compare against the REQUESTED count: drivers may clamp the actual
         // sample count, and comparing against format().samples() would then
@@ -3458,10 +3542,11 @@ void PbrPreviewGL::paintGL()
             }
         }
         if(m_msaaFbo)m_msaaFbo->bind();
+        else if(postActive)m_sceneFbo->bind(); // MSAA creation failed: post chain still needs the offscreen scene
         glClearColor(.1f,.1f,.1f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     } else {
         if(m_msaaFbo) m_msaaFbo.reset();
-        if(bloomActive){m_sceneFbo->bind();glClearColor(.1f,.1f,.1f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);}
+        if(postActive){m_sceneFbo->bind();glClearColor(.1f,.1f,.1f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);}
     }
     glViewport(0,0,pixelWidth,pixelHeight);
     m_environmentTexture->bind(5);m_prefilteredEnvironmentTexture->bind(12);m_brdfLutTexture->bind(13);m_specialTextureArray->bind(14);
@@ -3778,43 +3863,81 @@ void PbrPreviewGL::paintGL()
     drawGrid(); // inside the MSAA pass so the lines resolve smooth
     if(m_msaaSamples>1&&m_msaaFbo){
         glBindFramebuffer(GL_READ_FRAMEBUFFER,m_msaaFbo->handle());
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,bloomActive?m_sceneFbo->handle():defaultFramebufferObject());
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,postActive?m_sceneFbo->handle():defaultFramebufferObject());
         glBlitFramebuffer(0,0,pixelWidth,pixelHeight,0,0,pixelWidth,pixelHeight,GL_COLOR_BUFFER_BIT,GL_NEAREST);
-        glBindFramebuffer(GL_FRAMEBUFFER,bloomActive?m_sceneFbo->handle():defaultFramebufferObject());
+        if(ssaoActive) // SSAO samples scene depth; formats match (both D24S8), rects identical
+            glBlitFramebuffer(0,0,pixelWidth,pixelHeight,0,0,pixelWidth,pixelHeight,GL_DEPTH_BUFFER_BIT,GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER,postActive?m_sceneFbo->handle():defaultFramebufferObject());
     }
-    if(bloomActive){
-        // Bright pass -> half-res separable blur ping-pong -> additive composite.
+    if(postActive){
         glDisable(GL_DEPTH_TEST);
         glActiveTexture(GL_TEXTURE0);
-        m_bloomFboA->bind();
-        glViewport(0,0,m_bloomFboA->width(),m_bloomFboA->height());
-        m_bloomProgram->bind();
-        m_bloomProgram->setUniformValue("uSource",0);
-        m_bloomProgram->setUniformValue("uMode",0);
-        glBindTexture(GL_TEXTURE_2D,m_sceneFbo->texture());
         m_vao->bind();
-        glDrawArrays(GL_TRIANGLES,0,3);
-        const QVector2D texel(1.0f/float(m_bloomFboA->width()),1.0f/float(m_bloomFboA->height()));
-        m_bloomProgram->setUniformValue("uMode",1);
-        for(int pass=0;pass<2;++pass){
-            m_bloomFboB->bind();
-            m_bloomProgram->setUniformValue("uDirection",QVector2D(texel.x()*float(1+pass),0));
-            glBindTexture(GL_TEXTURE_2D,m_bloomFboA->texture());
+        if(ssaoActive){
+            // Half-res hemisphere AO from the depth texture, then one Gaussian
+            // ping-pong through the bloom blur to hide the rotation noise.
+            m_ssaoFboA->bind();
+            glViewport(0,0,m_ssaoFboA->width(),m_ssaoFboA->height());
+            m_ssaoProgram->bind();
+            m_ssaoProgram->setUniformValue("uDepth",0);
+            const QMatrix4x4 projection=projectionMatrix();
+            m_ssaoProgram->setUniformValue("uProjectionMatrix",projection);
+            m_ssaoProgram->setUniformValue("uInvProjectionMatrix",projection.inverted());
+            m_ssaoProgram->setUniformValue("uRadius",0.32f);
+            m_ssaoProgram->setUniformValue("uBias",0.02f);
+            glBindTexture(GL_TEXTURE_2D,m_sceneDepthTexture);
             glDrawArrays(GL_TRIANGLES,0,3);
-            m_bloomFboA->bind();
-            m_bloomProgram->setUniformValue("uDirection",QVector2D(0,texel.y()*float(1+pass)));
-            glBindTexture(GL_TEXTURE_2D,m_bloomFboB->texture());
-            glDrawArrays(GL_TRIANGLES,0,3);
+            m_ssaoProgram->release();
+            if(m_bloomProgram&&m_bloomProgram->isLinked()){
+                const QVector2D aoTexel(1.0f/float(m_ssaoFboA->width()),1.0f/float(m_ssaoFboA->height()));
+                m_bloomProgram->bind();
+                m_bloomProgram->setUniformValue("uSource",0);
+                m_bloomProgram->setUniformValue("uMode",1);
+                m_ssaoFboB->bind();
+                m_bloomProgram->setUniformValue("uDirection",QVector2D(aoTexel.x(),0));
+                glBindTexture(GL_TEXTURE_2D,m_ssaoFboA->texture());
+                glDrawArrays(GL_TRIANGLES,0,3);
+                m_ssaoFboA->bind();
+                m_bloomProgram->setUniformValue("uDirection",QVector2D(0,aoTexel.y()));
+                glBindTexture(GL_TEXTURE_2D,m_ssaoFboB->texture());
+                glDrawArrays(GL_TRIANGLES,0,3);
+                m_bloomProgram->release();
+            }
         }
-        m_bloomProgram->release();
+        if(bloomActive){
+            // Bright pass -> half-res separable blur ping-pong.
+            m_bloomFboA->bind();
+            glViewport(0,0,m_bloomFboA->width(),m_bloomFboA->height());
+            m_bloomProgram->bind();
+            m_bloomProgram->setUniformValue("uSource",0);
+            m_bloomProgram->setUniformValue("uMode",0);
+            glBindTexture(GL_TEXTURE_2D,m_sceneFbo->texture());
+            glDrawArrays(GL_TRIANGLES,0,3);
+            const QVector2D texel(1.0f/float(m_bloomFboA->width()),1.0f/float(m_bloomFboA->height()));
+            m_bloomProgram->setUniformValue("uMode",1);
+            for(int pass=0;pass<2;++pass){
+                m_bloomFboB->bind();
+                m_bloomProgram->setUniformValue("uDirection",QVector2D(texel.x()*float(1+pass),0));
+                glBindTexture(GL_TEXTURE_2D,m_bloomFboA->texture());
+                glDrawArrays(GL_TRIANGLES,0,3);
+                m_bloomFboA->bind();
+                m_bloomProgram->setUniformValue("uDirection",QVector2D(0,texel.y()*float(1+pass)));
+                glBindTexture(GL_TEXTURE_2D,m_bloomFboB->texture());
+                glDrawArrays(GL_TRIANGLES,0,3);
+            }
+            m_bloomProgram->release();
+        }
         glBindFramebuffer(GL_FRAMEBUFFER,defaultFramebufferObject());
         glViewport(0,0,pixelWidth,pixelHeight);
         m_compositeProgram->bind();
         m_compositeProgram->setUniformValue("uScene",0);
         m_compositeProgram->setUniformValue("uBloom",1);
-        m_compositeProgram->setUniformValue("uBloomStrength",m_bloomStrength);
+        m_compositeProgram->setUniformValue("uSsao",2);
+        m_compositeProgram->setUniformValue("uBloomStrength",bloomActive?m_bloomStrength:0.0f);
+        m_compositeProgram->setUniformValue("uSsaoStrength",ssaoActive?m_ssaoStrength:0.0f);
         glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,m_sceneFbo->texture());
-        glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,m_bloomFboA->texture());
+        glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,bloomActive?m_bloomFboA->texture():m_sceneFbo->texture());
+        glActiveTexture(GL_TEXTURE2);glBindTexture(GL_TEXTURE_2D,ssaoActive?m_ssaoFboA->texture():m_sceneFbo->texture());
         glDrawArrays(GL_TRIANGLES,0,3);
         m_vao->release();
         m_compositeProgram->release();
@@ -4220,10 +4343,17 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     m_bloomStrength->setRange(0.05,2.0);m_bloomStrength->setDecimals(2);m_bloomStrength->setSingleStep(0.05);m_bloomStrength->setValue(0.4);
     m_bloomStrength->setToolTip(tr("How strongly the blurred highlights are added back."));
     bloomLayout->addWidget(m_bloom);bloomLayout->addWidget(m_bloomStrength,1);
+    auto* ssaoRow=new QWidget(display);auto* ssaoLayout=new QHBoxLayout(ssaoRow);ssaoLayout->setContentsMargins(0,0,0,0);ssaoLayout->setSpacing(7);
+    m_ssao=new QCheckBox(tr("SSAO"),ssaoRow);m_ssao->setChecked(true);
+    m_ssao->setToolTip(tr("Screen-space ambient occlusion: contact darkening where surfaces meet, derived from scene depth. Editor preference only; never stored in the material."));
+    m_ssaoStrength=new DragNumericEdit(ssaoRow);
+    m_ssaoStrength->setRange(0.05,1.0);m_ssaoStrength->setDecimals(2);m_ssaoStrength->setSingleStep(0.05);m_ssaoStrength->setValue(0.5);
+    m_ssaoStrength->setToolTip(tr("How strongly the occlusion darkens the scene."));
+    ssaoLayout->addWidget(m_ssao);ssaoLayout->addWidget(m_ssaoStrength,1);
     m_antiAliasing=new QComboBox(display);m_antiAliasing->addItem(tr("Off"),1);m_antiAliasing->addItem(tr("MSAA 2x"),2);m_antiAliasing->addItem(tr("MSAA 4x"),4);m_antiAliasing->addItem(tr("MSAA 8x"),8);m_antiAliasing->setCurrentIndex(2);m_antiAliasing->setToolTip(tr("Multisampled viewport rendering. Editor preference only; never stored in the material."));
     m_ground=new QCheckBox(tr("Show ground plane"),display);m_ground->setChecked(true);m_compare=new QCheckBox(tr("Compare with defaults (split view)"),display);m_compare->setToolTip(tr("Split the object between the current material and its default values."));
     m_grid=new QCheckBox(tr("Ground grid with axis directions"),display);m_grid->setChecked(true);m_grid->setToolTip(tr("NifSkope-style grid on the ground: X axis red, Z axis blue, direction labels at the ends."));
-    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
+    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
     auto* referenceRow=new QWidget(display);auto* referenceLayout=new QHBoxLayout(referenceRow);referenceLayout->setContentsMargins(0,0,0,0);referenceLayout->setSpacing(5);
     auto* referenceLoad=new QPushButton(tr("Load…"),referenceRow);referenceLoad->setToolTip(tr("Show a second read-only material beside this one with a synchronized camera. Lighting and environment are snapshotted when the reference loads."));
     auto* referenceClear=new QPushButton(tr("Clear"),referenceRow);referenceClear->setEnabled(false);
@@ -4362,6 +4492,14 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     };
     connect(m_bloom,&QCheckBox::toggled,this,applyBloom);
     connect(m_bloomStrength,qOverload<double>(&QDoubleSpinBox::valueChanged),this,applyBloom);
+    const auto applySsao=[this]{
+        m_ssaoStrength->setEnabled(m_ssao->isChecked());
+        m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));
+        m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));
+        savePreviewSettings();
+    };
+    connect(m_ssao,&QCheckBox::toggled,this,applySsao);
+    connect(m_ssaoStrength,qOverload<double>(&QDoubleSpinBox::valueChanged),this,applySsao);
     connect(m_tonemap,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int index){
         m_materialCanvas->setTonemapOperator(index);
         m_referenceCanvas->setTonemapOperator(index);
@@ -4575,7 +4713,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
     m_shape->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/shape"),0).toInt(),0,3));
     m_planeOrientation->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/planeOrientation"),0).toInt(),0,2));m_twoSided->setChecked(s.value(QStringLiteral("Preview/twoSided"),true).toBool());
     m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(QStringLiteral("Preview/debug"),0).toInt(),0,20));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
-    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
+    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
     const int aaIndex=m_antiAliasing->findData(s.value(QStringLiteral("Preview/antiAliasing"),4).toInt());m_antiAliasing->setCurrentIndex(aaIndex>=0?aaIndex:2);m_materialCanvas->setMsaaSamples(m_antiAliasing->currentData().toInt());
     {
         const auto restoreField=[&s](DragNumericEdit* field,const QString& key){QSignalBlocker blocker(field);field->setValue(s.value(key,0.0).toDouble());};
@@ -4599,7 +4737,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
 void MaterialPreviewWidget::savePreviewSettings() const
 {
     const bool preserveManual=m_manualLightStored&&m_deriveExrLighting->isChecked();
-    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
+    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
 }
 
 void MaterialPreviewWidget::reloadPreviewCubemaps()

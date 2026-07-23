@@ -113,6 +113,7 @@ public:
     void setTonemapOperator(int op);
     void setTurntable(bool enabled, float degreesPerSecond);
     QImage captureScreenshot();
+    void setSsao(bool enabled, float strength);
     void setGroundEnabled(bool enabled);
     void setGridEnabled(bool enabled);
     void setFreeCamera(bool enabled);
@@ -215,8 +216,11 @@ private:
     std::unique_ptr<QOpenGLShaderProgram> m_lineProgram;
     std::unique_ptr<QOpenGLShaderProgram> m_bloomProgram;      // bright pass + separable blur
     std::unique_ptr<QOpenGLShaderProgram> m_compositeProgram;  // scene + bloom
-    std::unique_ptr<QOpenGLFramebufferObject> m_sceneFbo;      // resolved scene when bloom is on
+    std::unique_ptr<QOpenGLFramebufferObject> m_sceneFbo;      // resolved scene when any post pass is on
     std::unique_ptr<QOpenGLFramebufferObject> m_bloomFboA, m_bloomFboB; // half-res ping-pong
+    std::unique_ptr<QOpenGLShaderProgram> m_ssaoProgram;
+    std::unique_ptr<QOpenGLFramebufferObject> m_ssaoFboA, m_ssaoFboB;  // half-res AO + blur ping-pong
+    GLuint m_sceneDepthTexture = 0; // sampleable D24S8 attached to m_sceneFbo for SSAO
     std::unique_ptr<QOpenGLVertexArrayObject> m_gridVao;
     QOpenGLBuffer m_gridBuffer{QOpenGLBuffer::VertexBuffer};
     int m_gridVertexCount = 0;
@@ -366,6 +370,8 @@ private:
     float m_turntableSpeed = 20.0f;
     qint64 m_turntableLastMs = 0;
     bool m_screenshotMode = false; // true while grabFramebuffer captures without overlays
+    bool m_ssaoEnabled = true;
+    float m_ssaoStrength = 0.5f;
     bool m_groundEnabled = true, m_shadowsEnabled = true, m_comparisonEnabled = false;
     bool m_gridEnabled = true;
     // Navigation gizmo interaction state.
@@ -530,6 +536,8 @@ private:
     DragNumericEdit* m_debugSplit = nullptr;
     QCheckBox* m_bloom = nullptr;
     DragNumericEdit* m_bloomStrength = nullptr;
+    QCheckBox* m_ssao = nullptr;
+    DragNumericEdit* m_ssaoStrength = nullptr;
     QCheckBox* m_compare = nullptr;
     QLabel* m_importStatus = nullptr;
     // Dynamic surface-state simulation controls (States tab): one slider per
