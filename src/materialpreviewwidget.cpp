@@ -263,7 +263,10 @@ PbrPreviewGL::~PbrPreviewGL()
     m_bloomProgram.reset(); m_compositeProgram.reset(); m_sceneFbo.reset(); m_bloomFboA.reset(); m_bloomFboB.reset();
     m_ssaoProgram.reset(); m_ssaoFboA.reset(); m_ssaoFboB.reset();
     if (m_sceneDepthTexture) { glDeleteTextures(1, &m_sceneDepthTexture); m_sceneDepthTexture = 0; }
-    m_traceProgram.reset(); m_presentProgram.reset(); m_accumFboA.reset(); m_accumFboB.reset();
+    m_traceProgram.reset(); m_presentProgram.reset(); m_denoiseProgram.reset();
+    m_accumFboA.reset(); m_accumFboB.reset(); m_denoiseFboA.reset(); m_denoiseFboB.reset();
+    if (m_auxTextureA) { glDeleteTextures(1, &m_auxTextureA); m_auxTextureA = 0; }
+    if (m_auxTextureB) { glDeleteTextures(1, &m_auxTextureB); m_auxTextureB = 0; }
     if (m_bvhNodesTexture) { glDeleteTextures(1, &m_bvhNodesTexture); m_bvhNodesTexture = 0; }
     if (m_bvhTrianglesTexture) { glDeleteTextures(1, &m_bvhTrianglesTexture); m_bvhTrianglesTexture = 0; }
     if (m_bvhNodesBuffer) { glDeleteBuffers(1, &m_bvhNodesBuffer); m_bvhNodesBuffer = 0; }
@@ -2698,24 +2701,28 @@ void PbrPreviewGL::initializeGL()
     m_traceProgram = std::make_unique<QOpenGLShaderProgram>();
     static const char* traceFragment = R"GLSL(
         #version 330 core
-        in vec2 vUv;out vec4 fragColor;
+        in vec2 vUv;
+        layout(location=0) out vec4 fragColor;
+        layout(location=1) out vec4 fragAux; // first-hit shading normal + linear hit distance (denoiser guide)
         uniform samplerBuffer uBvhNodes,uBvhTriangles;
-        uniform sampler2D uBase,uRmaos,uEmissive,uAccum;
+        uniform sampler2D uBase,uNormal,uRmaos,uEmissive,uAccum;
         uniform samplerCube uEnvironment;
         uniform mat4 uInvViewProjection;
         uniform vec3 uCameraPosition,uKeyDirection,uKeyColor,uBaseFallback,uTint,uEmissiveColorFallback;
+        uniform vec3 uSubsurfaceProfileColor,uTransmissionTint;
         uniform vec2 uResolution;
-        uniform int uFrame,uSampleCount;
+        uniform int uFrame,uSampleCount,uSubsurfaceMode,uTriangleCount;
         uniform float uKeyIntensity,uEnvironmentYaw,uEnvironmentIntensity,uColorScale;
         uniform float uRoughnessFallback,uMetallicFallback,uAoFallback,uEmissiveMaskFallback,uEmissiveIntensity;
-        uniform bool uGroundEnabled,uUseBaseMap,uUseRmaosMap,uUseEmissiveMap;
+        uniform float uNormalStrength,uSubsurfaceWeight,uSubsurfaceTransmission,uSubsurfaceThickness;
+        uniform bool uGroundEnabled,uUseBaseMap,uUseRmaosMap,uUseEmissiveMap,uUseNormalMap,uNeeEnabled;
         const float PI=3.14159265359;
         const float GROUND_Y=-1.08;
         float rnd(inout uint s){s=s*747796405u+2891336453u;uint w=((s>>((s>>28u)+4u))^s)*277803737u;return float((w>>22u)^w)/4294967296.0;}
         vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
         vec3 environmentDirection(vec3 v){v=rotateY(v,radians(uEnvironmentYaw));return vec3(v.x,v.z,-v.y);}
         vec3 envRadiance(vec3 dir){return texture(uEnvironment,environmentDirection(dir)).rgb*uEnvironmentIntensity;}
-        struct Hit{float t;vec3 n;vec2 uv;bool ground;};
+        struct Hit{float t;vec3 n;vec2 uv;bool ground;int tri;};
         bool aabbHit(vec3 ro,vec3 rinv,vec3 bmin,vec3 bmax,float tMax){
             vec3 t1=(bmin-ro)*rinv,t2=(bmax-ro)*rinv;
             vec3 tminv=min(t1,t2),tmaxv=max(t1,t2);
@@ -2723,8 +2730,8 @@ void PbrPreviewGL::initializeGL()
             float tf=min(min(tmaxv.x,tmaxv.y),tmaxv.z);
             return tf>=max(tn,0.0)&&tn<tMax;
         }
-        bool traceScene(vec3 ro,vec3 rd,bool shadowOnly,out Hit hit){
-            hit.t=1e30;hit.ground=false;
+        bool traceScene(vec3 ro,vec3 rd,float tMax,bool shadowOnly,out Hit hit){
+            hit.t=tMax;hit.ground=false;hit.tri=-1;
             vec3 rinv=1.0/rd;
             // Ground disc first (analytic; matches the raster plane at y=-1.08, extent 5).
             if(uGroundEnabled&&abs(rd.y)>1e-6){
@@ -2755,13 +2762,24 @@ void PbrPreviewGL::initializeGL()
                     float t=dot(e2,qv)*invDet;
                     if(t<=0.001||t>=hit.t)continue;
                     vec4 d=texelFetch(uBvhTriangles,i*8+3),e=texelFetch(uBvhTriangles,i*8+4),f=texelFetch(uBvhTriangles,i*8+5);
-                    hit.t=t;hit.ground=false;
+                    hit.t=t;hit.ground=false;hit.tri=i;
                     hit.n=normalize(d.xyz*(1.0-u-v)+e.xyz*u+f.xyz*v);
                     hit.uv=vec2(a.w,b.w)*(1.0-u-v)+vec2(c.w,d.w)*u+vec2(e.w,f.w)*v;
                     if(shadowOnly)return true;
                 }
             }
-            return hit.t<1e29;
+            return hit.t<tMax;
+        }
+        vec3 shadingNormal(Hit hit,vec3 n){
+            if(hit.ground||hit.tri<0||!uUseNormalMap)return n;
+            vec4 tw=texelFetch(uBvhTriangles,hit.tri*8+6);
+            vec3 t=tw.xyz;
+            if(dot(t,t)<1e-8)return n;
+            t=normalize(t-n*dot(t,n));
+            vec3 b=cross(n,t)*tw.w;
+            vec2 nm=(texture(uNormal,hit.uv).rg*2.0-1.0)*uNormalStrength; // RG normal (BC5 layout)
+            float nz=sqrt(max(1.0-dot(nm,nm),0.0));
+            return normalize(t*nm.x+b*nm.y+n*nz);
         }
         void material(Hit hit,out vec3 base,out float rough,out float metal,out float ao,out vec3 emission){
             if(hit.ground){base=vec3(0.62);rough=0.85;metal=0.0;ao=1.0;emission=vec3(0);return;}
@@ -2794,7 +2812,7 @@ void PbrPreviewGL::initializeGL()
             vec3 h=normalize(t*cos(phi)*sinTheta+b*sin(phi)*sinTheta+n*cosTheta);
             return reflect(-v,h);
         }
-        vec3 directLight(vec3 p,vec3 n,vec3 v,vec3 base,float rough,float metal,inout uint seed){
+        vec3 directLight(vec3 p,vec3 gn,vec3 n,vec3 v,vec3 base,float rough,float metal,bool ground,inout uint seed){
             if(uKeyIntensity<=0.0)return vec3(0);
             // Cone-jittered key direction for soft shadows.
             vec3 l=normalize(uKeyDirection);
@@ -2803,16 +2821,69 @@ void PbrPreviewGL::initializeGL()
             float r1=rnd(seed)*6.2831853,r2=rnd(seed)*0.03;
             l=normalize(l+t*cos(r1)*r2+b*sin(r1)*r2);
             float NoL=dot(n,l);
+            vec3 result=vec3(0);
+            if(NoL>0.0){
+                Hit shadowHit;
+                if(!traceScene(p+gn*0.002,l,1e30,true,shadowHit)){
+                    vec3 h=normalize(v+l);
+                    float NoV=max(dot(n,v),0.001),NoH=max(dot(n,h),0.0),VoH=max(dot(v,h),0.0);
+                    vec3 f0=mix(vec3(0.04),base,metal);
+                    float alpha=rough*rough,k=(rough+1.0)*(rough+1.0)/8.0;
+                    vec3 spec=dGgx(NoH,alpha)*g1(NoL,k)*g1(NoV,k)*fresnel(VoH,f0)/max(4.0*NoL*NoV,0.001);
+                    vec3 diffuse=base*(1.0-metal)/PI;
+                    result=(diffuse+spec)*uKeyColor*uKeyIntensity*NoL;
+                }
+            }
+            // Subsurface mirrors the raster model (unshadowed by design: wrap
+            // fills the terminator, transmission is light through the body).
+            if(!ground&&uSubsurfaceMode>0){
+                vec3 scatterTint=uSubsurfaceProfileColor;
+                float wrap=.45;
+                float wrapped=max((NoL+wrap)/(1.0+wrap),0.0);
+                if(uSubsurfaceMode==1||uSubsurfaceMode==3)
+                    result+=base*scatterTint*uSubsurfaceWeight*max(wrapped-max(NoL,0.0),0.0)*uKeyColor*uKeyIntensity;
+                if(uSubsurfaceMode==2||uSubsurfaceMode==3){
+                    float back=max(dot(-n,l),0.0);
+                    result+=base*scatterTint*pow(max(uTransmissionTint,vec3(.001)),vec3(2.2))*uSubsurfaceTransmission*back*uSubsurfaceThickness*uKeyColor*uKeyIntensity;
+                }
+            }
+            return result;
+        }
+        vec3 emissiveAt(vec2 uv){
+            vec4 s=uUseEmissiveMap?texture(uEmissive,uv):vec4(0);
+            return (uUseEmissiveMap?pow(s.rgb,vec3(2.2))*s.a
+                                   :pow(uEmissiveColorFallback,vec3(2.2))*uEmissiveMaskFallback)*uEmissiveIntensity;
+        }
+        // Next-event estimation toward emissive geometry: uniform triangle pick
+        // with the per-triangle area folded into the pdf, diffuse response only
+        // (specular paths keep collecting emission implicitly).
+        vec3 sampleEmissive(vec3 p,vec3 gn,vec3 n,vec3 base,float metal,inout uint seed){
+            if(!uNeeEnabled||uTriangleCount<=0)return vec3(0);
+            int idx=min(int(rnd(seed)*float(uTriangleCount)),uTriangleCount-1);
+            float area=texelFetch(uBvhTriangles,idx*8+7).x;
+            if(area<=1e-9)return vec3(0);
+            vec4 a=texelFetch(uBvhTriangles,idx*8),b=texelFetch(uBvhTriangles,idx*8+1),c=texelFetch(uBvhTriangles,idx*8+2);
+            float r1=rnd(seed),r2=rnd(seed);
+            if(r1+r2>1.0){r1=1.0-r1;r2=1.0-r2;}
+            vec3 q=a.xyz+b.xyz*r1+c.xyz*r2;
+            vec4 d=texelFetch(uBvhTriangles,idx*8+3),e=texelFetch(uBvhTriangles,idx*8+4),f=texelFetch(uBvhTriangles,idx*8+5);
+            vec2 quv=vec2(a.w,b.w)*(1.0-r1-r2)+vec2(c.w,d.w)*r1+vec2(e.w,f.w)*r2;
+            vec3 emission=emissiveAt(quv);
+            if(max(emission.r,max(emission.g,emission.b))<=1e-5)return vec3(0);
+            vec3 toQ=q-p;
+            float dist2=dot(toQ,toQ);
+            if(dist2<1e-6)return vec3(0);
+            float dist=sqrt(dist2);
+            vec3 l=toQ/dist;
+            float NoL=dot(n,l);
             if(NoL<=0.0)return vec3(0);
+            float cosLight=abs(dot(normalize(cross(b.xyz,c.xyz)),l));
+            if(cosLight<=1e-4)return vec3(0);
             Hit shadowHit;
-            if(traceScene(p+n*0.002,l,true,shadowHit))return vec3(0);
-            vec3 h=normalize(v+l);
-            float NoV=max(dot(n,v),0.001),NoH=max(dot(n,h),0.0),VoH=max(dot(v,h),0.0);
-            vec3 f0=mix(vec3(0.04),base,metal);
-            float alpha=rough*rough,k=(rough+1.0)*(rough+1.0)/8.0;
-            vec3 spec=dGgx(NoH,alpha)*g1(NoL,k)*g1(NoV,k)*fresnel(VoH,f0)/max(4.0*NoL*NoV,0.001);
+            if(traceScene(p+gn*0.002,l,dist-0.004,true,shadowHit))return vec3(0);
+            float pdfArea=1.0/(float(uTriangleCount)*area);
             vec3 diffuse=base*(1.0-metal)/PI;
-            return (diffuse+spec)*uKeyColor*uKeyIntensity*NoL;
+            return diffuse*emission*(NoL*cosLight/dist2)/pdfArea;
         }
         void main(){
             uint seed=uint(gl_FragCoord.x)*1973u+uint(gl_FragCoord.y)*9277u+uint(uFrame)*26699u+1u;
@@ -2822,31 +2893,41 @@ void PbrPreviewGL::initializeGL()
             vec3 rd=normalize(pw.xyz/pw.w-uCameraPosition);
             vec3 ro=uCameraPosition;
             vec3 radiance=vec3(0),throughput=vec3(1);
+            bool specularPath=true; // camera rays count as specular for the NEE split
+            fragAux=vec4(0,0,0,1e8);
             for(int bounce=0;bounce<3;++bounce){
                 Hit hit;
-                if(!traceScene(ro,rd,false,hit)){radiance+=throughput*envRadiance(rd);break;}
+                if(!traceScene(ro,rd,1e30,false,hit)){radiance+=throughput*envRadiance(rd);break;}
                 vec3 p=ro+rd*hit.t;
-                vec3 n=hit.n;if(dot(n,rd)>0.0)n=-n;
+                vec3 gn=hit.n;if(dot(gn,rd)>0.0)gn=-gn;
+                vec3 n=shadingNormal(hit,gn);
                 vec3 v=-rd;
                 vec3 base;float rough,metal,ao;vec3 emission;
                 material(hit,base,rough,metal,ao,emission);
-                radiance+=throughput*emission;
-                radiance+=throughput*directLight(p,n,v,base,rough,metal,seed);
+                if(bounce==0)fragAux=vec4(n,hit.t);
+                // NEE covers the diffuse response, so diffuse-continued paths
+                // skip implicit emission; specular paths keep it (mirror glows).
+                if(specularPath||!uNeeEnabled)radiance+=throughput*emission;
+                radiance+=throughput*directLight(p,gn,n,v,base,rough,metal,hit.ground,seed);
+                radiance+=throughput*sampleEmissive(p,gn,n,base,metal,seed);
                 if(bounce==2)break;
                 // Russian-roulette-free continuation: pick diffuse or specular
                 // with equal probability and compensate by 2x.
                 vec3 f0=mix(vec3(0.04),base,metal);
                 if(rnd(seed)<0.5){
                     rd=cosineSample(n,seed);
+                    if(dot(rd,gn)<=0.0)break; // shading normal sent it under the surface
                     throughput*=base*(1.0-metal)*2.0*mix(1.0,ao,0.85); // cosine pdf cancels NoL/PI
+                    specularPath=false;
                 }else{
                     rd=ggxSample(n,v,rough,seed);
-                    if(dot(rd,n)<=0.0)break;
+                    if(dot(rd,gn)<=0.0||dot(rd,n)<=0.0)break;
                     vec3 h=normalize(v+rd);
                     throughput*=fresnel(max(dot(v,h),0.0),f0)*g1(max(dot(n,rd),0.001),rough*rough*0.5)*2.0;
+                    specularPath=true;
                 }
                 if(max(throughput.r,max(throughput.g,throughput.b))<0.005)break;
-                ro=p+n*0.002;
+                ro=p+gn*0.002;
             }
             radiance=clamp(radiance,vec3(0),vec3(60.0)); // fireflies
             vec3 previous=texture(uAccum,vUv).rgb;
@@ -2857,12 +2938,45 @@ void PbrPreviewGL::initializeGL()
     if (!m_traceProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
         || !m_traceProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, traceFragment)
         || !m_traceProgram->link()) recordShaderFailure("trace", m_traceProgram->log());
+    // Edge-avoiding a-trous denoiser for the tracer's young frames, guided by
+    // the first-hit normal/depth aux buffer; faded out as samples accumulate.
+    m_denoiseProgram = std::make_unique<QOpenGLShaderProgram>();
+    static const char* denoiseFragment = R"GLSL(
+        #version 330 core
+        in vec2 vUv;out vec4 fragColor;
+        uniform sampler2D uColor,uAux;
+        uniform vec2 uTexel;
+        uniform int uStepSize;
+        void main(){
+            vec4 caux=texture(uAux,vUv);
+            vec3 cn=caux.xyz;float cd=caux.w;
+            bool cbg=dot(cn,cn)<0.25; // background pixels only mix with background
+            const float kernel[3]=float[3](0.375,0.25,0.0625);
+            vec3 sum=vec3(0);float wsum=0.0;
+            for(int j=-2;j<=2;++j)for(int i=-2;i<=2;++i){
+                vec2 suv=vUv+vec2(float(i),float(j))*uTexel*float(uStepSize);
+                vec4 saux=texture(uAux,suv);
+                bool sbg=dot(saux.xyz,saux.xyz)<0.25;
+                float nw=(cbg||sbg)?((cbg&&sbg)?1.0:0.0):pow(max(dot(cn,saux.xyz),0.0),24.0);
+                float dw=exp(-abs(cd-saux.w)/(abs(cd)*0.25+0.05)); // loose: grazing ground has steep per-texel depth slope
+                float w=kernel[abs(i)]*kernel[abs(j)]*nw*dw;
+                if(isnan(w)||isinf(w))w=0.0;
+                sum+=texture(uColor,suv).rgb*w;wsum+=w;
+            }
+            vec3 result=wsum>1e-6?sum/wsum:texture(uColor,vUv).rgb;
+            if(any(isnan(result)))result=texture(uColor,vUv).rgb;
+            fragColor=vec4(result,1.0);
+        }
+    )GLSL";
+    if (!m_denoiseProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
+        || !m_denoiseProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, denoiseFragment)
+        || !m_denoiseProgram->link()) recordShaderFailure("denoise", m_denoiseProgram->log());
     m_presentProgram = std::make_unique<QOpenGLShaderProgram>();
     static const char* presentFragment = R"GLSL(
         #version 330 core
         in vec2 vUv;out vec4 fragColor;
-        uniform sampler2D uSource;
-        uniform float uExposure;
+        uniform sampler2D uSource,uFiltered;
+        uniform float uExposure,uDenoiseMix;
         uniform int uTonemapOperator;
         vec3 agxContrast(vec3 x){vec3 x2=x*x;vec3 x4=x2*x2;return 15.5*x4*x2-40.14*x4*x+31.96*x4-6.868*x2*x+0.4298*x2+0.1191*x-0.00232;}
         vec3 tonemap(vec3 c){
@@ -2878,7 +2992,7 @@ void PbrPreviewGL::initializeGL()
             else{c=clamp(c,0.0,1.0);}
             return pow(max(c,vec3(0)),vec3(1.0/2.2));
         }
-        void main(){fragColor=vec4(tonemap(texture(uSource,vUv).rgb),1.0);}
+        void main(){fragColor=vec4(tonemap(mix(texture(uSource,vUv).rgb,texture(uFiltered,vUv).rgb,uDenoiseMix)),1.0);}
     )GLSL";
     if (!m_presentProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
         || !m_presentProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, presentFragment)
@@ -3679,6 +3793,9 @@ struct TraceTriangle {
     QVector3D n0, n1, n2;
     QVector2D uv0, uv1, uv2;
     QVector3D centroid;
+    QVector3D tangent;  // geometric, from UV edge deltas (world space)
+    float handedness = 1.0f;
+    float area = 0.0f;
 };
 
 struct TraceNode {
@@ -3746,6 +3863,14 @@ void PbrPreviewGL::uploadTraceBvh()
             tri.n0 = mapNormal(a.normal); tri.n1 = mapNormal(b.normal); tri.n2 = mapNormal(c.normal);
             tri.uv0 = a.uv0; tri.uv1 = b.uv0; tri.uv2 = c.uv0;
             tri.centroid = tri.v0 + (tri.e1 + tri.e2) / 3.0f;
+            tri.area = QVector3D::crossProduct(tri.e1, tri.e2).length() * 0.5f;
+            // Geometric tangent from the UV parameterization; handedness from
+            // the authored vertex tangent so mirrored islands flip correctly.
+            const QVector2D duv1 = tri.uv1 - tri.uv0, duv2 = tri.uv2 - tri.uv0;
+            const float uvDet = duv1.x() * duv2.y() - duv2.x() * duv1.y();
+            if (std::abs(uvDet) > 1e-12f) tri.tangent = (tri.e1 * duv2.y() - tri.e2 * duv1.y()) / uvDet;
+            if (tri.tangent.lengthSquared() > 1e-10f) tri.tangent.normalize(); else tri.tangent = QVector3D();
+            tri.handedness = a.tangent.w() < 0.0f ? -1.0f : 1.0f;
             triangles.append(tri);
         }
     }
@@ -3762,7 +3887,8 @@ void PbrPreviewGL::uploadTraceBvh()
         nodeData << n.bmin.x() << n.bmin.y() << n.bmin.z() << float(n.leftFirst)
                  << n.bmax.x() << n.bmax.y() << n.bmax.z() << float(n.count);
     }
-    // Triangles: 8 RGBA32F texels — v0/e1/e2 (w carries uv), n0/n1/n2 (w carries uv), 2 spare-free.
+    // Triangles: 8 RGBA32F texels — v0/e1/e2 (w carries uv), n0/n1/n2 (w carries uv),
+    // texel 6 = geometric tangent + handedness, texel 7 = area (for emissive NEE).
     QVector<float> triData; triData.reserve(triangles.size() * 32);
     for (const TraceTriangle& t : triangles) {
         triData << t.v0.x() << t.v0.y() << t.v0.z() << t.uv0.x()
@@ -3771,8 +3897,8 @@ void PbrPreviewGL::uploadTraceBvh()
                 << t.n0.x() << t.n0.y() << t.n0.z() << t.uv1.y()
                 << t.n1.x() << t.n1.y() << t.n1.z() << t.uv2.x()
                 << t.n2.x() << t.n2.y() << t.n2.z() << t.uv2.y()
-                << 0.0f << 0.0f << 0.0f << 0.0f
-                << 0.0f << 0.0f << 0.0f << 0.0f;
+                << t.tangent.x() << t.tangent.y() << t.tangent.z() << t.handedness
+                << t.area << 0.0f << 0.0f << 0.0f;
     }
     const auto uploadBuffer = [this](GLuint& buffer, GLuint& texture, const QVector<float>& data) {
         if (!buffer) glGenBuffers(1, &buffer);
@@ -3800,6 +3926,13 @@ void PbrPreviewGL::setPathTraced(bool enabled)
     update();
 }
 
+void PbrPreviewGL::setTraceDenoise(bool enabled)
+{
+    if (m_traceDenoise == enabled) return;
+    m_traceDenoise = enabled;
+    update();
+}
+
 void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
 {
     if (m_bvhDirty) uploadTraceBvh();
@@ -3808,6 +3941,27 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
         accumFormat.setInternalTextureFormat(GL_RGBA32F);
         m_accumFboA = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
         m_accumFboB = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
+        m_denoiseFboA = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
+        m_denoiseFboB = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
+        // Attachment 1 = first-hit normal + distance, the denoiser's edge
+        // guide. Hand-attached (same pattern as the scene depth texture) so
+        // there is no ambiguity about who owns or binds it.
+        const auto makeAux = [this, pixelWidth, pixelHeight](QOpenGLFramebufferObject& fbo, GLuint& texture) {
+            if (texture) glDeleteTextures(1, &texture);
+            glGenTextures(1, &texture);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, pixelWidth, pixelHeight, 0, GL_RGBA, GL_FLOAT, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo.handle());
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, texture, 0);
+        };
+        makeAux(*m_accumFboA, m_auxTextureA);
+        makeAux(*m_accumFboB, m_auxTextureB);
+        glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
         m_accumSamples = 0;
     }
     // Any change in what the tracer can see restarts accumulation.
@@ -3826,17 +3980,19 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     glDisable(GL_DEPTH_TEST);
     m_accumFboB->bind();
     glViewport(0, 0, pixelWidth, pixelHeight);
+    static const GLenum traceBuffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    glDrawBuffers(2, traceBuffers);
     m_traceProgram->bind();
     m_traceProgram->setUniformValue("uBvhNodes", 22);
     m_traceProgram->setUniformValue("uBvhTriangles", 23);
     glActiveTexture(GL_TEXTURE22); glBindTexture(GL_TEXTURE_BUFFER, m_bvhNodesTexture);
     glActiveTexture(GL_TEXTURE23); glBindTexture(GL_TEXTURE_BUFFER, m_bvhTrianglesTexture);
     glActiveTexture(GL_TEXTURE0);
-    m_baseTexture->bind(0); m_rmaosTexture->bind(2); m_emissiveTexture->bind(3); m_environmentTexture->bind(5);
-    m_accumFboA->texture(); // ensure created
+    m_baseTexture->bind(0); m_normalTexture->bind(1); m_rmaosTexture->bind(2); m_emissiveTexture->bind(3); m_environmentTexture->bind(5);
     glActiveTexture(GL_TEXTURE7); glBindTexture(GL_TEXTURE_2D, m_accumFboA->texture());
     glActiveTexture(GL_TEXTURE0);
     m_traceProgram->setUniformValue("uBase", 0);
+    m_traceProgram->setUniformValue("uNormal", 1);
     m_traceProgram->setUniformValue("uRmaos", 2);
     m_traceProgram->setUniformValue("uEmissive", 3);
     m_traceProgram->setUniformValue("uEnvironment", 5);
@@ -3855,6 +4011,31 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     m_traceProgram->setUniformValue("uUseBaseMap", m_hasBase && !m_overrideBaseColor);
     m_traceProgram->setUniformValue("uUseRmaosMap", m_hasRmaos);
     m_traceProgram->setUniformValue("uUseEmissiveMap", m_hasEmissive);
+    m_traceProgram->setUniformValue("uUseNormalMap", m_hasNormal && !m_overrideNormal);
+    m_traceProgram->setUniformValue("uNormalStrength", m_normalStrength);
+    {
+        // Subsurface constants mirror the raster uniform block (map-driven
+        // scatter tint and curvature thickness are raster-only refinements).
+        const QJsonObject subsurface = m_document.settingGroup(QStringLiteral("Shading/Subsurface"));
+        const QString sssMode = subsurface.value(QStringLiteral("mode")).toString(QStringLiteral("Disabled"));
+        m_traceProgram->setUniformValue("uSubsurfaceMode",
+            sssMode == QStringLiteral("Diffusion Profile") ? 1 : (sssMode == QStringLiteral("Thin Transmission") ? 2 : (sssMode == QStringLiteral("Combined") ? 3 : 0)));
+        const QString profile = subsurface.value(QStringLiteral("profile")).toString(QStringLiteral("Skin"));
+        const QVector3D profileColor = profile == QStringLiteral("Wax") ? QVector3D(1, .72f, .4f)
+            : (profile == QStringLiteral("Flesh") ? QVector3D(1, .3f, .22f)
+            : (profile == QStringLiteral("Plant") ? QVector3D(.42f, .8f, .28f)
+            : (profile == QStringLiteral("Custom") ? jsonColor(subsurface, QStringLiteral("customScatterColor"), QStringLiteral("#FFB39D"))
+            : QVector3D(1, .55f, .42f))));
+        m_traceProgram->setUniformValue("uSubsurfaceProfileColor", profileColor);
+        m_traceProgram->setUniformValue("uSubsurfaceWeight", float(subsurface.value(QStringLiteral("weight")).toDouble(1.0)));
+        m_traceProgram->setUniformValue("uSubsurfaceTransmission", float(subsurface.value(QStringLiteral("transmission")).toDouble(0.0)));
+        m_traceProgram->setUniformValue("uTransmissionTint", jsonColor(subsurface, QStringLiteral("transmissionTint"), QStringLiteral("#FFFFFF")));
+        m_traceProgram->setUniformValue("uSubsurfaceThickness", float(subsurface.value(QStringLiteral("thicknessScale")).toDouble(1.0)));
+    }
+    const bool emissiveConstant = m_emissiveMask > 0.001f
+        && (m_emissiveColor.redF() + m_emissiveColor.greenF() + m_emissiveColor.blueF()) > 0.003;
+    m_traceProgram->setUniformValue("uNeeEnabled", m_emissiveIntensity > 0.001f && (m_hasEmissive || emissiveConstant));
+    m_traceProgram->setUniformValue("uTriangleCount", m_bvhTriangleCount);
     m_traceProgram->setUniformValue("uBaseFallback", QVector3D(m_baseColor.redF(), m_baseColor.greenF(), m_baseColor.blueF()));
     m_traceProgram->setUniformValue("uTint", QVector3D(m_tint.redF(), m_tint.greenF(), m_tint.blueF()));
     m_traceProgram->setUniformValue("uColorScale", m_colorScale);
@@ -3867,15 +4048,48 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     m_vao->bind();
     glDrawArrays(GL_TRIANGLES, 0, 3);
     m_traceProgram->release();
-    std::swap(m_accumFboA, m_accumFboB); // A now holds the freshest average
+    static const GLenum singleBuffer[1] = { GL_COLOR_ATTACHMENT0 };
+    glDrawBuffers(1, singleBuffer);
+    std::swap(m_accumFboA, m_accumFboB); // A now holds the freshest average + aux
+    std::swap(m_auxTextureA, m_auxTextureB);
+
+    // Edge-aware a-trous passes while the image is young; the guide buffer is
+    // the freshest first-hit normal/depth. Fades out by 96 spp.
+    const float denoiseMix = (m_traceDenoise && m_denoiseProgram && m_denoiseProgram->isLinked())
+        ? std::clamp(1.2f * (1.0f - float(m_accumSamples) / 96.0f), 0.0f, 1.0f) : 0.0f; // fully filtered below ~16 spp
+    GLuint filteredTexture = m_accumFboA->texture();
+    const GLuint auxTexture = m_auxTextureA;
+    if (denoiseMix > 0.001f) {
+        m_denoiseProgram->bind();
+        m_denoiseProgram->setUniformValue("uColor", 0);
+        m_denoiseProgram->setUniformValue("uAux", 1);
+        m_denoiseProgram->setUniformValue("uTexel", QVector2D(1.0f / float(pixelWidth), 1.0f / float(pixelHeight)));
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, auxTexture);
+        glActiveTexture(GL_TEXTURE0);
+        const int steps[3] = { 1, 2, 4 };
+        GLuint sourceTexture = filteredTexture;
+        for (int pass = 0; pass < 3; ++pass) {
+            QOpenGLFramebufferObject* target = (pass % 2 == 0) ? m_denoiseFboA.get() : m_denoiseFboB.get();
+            target->bind();
+            m_denoiseProgram->setUniformValue("uStepSize", steps[pass]);
+            glBindTexture(GL_TEXTURE_2D, sourceTexture);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            sourceTexture = target->texture();
+        }
+        m_denoiseProgram->release();
+        filteredTexture = sourceTexture;
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
     glViewport(0, 0, pixelWidth, pixelHeight);
     m_presentProgram->bind();
     m_presentProgram->setUniformValue("uSource", 0);
+    m_presentProgram->setUniformValue("uFiltered", 1);
+    m_presentProgram->setUniformValue("uDenoiseMix", denoiseMix);
     m_presentProgram->setUniformValue("uExposure", m_exposure);
     m_presentProgram->setUniformValue("uTonemapOperator", m_tonemapOperator);
-    glBindTexture(GL_TEXTURE_2D, m_accumFboA->texture());
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, filteredTexture);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, m_accumFboA->texture());
     glDrawArrays(GL_TRIANGLES, 0, 3);
     m_vao->release();
     m_presentProgram->release();
@@ -4776,11 +4990,15 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     m_ssaoStrength->setToolTip(tr("How strongly the occlusion darkens the scene."));
     ssaoLayout->addWidget(m_ssao);ssaoLayout->addWidget(m_ssaoStrength,1);
     m_antiAliasing=new QComboBox(display);m_antiAliasing->addItem(tr("Off"),1);m_antiAliasing->addItem(tr("MSAA 2x"),2);m_antiAliasing->addItem(tr("MSAA 4x"),4);m_antiAliasing->addItem(tr("MSAA 8x"),8);m_antiAliasing->setCurrentIndex(2);m_antiAliasing->setToolTip(tr("Multisampled viewport rendering. Editor preference only; never stored in the material."));
-    m_pathTrace=new QCheckBox(tr("Path-traced reference"),display);
-    m_pathTrace->setToolTip(tr("Progressive path tracing of the preview scene: true soft shadows, bounce light, and real reflections, converging while the camera is still. Reference simplifications: primary layer only, smooth vertex normals (no normal maps), no states or parallax. Bloom, SSAO, MSAA, and debug views pause while active."));
+    auto* traceRow=new QWidget(display);auto* traceLayout=new QHBoxLayout(traceRow);traceLayout->setContentsMargins(0,0,0,0);traceLayout->setSpacing(7);
+    m_pathTrace=new QCheckBox(tr("Path-traced reference"),traceRow);
+    m_pathTrace->setToolTip(tr("Progressive path tracing of the preview scene: true soft shadows, bounce light, emissive illumination, and real reflections, converging while the camera is still. Uses tangent-space normal maps and the material's subsurface settings. Reference simplifications: primary layer only, no states or parallax. Bloom, SSAO, MSAA, and debug views pause while active."));
+    m_traceDenoise=new QCheckBox(tr("Denoise"),traceRow);m_traceDenoise->setChecked(true);m_traceDenoise->setEnabled(false);
+    m_traceDenoise->setToolTip(tr("Edge-aware filter over the young, noisy frames; fades out automatically as samples accumulate."));
+    traceLayout->addWidget(m_pathTrace);traceLayout->addStretch();traceLayout->addWidget(m_traceDenoise);
     m_ground=new QCheckBox(tr("Show ground plane"),display);m_ground->setChecked(true);m_compare=new QCheckBox(tr("Compare with defaults (split view)"),display);m_compare->setToolTip(tr("Split the object between the current material and its default values."));
     m_grid=new QCheckBox(tr("Ground grid with axis directions"),display);m_grid->setChecked(true);m_grid->setToolTip(tr("NifSkope-style grid on the ground: X axis red, Z axis blue, direction labels at the ends."));
-    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),m_pathTrace);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
+    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),traceRow);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
     auto* referenceRow=new QWidget(display);auto* referenceLayout=new QHBoxLayout(referenceRow);referenceLayout->setContentsMargins(0,0,0,0);referenceLayout->setSpacing(5);
     auto* referenceLoad=new QPushButton(tr("Load…"),referenceRow);referenceLoad->setToolTip(tr("Show a second read-only material beside this one with a synchronized camera. Lighting and environment are snapshotted when the reference loads."));
     auto* referenceClear=new QPushButton(tr("Clear"),referenceRow);referenceClear->setEnabled(false);
@@ -4929,6 +5147,11 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     connect(m_ssaoStrength,qOverload<double>(&QDoubleSpinBox::valueChanged),this,applySsao);
     connect(m_pathTrace,&QCheckBox::toggled,this,[this](bool checked){
         m_materialCanvas->setPathTraced(checked); // reference canvas stays rasterized
+        m_traceDenoise->setEnabled(checked);
+        savePreviewSettings();
+    });
+    connect(m_traceDenoise,&QCheckBox::toggled,this,[this](bool checked){
+        m_materialCanvas->setTraceDenoise(checked);
         savePreviewSettings();
     });
     connect(m_tonemap,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int index){
@@ -5144,7 +5367,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
     m_shape->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/shape"),0).toInt(),0,3));
     m_planeOrientation->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/planeOrientation"),0).toInt(),0,2));m_twoSided->setChecked(s.value(QStringLiteral("Preview/twoSided"),true).toBool());
     m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(QStringLiteral("Preview/debug"),0).toInt(),0,20));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
-    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));{QSignalBlocker pathTraceBlocker(m_pathTrace);m_pathTrace->setChecked(s.value(QStringLiteral("Preview/pathTraced"),false).toBool());}m_materialCanvas->setPathTraced(m_pathTrace->isChecked());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
+    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));{QSignalBlocker pathTraceBlocker(m_pathTrace),traceDenoiseBlocker(m_traceDenoise);m_pathTrace->setChecked(s.value(QStringLiteral("Preview/pathTraced"),false).toBool());m_traceDenoise->setChecked(s.value(QStringLiteral("Preview/traceDenoise"),true).toBool());}m_materialCanvas->setPathTraced(m_pathTrace->isChecked());m_materialCanvas->setTraceDenoise(m_traceDenoise->isChecked());m_traceDenoise->setEnabled(m_pathTrace->isChecked());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
     const int aaIndex=m_antiAliasing->findData(s.value(QStringLiteral("Preview/antiAliasing"),4).toInt());m_antiAliasing->setCurrentIndex(aaIndex>=0?aaIndex:2);m_materialCanvas->setMsaaSamples(m_antiAliasing->currentData().toInt());
     {
         const auto restoreField=[&s](DragNumericEdit* field,const QString& key){QSignalBlocker blocker(field);field->setValue(s.value(key,0.0).toDouble());};
@@ -5168,7 +5391,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
 void MaterialPreviewWidget::savePreviewSettings() const
 {
     const bool preserveManual=m_manualLightStored&&m_deriveExrLighting->isChecked();
-    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/pathTraced"),m_pathTrace->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
+    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/pathTraced"),m_pathTrace->isChecked());s.setValue(QStringLiteral("Preview/traceDenoise"),m_traceDenoise->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
 }
 
 void MaterialPreviewWidget::reloadPreviewCubemaps()
