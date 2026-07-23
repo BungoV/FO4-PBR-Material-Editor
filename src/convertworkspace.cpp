@@ -311,11 +311,11 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     m_preview = new MaterialPreviewWidget(splitter);
     connect(m_preview->canvas(), &PbrPreviewGL::meshTrianglePicked, this, &ConvertWorkspace::handleTrianglePicked);
     splitter->addWidget(m_preview);
-    // The 3D viewport opens at half the window width, matching the
+    // The 3D viewport opens at a third of the window width, matching the
     // authoring workspace.
-    splitter->setSizes({330, 630, 960});
+    splitter->setSizes({330, 950, 640});
     splitter->setStretchFactor(0, 0);
-    splitter->setStretchFactor(1, 1);
+    splitter->setStretchFactor(1, 2);
     splitter->setStretchFactor(2, 1);
     updatePreview(nullptr);
 

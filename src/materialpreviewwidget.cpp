@@ -1748,22 +1748,46 @@ void PbrPreviewGL::initializeGL()
             vec3 n=normalize(normal);
             float NoL=max(dot(n,normalize(uKeyDirection)),0.0);
             float slope=clamp(1.0-NoL,0.0,1.0);
-            float texelWorld=4.8/float(textureSize(uShadowMap,0).x); // ortho frustum is 4.8 world wide
+            float texelWorld=10.4/float(textureSize(uShadowMap,0).x); // ortho frustum width in world units
             vec3 offsetPosition=worldPosition+n*texelWorld*(1.5+2.5*slope);
             vec4 lightPosition=uShadowMatrix*vec4(offsetPosition,1.0);
             vec3 coordinate=lightPosition.xyz/lightPosition.w*.5+.5;
             if(any(lessThan(coordinate,vec3(0.0)))||any(greaterThan(coordinate,vec3(1.0))))return 1.0;
             vec2 texel=1.0/vec2(textureSize(uShadowMap,0));
             float bias=mix(.0006,.0025,slope);
+            float receiver=coordinate.z-bias;
+            // Contact-hardening (PCSS-style, Substance-Painter look): a small
+            // blocker search sets the penumbra — tight where the caster
+            // touches the receiver, wide and soft further away.
+            const vec2 poisson[16]=vec2[16](
+                vec2(-.94201624,-.39906216),vec2(.94558609,-.76890725),vec2(-.094184101,-.92938870),vec2(.34495938,.29387760),
+                vec2(-.91588581,.45771432),vec2(-.81544232,-.87912464),vec2(-.38277543,.27676845),vec2(.97484398,.75648379),
+                vec2(.44323325,-.97511554),vec2(.53742981,-.47373420),vec2(-.26496911,-.41893023),vec2(.79197514,.19090188),
+                vec2(-.24188840,.99706507),vec2(-.81409955,.91437590),vec2(.19984126,.78641367),vec2(.14383161,-.14100790));
+            float blockerSum=0.0;int blockerCount=0;
+            for(int i=0;i<16;i+=4){
+                float depthSample=texture(uShadowMap,coordinate.xy+poisson[i]*texel*3.0).r;
+                if(depthSample<receiver){blockerSum+=depthSample;++blockerCount;}
+            }
+            if(blockerCount==0)return 1.0;
+            float blocker=blockerSum/float(blockerCount);
+            float penumbra=clamp((receiver-blocker)*260.0,1.0,7.0);
             float occlusion=0.0;
-            for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x)
-                occlusion+=coordinate.z-bias>texture(uShadowMap,coordinate.xy+vec2(x,y)*texel).r?1.0:0.0;
-            return 1.0-uShadowIntensity*occlusion/9.0;
+            for(int i=0;i<16;++i)
+                occlusion+=receiver>texture(uShadowMap,coordinate.xy+poisson[i]*texel*penumbra).r?1.0:0.0;
+            occlusion/=16.0;
+            // Fade toward the shadow frustum border so the shadow can never
+            // end in a hard cut across the ground.
+            vec2 border=min(coordinate.xy,1.0-coordinate.xy);
+            float fade=smoothstep(0.0,.06,min(border.x,border.y));
+            return 1.0-uShadowIntensity*occlusion*fade;
         }
         void main(){
             if(uIsGround){
+                // Neutral light plane (Substance Painter's default-base look)
+                // so shadows and materials read against a clean backdrop.
                 float grid=min(abs(fract(vWorldPosition.x)-.5),abs(fract(vWorldPosition.z)-.5));
-                vec3 ground=mix(vec3(.11),vec3(.16),smoothstep(.015,.035,grid));
+                vec3 ground=mix(vec3(.55),vec3(.68),smoothstep(.015,.035,grid));
                 vec3 groundNormal=normalize(vNormal);float visibility=shadowVisibility(vWorldPosition,groundNormal);
                 float environmentLight=.35+.35*uEnvironmentIntensity;
                 if(uDerivedEnvironmentShadow)environmentLight*=mix(1.0,visibility,uDerivedEnvironmentShadowWeight);
@@ -2879,10 +2903,6 @@ void PbrPreviewGL::buildGridGeometry()
         line({-half,y,t},{half,y,t},colorZ);
     }
     m_gridVertexCount=int(data.size()/7);
-    // Trailing pair: the green vertical Y axis, drawn only in orthographic
-    // side views where the ground grid is edge-on.
-    const QVector4D yAxisColor(.42f,.78f,.35f,.95f);
-    line({0,y,0},{0,y+2.0f*half,0},yAxisColor);
     m_gridVao->bind();
     m_gridBuffer.bind();
     m_gridBuffer.allocate(data.constData(),int(data.size()*sizeof(float)));
@@ -2949,8 +2969,6 @@ void PbrPreviewGL::drawGrid()
     m_lineProgram->setUniformValue("uUseConstant",false);
     m_gridVao->bind();
     glDrawArrays(GL_LINES,0,m_gridVertexCount);
-    if(m_projection==Projection::Orthographic&&std::abs(m_pitch)<45.0f)
-        glDrawArrays(GL_LINES,m_gridVertexCount,2); // green Y axis in ortho side views
     m_gridVao->release();
     m_lineProgram->release();
     glDepthMask(GL_TRUE);
@@ -3232,8 +3250,10 @@ void PbrPreviewGL::renderShadowMap()
     QMatrix4x4 lightView,lightProjection;
     const QVector3D up=std::abs(QVector3D::dotProduct(direction,QVector3D(0,1,0)))>.95f
         ? QVector3D(0,0,1):QVector3D(0,1,0);
-    lightView.lookAt(direction*4.0f,QVector3D(),up);
-    lightProjection.ortho(-2.4f,2.4f,-2.4f,2.4f,.1f,8.0f);
+    // The frustum covers the whole ground plane so shadows never clip into a
+    // hard-edged parallelogram mid-plane.
+    lightView.lookAt(direction*6.0f,QVector3D(),up);
+    lightProjection.ortho(-5.2f,5.2f,-5.2f,5.2f,.1f,12.0f);
     m_shadowMatrix=lightProjection*lightView;
     if(!m_shadowsEnabled||m_shadowIntensity<=0.0f||!m_shadowProgram||!m_shadowProgram->isLinked()
         ||!m_shadowFramebuffer||!m_shadowDepthTexture||!m_mesh.isValid())return;
@@ -3664,11 +3684,14 @@ void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
         const int hover=navGizmoHitTest(event->position());
         if(hover!=m_navHover){m_navHover=hover;update();}
     }
+    // Camera bindings match the NifSkope build (Blender scheme): MMB orbit,
+    // Shift+MMB pan, Ctrl+MMB dolly, wheel zoom.
     if(m_dragButton==Qt::MiddleButton){
         if(event->modifiers()&Qt::ShiftModifier){const float scale=.0035f*m_distance;m_pan+=QVector2D(float(delta.x())*scale,float(-delta.y())*scale);}
+        else if(event->modifiers()&Qt::ControlModifier){m_distance=std::clamp(m_distance+float(delta.x()+delta.y())*.012f,.25f,25.0f);}
         else{m_yaw+=float(delta.x())*.5f;m_pitch=std::clamp(m_pitch+float(delta.y())*.5f,-89.9f,89.9f);}
         update();emit cameraChanged();
-    }else if(m_dragButton==Qt::RightButton){m_distance=std::clamp(m_distance+float(delta.x()+delta.y())*.012f,.25f,25.0f);update();emit cameraChanged();}
+    }
     else if(m_dragButton==Qt::LeftButton&&(event->modifiers()&Qt::ShiftModifier)){m_keyYaw+=float(delta.x())*.5f;m_keyPitch=std::clamp(m_keyPitch-float(delta.y())*.5f,-89.0f,89.0f);update();emit lightAnglesChanged(m_keyYaw,m_keyPitch);}
     else if(m_dragButton==Qt::LeftButton&&(event->modifiers()&Qt::ControlModifier)){
         // Ctrl+LMB spins the environment (and its derived lighting) around the object.
@@ -3828,9 +3851,9 @@ MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent) : QFrame(parent)
     // panel silently changes any combo under the cursor and savePreviewSettings
     // persists the accident (this is how projection kept flipping to ortho).
     for(QComboBox* combo:m_controls->findChildren<QComboBox*>())WheelFocusGuard::install(combo);
-    auto* help=new QLabel(tr("Viewport: MMB orbit • Shift+MMB pan • RMB dolly • wheel zoom • F frame • Shift+F fly • Ctrl+LMB spin environment"),this);
+    auto* help=new QLabel(tr("Viewport: MMB orbit • Shift+MMB pan • Ctrl+MMB dolly • wheel zoom • F frame • Shift+F fly • Ctrl+LMB spin environment"),this);
     help->setObjectName(QStringLiteral("Muted"));help->setWordWrap(true);
-    help->setToolTip(tr("Viewport controls: MMB orbit; Shift+MMB pan; RMB dolly; wheel zoom; Shift+LMB rotate the key light; Ctrl+LMB spin the environment (and its derived lighting) around the object; F frame; Shift+F free camera (WASD fly, Q/E down/up, wheel = speed); the top-right gizmo snaps axis views and orbits by drag; Numpad 1/3/7 axis views; Numpad 5 toggle projection."));
+    help->setToolTip(tr("Viewport controls (NifSkope scheme): MMB orbit; Shift+MMB pan; Ctrl+MMB dolly; wheel zoom; Shift+LMB rotate the key light; Ctrl+LMB spin the environment (and its derived lighting) around the object; F frame; Shift+F free camera (WASD fly, Q/E down/up, wheel = speed); the top-right gizmo snaps axis views and orbits by drag; Numpad 1/3/7 axis views; Numpad 5 toggle projection."));
     layout->addWidget(help);
     connect(m_materialCanvas,&PbrPreviewGL::lightAnglesChanged,this,[this](float yaw,float pitch){QSignalBlocker a(m_keyYaw),b(m_keyPitch);m_keyYaw->setValue(yaw);m_keyPitch->setValue(pitch);savePreviewSettings();});
     loadPreviewSettings();showFullMaterial();

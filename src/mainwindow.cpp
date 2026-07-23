@@ -237,11 +237,11 @@ void MainWindow::buildWindow()
     m_splitter->addWidget(side);
     m_splitter->addWidget(m_pages);
     m_splitter->addWidget(m_preview);
-    // The 3D viewport opens at half the window width by default; the pages
-    // pane and the preview share resize growth so the split character holds.
-    m_splitter->setSizes({210, 540, 750});
+    // The 3D viewport opens at a third of the window width by default; the
+    // pages pane and the preview share resize growth so the ratio holds.
+    m_splitter->setSizes({210, 795, 495});
     m_splitter->setStretchFactor(0, 0);
-    m_splitter->setStretchFactor(1, 1);
+    m_splitter->setStretchFactor(1, 2);
     m_splitter->setStretchFactor(2, 1);
     m_workspaceStack = new QStackedWidget(central);
     m_workspaceStack->addWidget(m_splitter);
