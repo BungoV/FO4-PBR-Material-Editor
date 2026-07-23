@@ -403,9 +403,12 @@ void MainWindow::buildMenus()
             tr("FO4 PBR Material Editor\n\nIndependent C++20/Qt 6 implementation for authoring experimental PBRM materials and future NifSkope integration.\n\nDeveloped by Bungo + Claude"));
     });
 
-    // Compile-time stamp so "which exe am I actually running?" is answerable
-    // at a glance - stale publish\ copies have caused real confusion.
-    auto* version = new QLabel(tr("C++ / Qt • PBRM V5 • build %1 %2").arg(QStringLiteral(__DATE__), QStringLiteral(__TIME__)), this);
+    // Build stamp so "which exe am I actually running?" is answerable at a
+    // glance. Read from the executable's own timestamp at RUNTIME: __TIME__
+    // froze at mainwindow.o's last compile and lied whenever later builds only
+    // touched other translation units.
+    const QDateTime linkTime = QFileInfo(QCoreApplication::applicationFilePath()).lastModified();
+    auto* version = new QLabel(tr("C++ / Qt • PBRM V5 • build %1").arg(linkTime.toString(QStringLiteral("MMM d yyyy HH:mm:ss"))), this);
     version->setObjectName(QStringLiteral("VersionBadge"));
     version->setToolTip(tr("Independent C++/Qt PBRM version 5 editor. The build stamp identifies the running binary."));
     statusBar()->addPermanentWidget(version);
