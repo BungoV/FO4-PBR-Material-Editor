@@ -3978,6 +3978,12 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     const QVector4D eye4 = view.inverted() * QVector4D(0, 0, 0, 1);
 
     glDisable(GL_DEPTH_TEST);
+    // The QPainter overlay pass leaves GL_BLEND enabled (and can leave a
+    // scissor). The average in attachment 0 is immune (alpha 1 -> plain copy),
+    // but the aux attachment writes alpha = hit distance, which alpha-blending
+    // turns into runaway feedback that destroys the denoiser's guide.
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
     m_accumFboB->bind();
     glViewport(0, 0, pixelWidth, pixelHeight);
     static const GLenum traceBuffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
@@ -4000,7 +4006,10 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     m_traceProgram->setUniformValue("uInvViewProjection", inverse);
     m_traceProgram->setUniformValue("uCameraPosition", eye4.toVector3DAffine());
     m_traceProgram->setUniformValue("uResolution", QVector2D(float(pixelWidth), float(pixelHeight)));
-    m_traceProgram->setUniformValue("uFrame", m_traceFrame);
+    // While the camera moves, every frame is sample #0. A fixed seed keeps the
+    // noise pattern deterministic so the filtered image is stable instead of
+    // boiling; once still, later samples vary the seed and converge normally.
+    m_traceProgram->setUniformValue("uFrame", m_accumSamples == 0 ? 0 : m_traceFrame);
     m_traceProgram->setUniformValue("uSampleCount", m_accumSamples);
     m_traceProgram->setUniformValue("uKeyDirection", keyDirection());
     m_traceProgram->setUniformValue("uKeyColor", QVector3D(m_keyColor.redF(), m_keyColor.greenF(), m_keyColor.blueF()));
@@ -4056,19 +4065,19 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     // Edge-aware a-trous passes while the image is young; the guide buffer is
     // the freshest first-hit normal/depth. Fades out by 96 spp.
     const float denoiseMix = (m_traceDenoise && m_denoiseProgram && m_denoiseProgram->isLinked())
-        ? std::clamp(1.2f * (1.0f - float(m_accumSamples) / 96.0f), 0.0f, 1.0f) : 0.0f; // fully filtered below ~16 spp
+        ? std::clamp(1.33f * (1.0f - float(m_accumSamples) / 128.0f), 0.0f, 1.0f) : 0.0f; // fully filtered below 32 spp, gone by 128
     GLuint filteredTexture = m_accumFboA->texture();
     const GLuint auxTexture = m_auxTextureA;
     if (denoiseMix > 0.001f) {
         m_denoiseProgram->bind();
         m_denoiseProgram->setUniformValue("uColor", 0);
-        m_denoiseProgram->setUniformValue("uAux", 1);
+        m_denoiseProgram->setUniformValue("uAux", 9);
         m_denoiseProgram->setUniformValue("uTexel", QVector2D(1.0f / float(pixelWidth), 1.0f / float(pixelHeight)));
-        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, auxTexture);
+        glActiveTexture(GL_TEXTURE9); glBindTexture(GL_TEXTURE_2D, auxTexture);
         glActiveTexture(GL_TEXTURE0);
-        const int steps[3] = { 1, 2, 4 };
+        const int steps[4] = { 1, 2, 4, 8 };
         GLuint sourceTexture = filteredTexture;
-        for (int pass = 0; pass < 3; ++pass) {
+        for (int pass = 0; pass < 4; ++pass) {
             QOpenGLFramebufferObject* target = (pass % 2 == 0) ? m_denoiseFboA.get() : m_denoiseFboB.get();
             target->bind();
             m_denoiseProgram->setUniformValue("uStepSize", steps[pass]);
