@@ -2814,6 +2814,17 @@ void PbrPreviewGL::initializeGL()
                                      :pow(uEmissiveColorFallback,vec3(2.2))*uEmissiveMaskFallback)*uEmissiveIntensity;
         }
         vec3 fresnel(float VoH,vec3 f0){return f0+(vec3(1.0)-f0)*pow(1.0-VoH,5.0);}
+        // Unoccluded split-sum IBL for a surface point - the raster's answer.
+        // Used to terminate paths gracefully (bounce cap, rays bent under the
+        // horizon by normal maps): every path ends in light, never in black.
+        vec3 iblApproximation(vec3 n,vec3 v,vec3 base,float rough,float metal,float ao){
+            vec3 f0=mix(vec3(0.04),base,metal);
+            vec2 envBrdf=texture(uBrdfLut,vec2(max(dot(n,v),0.001),rough)).rg;
+            vec3 spec=(f0*envBrdf.x+vec3(envBrdf.y))
+                *textureLod(uPrefilteredEnvironment,environmentDirection(reflect(-v,n)),rough*uPrefilteredEnvironmentMaxLod).rgb*uEnvironmentIntensity;
+            vec3 diff=base*(1.0-metal)*mix(1.0,ao,0.85)*diffuseIrradianceEnv(n);
+            return spec+diff;
+        }
         float dGgx(float NoH,float a){float a2=a*a;float d=NoH*NoH*(a2-1.0)+1.0;return a2/(PI*d*d);}
         float g1(float NoX,float k){return NoX/(NoX*(1.0-k)+k);}
         vec3 cosineSample(vec3 n,inout uint seed){
@@ -2948,7 +2959,7 @@ void PbrPreviewGL::initializeGL()
                 if(specularPath||!uNeeEnabled)radiance+=throughput*emission;
                 radiance+=throughput*directLight(p,gn,n,v,base,rough,metal,hit.ground,seed);
                 radiance+=throughput*sampleEmissive(p,gn,n,base,metal,seed);
-                if(bounce==2)break;
+                if(bounce==2){radiance+=throughput*iblApproximation(n,v,base,rough,metal,ao);break;} // cap: terminate into light
                 // Russian-roulette-free continuation: pick diffuse or specular
                 // with equal probability and compensate by 2x.
                 vec3 f0=mix(vec3(0.04),base,metal);
@@ -2960,7 +2971,7 @@ void PbrPreviewGL::initializeGL()
                 float pDiffuse=clamp(pd/max(pd+ps,1e-4),0.0,1.0);
                 if(rnd(seed)<pDiffuse){
                     rd=cosineSample(n,seed);
-                    if(dot(rd,gn)<=0.0)break; // shading normal sent it under the surface
+                    if(dot(rd,gn)<=0.0){radiance+=throughput*iblApproximation(n,v,base,rough,metal,ao);break;} // bent under the surface
                     throughput*=base*(1.0-metal)*mix(1.0,ao,0.85)/max(pDiffuse,1e-4); // cosine pdf cancels NoL/PI
                     specularPath=false;
                     pathRoughness=-1.0;
@@ -2970,7 +2981,7 @@ void PbrPreviewGL::initializeGL()
                     // LUT), lobe width deferred to the prefiltered env on miss.
                     // No stochastic lobe sampling = no specular sparkle.
                     rd=reflect(-v,n);
-                    if(dot(rd,gn)<=0.0||dot(rd,n)<=0.0)break;
+                    if(dot(rd,gn)<=0.0||dot(rd,n)<=0.0){radiance+=throughput*iblApproximation(n,v,base,rough,metal,ao);break;} // grazing normal-map bend
                     vec2 envBrdf=texture(uBrdfLut,vec2(max(dot(n,v),0.001),rough)).rg;
                     throughput*=(f0*envBrdf.x+vec3(envBrdf.y))/max(1.0-pDiffuse,1e-4);
                     specularPath=true;
