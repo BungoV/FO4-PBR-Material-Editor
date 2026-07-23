@@ -394,8 +394,8 @@ ColorPickerDialog::ColorPickerDialog(const QColor& initial, bool alphaEnabled, Q
     auto* cancel = new QPushButton(tr("Cancel"), this);
     auto* accept = new QPushButton(tr("OK"), this);
     accept->setDefault(true);
-    buttons->addWidget(cancel);
     buttons->addWidget(accept);
+    buttons->addWidget(cancel);
     outer->addLayout(buttons);
 
     const auto link = [this](QSlider* slider, QSpinBox* spin) {
