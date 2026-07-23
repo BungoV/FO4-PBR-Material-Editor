@@ -64,7 +64,9 @@ public:
         AmbientOcclusion = 5, F0 = 6, Emissive = 7, UvChecker = 8,
         Wireframe = 9, TangentBasis = 10, Opacity = 11, TangentNormal = 12,
         Height = 13, RoughnessMetallic = 14, Rmaos = 15, EmissiveMask = 16,
-        LayerCoverage = 17, EmissiveColor = 18, Curvature = 19, Validation = 20
+        LayerCoverage = 17, EmissiveColor = 18, Curvature = 19, Validation = 20,
+        // Converter comparison views: the ORIGINAL FO4/FO76 source maps.
+        SourceDiffuse = 21, SourceSpec = 22, SourceNormal = 23, SourceExtra = 24
     };
     enum class AxisView { Front, Back, Left, Right, Top, Bottom };
     struct EnvironmentLight {
@@ -110,6 +112,9 @@ public:
     void setDebugView(DebugView view);
     void setDebugViewLeft(DebugView view);
     void setDebugSplit(float fraction);
+    // Converter comparison: the pre-conversion source maps (diffuse, spec or
+    // reflectance, normal, lighting/greyscale) shown by the Source* views.
+    void setSourceComparisonImages(const QImage& diffuse, const QImage& spec, const QImage& normal, const QImage& extra);
     void setBloom(bool enabled, float strength);
     void setTonemapOperator(int op);
     void setTurntable(bool enabled, float degreesPerSecond);
@@ -244,6 +249,7 @@ private:
     QByteArray m_traceStateHash;
     void uploadTraceBvh();
     void renderPathTraced(int pixelWidth, int pixelHeight);
+    void uploadSourceComparisonTextures();
     std::unique_ptr<QOpenGLVertexArrayObject> m_gridVao;
     QOpenGLBuffer m_gridBuffer{QOpenGLBuffer::VertexBuffer};
     int m_gridVertexCount = 0;
@@ -386,6 +392,9 @@ private:
     Background m_background = Background::Cubemap;
     DebugView m_debugView = DebugView::Shaded;
     DebugView m_debugViewLeft = DebugView::Shaded; // left half of the split view
+    std::unique_ptr<QOpenGLTexture> m_sourceTextures[4]; // converter source maps (diffuse/spec/normal/extra)
+    QImage m_sourceImages[4];
+    bool m_sourceDirty = false;
     float m_debugSplit = 0.0f; // 0 = the map fills the view; else shaded left of the divider
     bool m_bloomEnabled = true;
     float m_bloomStrength = 0.4f;
@@ -472,7 +481,7 @@ private:
 class MaterialPreviewWidget final : public QFrame {
     Q_OBJECT
 public:
-    explicit MaterialPreviewWidget(QWidget* parent = nullptr);
+    explicit MaterialPreviewWidget(QWidget* parent = nullptr, bool converterMode = false);
     void setTextureRoot(const QString& textureRoot);
     void setMaterial(const Pbr::MaterialDocument& document);
     void reloadPreviewCubemaps();
@@ -535,6 +544,7 @@ private:
     QComboBox* m_lightingPreset = nullptr;
     QComboBox* m_tonemap = nullptr;
     QComboBox* m_debugLeft = nullptr;
+    const bool m_converterMode = false; // source-map views + session-scoped 50% split default
     QCheckBox* m_deriveExrLighting = nullptr;
     DragNumericEdit* m_keyIntensity = nullptr;
     DragNumericEdit* m_keyYaw = nullptr;

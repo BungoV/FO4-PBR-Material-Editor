@@ -262,6 +262,7 @@ PbrPreviewGL::~PbrPreviewGL()
     m_vao.reset(); m_groundVao.reset(); m_gridVao.reset(); m_highlightVao.reset(); m_lineProgram.reset(); m_program.reset(); m_backgroundProgram.reset();
     m_bloomProgram.reset(); m_compositeProgram.reset(); m_sceneFbo.reset(); m_bloomFboA.reset(); m_bloomFboB.reset();
     m_ssaoProgram.reset(); m_ssaoFboA.reset(); m_ssaoFboB.reset();
+    for (auto& sourceTexture : m_sourceTextures) sourceTexture.reset();
     if (m_sceneDepthTexture) { glDeleteTextures(1, &m_sceneDepthTexture); m_sceneDepthTexture = 0; }
     m_traceProgram.reset(); m_presentProgram.reset(); m_denoiseProgram.reset();
     m_accumFboA.reset(); m_accumFboB.reset(); m_denoiseFboA.reset(); m_denoiseFboB.reset();
@@ -1140,6 +1141,30 @@ void PbrPreviewGL::setProjection(Projection value) { if(m_projection==value)retu
 void PbrPreviewGL::setBackground(Background value) { m_background = value; update(); }
 void PbrPreviewGL::setDebugView(DebugView value) { m_debugView = value; update(); }
 void PbrPreviewGL::setDebugViewLeft(DebugView value) { m_debugViewLeft = value; update(); }
+
+void PbrPreviewGL::setSourceComparisonImages(const QImage& diffuse, const QImage& spec, const QImage& normal, const QImage& extra)
+{
+    m_sourceImages[0] = diffuse; m_sourceImages[1] = spec; m_sourceImages[2] = normal; m_sourceImages[3] = extra;
+    m_sourceDirty = true;
+    update();
+}
+
+void PbrPreviewGL::uploadSourceComparisonTextures()
+{
+    for (int i = 0; i < 4; ++i) {
+        QImage image = m_sourceImages[i];
+        if (image.isNull()) {
+            image = QImage(2, 2, QImage::Format_RGBA8888);
+            image.fill(QColor(40, 40, 44)); // "no such source map"
+        }
+        m_sourceTextures[i] = std::make_unique<QOpenGLTexture>(image.convertToFormat(QImage::Format_RGBA8888).mirrored(),
+            QOpenGLTexture::DontGenerateMipMaps);
+        m_sourceTextures[i]->setMinificationFilter(QOpenGLTexture::Linear);
+        m_sourceTextures[i]->setMagnificationFilter(QOpenGLTexture::Linear);
+        m_sourceTextures[i]->setWrapMode(QOpenGLTexture::Repeat);
+    }
+    m_sourceDirty = false;
+}
 void PbrPreviewGL::setDebugSplit(float fraction) { m_debugSplit = std::clamp(fraction, 0.0f, 0.98f); update(); }
 void PbrPreviewGL::setTonemapOperator(int op) { m_tonemapOperator = std::clamp(op, 0, 3); update(); }
 
@@ -1540,6 +1565,7 @@ void PbrPreviewGL::initializeGL()
         uniform bool uDynamicInvert,uGlassThinWalled,uWaterShoreFoam,uDecalEnabled;
         uniform bool uMirrorPrimaryUv;
         uniform int uTonemapOperator;
+        uniform sampler2D uSource0,uSource1,uSource2,uSource3; // converter source maps
         const float PI=3.14159265359;
         vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
         vec2 addressUv(vec2 uv,int mode){
@@ -2345,6 +2371,11 @@ void PbrPreviewGL::initializeGL()
                 else if(luma>240.0/255.0)flag=vec3(0.2,0.55,1.0);                   // dielectric albedo too bright
                 fragColor=flag.r<0.0?vec4(vec3(luma*0.75),1.0):vec4(flag,1.0);return;
             }
+            // Converter source maps, shown exactly as stored in the file.
+            if(dbgView==21){fragColor=vec4(texture(uSource0,uv).rgb,1);return;}
+            if(dbgView==22){fragColor=vec4(texture(uSource1,uv).rgb,1);return;}
+            if(dbgView==23){fragColor=vec4(texture(uSource2,uv).rgb,1);return;}
+            if(dbgView==24){fragColor=vec4(texture(uSource3,uv).rgb,1);return;}
             if(unlitMaterial){vec3 unlit=base*uUnlitIntensity+particleEdgeGlow;if(uUnlitVertexColor)unlit*=vColor.rgb;fragColor=vec4(uUnlitExposure?tonemap(unlit):pow(max(unlit,vec3(0.0)),vec3(1.0/2.2)),opacity);return;}
             if(uSpecularAa&&!defaults){
                 // Tokuyoshi/Kaplanyan screen-space variance: widen the lobe where
@@ -4301,6 +4332,11 @@ void PbrPreviewGL::paintGL()
     m_secondaryBaseTexture->bind(6);m_secondaryNormalTexture->bind(7);m_secondaryRmaosTexture->bind(8);m_secondaryEmissiveTexture->bind(9);m_layerCoverageTexture->bind(10);m_gradientTexture->bind(11);
     m_tertiaryBaseTexture->bind(16);m_tertiaryNormalTexture->bind(17);m_tertiaryRmaosTexture->bind(18);m_tertiaryEmissiveTexture->bind(19);m_tertiaryCoverageTexture->bind(20);
     m_interiorTexture->bind(21);m_program->setUniformValue("uInterior",21);
+    if(m_sourceDirty)uploadSourceComparisonTextures();
+    if(m_sourceTextures[0]){
+        m_sourceTextures[0]->bind(24);m_sourceTextures[1]->bind(25);m_sourceTextures[2]->bind(26);m_sourceTextures[3]->bind(27);
+        m_program->setUniformValue("uSource0",24);m_program->setUniformValue("uSource1",25);m_program->setUniformValue("uSource2",26);m_program->setUniformValue("uSource3",27);
+    }
     m_program->setUniformValue("uInteriorEnabled",m_interiorEnabled);m_program->setUniformValue("uInteriorRooms",QVector2D(m_interiorRoomsU,m_interiorRoomsV));m_program->setUniformValue("uInteriorDepth",m_interiorDepth);m_program->setUniformValue("uInteriorBrightness",m_interiorBrightness);m_program->setUniformValue("uInteriorEmissive",m_interiorEmissive);
     m_program->setUniformValue("uBase",0);m_program->setUniformValue("uNormal",1);m_program->setUniformValue("uRmaos",2);m_program->setUniformValue("uEmissive",3);m_program->setUniformValue("uHeight",4);m_program->setUniformValue("uEnvironment",5);
     glActiveTexture(GL_TEXTURE15);glBindTexture(GL_TEXTURE_2D,m_shadowDepthTexture);m_program->setUniformValue("uShadowMap",15);m_program->setUniformValue("uShadowMatrix",m_shadowMatrix);m_program->setUniformValue("uShadowsEnabled",m_shadowsEnabled);m_program->setUniformValue("uShadowIntensity",m_shadowIntensity);m_program->setUniformValue("uDerivedEnvironmentShadow",m_derivedEnvironmentShadow);m_program->setUniformValue("uDerivedEnvironmentShadowWeight",m_derivedEnvironmentShadowWeight);
@@ -4851,7 +4887,7 @@ void PbrPreviewGL::leaveEvent(QEvent* event)
     QOpenGLWidget::leaveEvent(event);
 }
 
-MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent) : QFrame(parent)
+MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent, bool converterMode) : QFrame(parent), m_converterMode(converterMode)
 {
     setObjectName(QStringLiteral("PreviewPanel"));
     auto* layout=new QVBoxLayout(this);layout->setContentsMargins(8,8,8,8);layout->setSpacing(6);
@@ -5076,6 +5112,13 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     addRenderMode(tr("Emissive Color"),PbrPreviewGL::DebugView::EmissiveColor);addRenderMode(tr("Emissive Mask"),PbrPreviewGL::DebugView::EmissiveMask);addRenderMode(tr("Emissive (Final)"),PbrPreviewGL::DebugView::Emissive);addRenderMode(tr("Layer Coverage"),PbrPreviewGL::DebugView::LayerCoverage);
     addRenderMode(tr("Curvature (Normal.A)"),PbrPreviewGL::DebugView::Curvature);
     addRenderMode(tr("PBR Validation"),PbrPreviewGL::DebugView::Validation);
+    if(m_converterMode){
+        // Compare the converted channels against the ORIGINAL game maps.
+        addRenderMode(tr("Source Diffuse (FO4/76)"),PbrPreviewGL::DebugView::SourceDiffuse);
+        addRenderMode(tr("Source Spec / Reflectance"),PbrPreviewGL::DebugView::SourceSpec);
+        addRenderMode(tr("Source Normal"),PbrPreviewGL::DebugView::SourceNormal);
+        addRenderMode(tr("Source Lighting / Greyscale"),PbrPreviewGL::DebugView::SourceExtra);
+    }
     addRenderMode(tr("UV Checker"),PbrPreviewGL::DebugView::UvChecker);addRenderMode(tr("Wireframe"),PbrPreviewGL::DebugView::Wireframe);addRenderMode(tr("Tangent Basis"),PbrPreviewGL::DebugView::TangentBasis);
     m_debugSplit=new DragNumericEdit(display);
     m_debugSplit->setRange(0.0,98.0);
@@ -5475,8 +5518,8 @@ void MaterialPreviewWidget::loadPreviewSettings()
     QSignalBlocker l(m_keyIntensity),m(m_keyYaw),n(m_keyPitch),o(m_environmentIntensity),p(m_environmentYaw),q(m_exposure),r(m_temperature),shadowBlocker(m_shadows),shadowIntensityBlocker(m_shadowIntensity),deriveBlocker(m_deriveExrLighting),presetBlocker(m_lightingPreset);
     m_shape->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/shape"),0).toInt(),0,3));
     m_planeOrientation->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/planeOrientation"),0).toInt(),0,2));m_twoSided->setChecked(s.value(QStringLiteral("Preview/twoSided"),true).toBool());
-    m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(QStringLiteral("Preview/debug"),0).toInt(),0,20));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
-    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker leftBlocker(m_debugLeft);const int leftIndex=m_debugLeft->findData(std::clamp(s.value(QStringLiteral("Preview/debugLeft"),0).toInt(),0,20));m_debugLeft->setCurrentIndex(leftIndex>=0?leftIndex:0);}m_materialCanvas->setDebugViewLeft(static_cast<PbrPreviewGL::DebugView>(m_debugLeft->currentData().toInt()));{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));{QSignalBlocker pathTraceBlocker(m_pathTrace),traceDenoiseBlocker(m_traceDenoise);m_pathTrace->setChecked(s.value(QStringLiteral("Preview/pathTraced"),false).toBool());m_traceDenoise->setChecked(s.value(QStringLiteral("Preview/traceDenoise"),true).toBool());}m_materialCanvas->setPathTraced(m_pathTrace->isChecked());m_materialCanvas->setTraceDenoise(m_traceDenoise->isChecked());m_traceDenoise->setEnabled(m_pathTrace->isChecked());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
+    m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(m_converterMode?QStringLiteral("Preview/convDebug"):QStringLiteral("Preview/debug"),0).toInt(),0,24));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
+    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(m_converterMode?50.0:s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker leftBlocker(m_debugLeft);const int leftIndex=m_debugLeft->findData(std::clamp(s.value(m_converterMode?QStringLiteral("Preview/convDebugLeft"):QStringLiteral("Preview/debugLeft"),0).toInt(),0,24));m_debugLeft->setCurrentIndex(leftIndex>=0?leftIndex:0);}m_materialCanvas->setDebugViewLeft(static_cast<PbrPreviewGL::DebugView>(m_debugLeft->currentData().toInt()));{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));{QSignalBlocker pathTraceBlocker(m_pathTrace),traceDenoiseBlocker(m_traceDenoise);m_pathTrace->setChecked(s.value(QStringLiteral("Preview/pathTraced"),false).toBool());m_traceDenoise->setChecked(s.value(QStringLiteral("Preview/traceDenoise"),true).toBool());}m_materialCanvas->setPathTraced(m_pathTrace->isChecked());m_materialCanvas->setTraceDenoise(m_traceDenoise->isChecked());m_traceDenoise->setEnabled(m_pathTrace->isChecked());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
     const int aaIndex=m_antiAliasing->findData(s.value(QStringLiteral("Preview/antiAliasing"),4).toInt());m_antiAliasing->setCurrentIndex(aaIndex>=0?aaIndex:2);m_materialCanvas->setMsaaSamples(m_antiAliasing->currentData().toInt());
     {
         const auto restoreField=[&s](DragNumericEdit* field,const QString& key){QSignalBlocker blocker(field);field->setValue(s.value(key,0.0).toDouble());};
@@ -5500,7 +5543,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
 void MaterialPreviewWidget::savePreviewSettings() const
 {
     const bool preserveManual=m_manualLightStored&&m_deriveExrLighting->isChecked();
-    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/debugLeft"),m_debugLeft->currentData());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/pathTraced"),m_pathTrace->isChecked());s.setValue(QStringLiteral("Preview/traceDenoise"),m_traceDenoise->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
+    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(m_converterMode?QStringLiteral("Preview/convDebug"):QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());if(!m_converterMode)s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(m_converterMode?QStringLiteral("Preview/convDebugLeft"):QStringLiteral("Preview/debugLeft"),m_debugLeft->currentData());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/pathTraced"),m_pathTrace->isChecked());s.setValue(QStringLiteral("Preview/traceDenoise"),m_traceDenoise->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
 }
 
 void MaterialPreviewWidget::reloadPreviewCubemaps()

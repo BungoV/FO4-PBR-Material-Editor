@@ -17,6 +17,7 @@ class QListWidget;
 class QPushButton;
 class QSpinBox;
 class QThread;
+class QTimer;
 class QTreeWidget;
 class QTreeWidgetItem;
 class MaterialPreviewWidget;
@@ -115,6 +116,8 @@ private:
     QPushButton* m_maskSave = nullptr;
     QLabel* m_maskStatus = nullptr;
 
+    QTimer* m_liveReconvert = nullptr;   // debounced reconvert while override sliders move
+    QString m_sourceImagesFor;           // material whose source maps are loaded in the preview
     QHash<QString, MaterialOverride> m_overrides;
     QHash<QString, MaskState> m_masks;
     QVector<int> m_maskElements;      // cached element ids for the loaded mesh

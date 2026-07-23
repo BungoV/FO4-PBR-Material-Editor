@@ -1,9 +1,11 @@
 #include "convertworkspace.h"
 
+#include "bgsmreader.h"
 #include "dragnumericedit.h"
 #include "maskpaint.h"
 #include "materialdocument.h"
 #include "materialpreviewwidget.h"
+#include "textureimage.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -25,6 +27,7 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QThread>
+#include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
@@ -247,10 +250,33 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
             m_overrides.remove(key);
         }
     };
-    connect(m_overrideEnabled, &QCheckBox::toggled, this, storeOverride);
-    connect(m_overrideRecovery, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
-    connect(m_overrideGlossCurve, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
-    connect(m_overrideSpecPercentile, qOverload<double>(&QDoubleSpinBox::valueChanged), this, storeOverride);
+    // Live tuning: moving a slider implies override intent, so the checkbox
+    // self-enables, the override stores, and a debounced reconvert of the
+    // selected material refreshes the preview without pressing the button.
+    m_liveReconvert = new QTimer(this);
+    m_liveReconvert->setSingleShot(true);
+    connect(m_liveReconvert, &QTimer::timeout, this, [this] {
+        if (m_running) { m_liveReconvert->start(400); return; } // a run is in flight; retry shortly
+        QTreeWidgetItem* item = m_queue->currentItem();
+        const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
+        if (row < 0 || row >= m_entries.size()) return;
+        startRun(false, RunScope::CurrentRow);
+    });
+    const auto liveAdjust = [this, storeOverride] {
+        if (!m_overrideEnabled->isChecked()) {
+            const QSignalBlocker blocker(m_overrideEnabled);
+            m_overrideEnabled->setChecked(true);
+        }
+        storeOverride();
+        m_liveReconvert->start(500);
+    };
+    connect(m_overrideEnabled, &QCheckBox::toggled, this, [this, storeOverride] {
+        storeOverride();
+        m_liveReconvert->start(500);
+    });
+    connect(m_overrideRecovery, qOverload<double>(&QDoubleSpinBox::valueChanged), this, liveAdjust);
+    connect(m_overrideGlossCurve, qOverload<double>(&QDoubleSpinBox::valueChanged), this, liveAdjust);
+    connect(m_overrideSpecPercentile, qOverload<double>(&QDoubleSpinBox::valueChanged), this, liveAdjust);
 
     // Correction masking: load the material's reference NIF, click parts in
     // the preview to force dielectric/metal, save the 0.5-neutral sidecar.
@@ -308,7 +334,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     // ---- Far right: the same live 3D preview the editor uses, showing the
     // selected material's CONVERTED sibling with the output mod folder as
     // its texture root.
-    m_preview = new MaterialPreviewWidget(splitter);
+    m_preview = new MaterialPreviewWidget(splitter, /*converterMode=*/true);
     connect(m_preview->canvas(), &PbrPreviewGL::meshTrianglePicked, this, &ConvertWorkspace::handleTrianglePicked);
     splitter->addWidget(m_preview);
     // The 3D viewport opens at a third of the window width, matching the
@@ -603,6 +629,25 @@ void ConvertWorkspace::updateDetail()
 
 void ConvertWorkspace::updatePreview(const QueueEntry* entry)
 {
+    // Source-map comparison: load the ORIGINAL game textures for the Source*
+    // render modes so the split view can pair them with converted channels.
+    const QString sourceKey = entry ? entry->materialPath : QString();
+    if (sourceKey != m_sourceImagesFor) {
+        m_sourceImagesFor = sourceKey;
+        QImage diffuse, spec, normal, extra;
+        Bgsm::Material source;
+        if (!sourceKey.isEmpty() && Bgsm::readFile(sourceKey, &source, nullptr)) {
+            const QString textureRoot = m_textureRootEdit->text().trimmed();
+            const auto loadMap = [&textureRoot](const QString& authored) {
+                return authored.isEmpty() ? QImage() : TextureImage::load(authored, textureRoot, nullptr);
+            };
+            diffuse = loadMap(source.diffuseTexture);
+            spec = loadMap(!source.specularTexture.isEmpty() ? source.specularTexture : source.smoothSpecTexture);
+            normal = loadMap(source.normalTexture);
+            extra = loadMap(!source.lightingTexture.isEmpty() ? source.lightingTexture : source.greyscaleTexture);
+        }
+        m_preview->canvas()->setSourceComparisonImages(diffuse, spec, normal, extra);
+    }
     // The preview always resolves against the output mod folder; converted
     // siblings carry portable Textures-relative paths.
     m_preview->setTextureRoot(QDir::fromNativeSeparators(m_outputEdit->text().trimmed())
