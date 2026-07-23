@@ -171,7 +171,13 @@ PreviewMesh sphere(int segments, int rings)
         // The old inward winding was hidden while culling was disabled, but
         // exposed the back hemisphere as a dark "hole" once material-sidedness
         // began controlling GL back-face culling.
-        mesh.indices << a << a + 1 << b << a + 1 << b + 1 << b;
+        // Alternate the quad diagonal checkerboard-style: one consistent
+        // diagonal biases the normal-interpolation error directionally, which
+        // glossy shading reveals as pole-centred spokes on the sphere.
+        if ((x + y) & 1)
+            mesh.indices << a << a + 1 << b << a + 1 << b + 1 << b;
+        else
+            mesh.indices << a << a + 1 << b + 1 << a << b + 1 << b;
     }
     mesh.submeshes.push_back({QStringLiteral("Sphere"), 0, int(mesh.indices.size())});
     mesh.radius = 1.0f;

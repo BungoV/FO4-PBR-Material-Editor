@@ -44,7 +44,7 @@ enum class PlaneOrientation { XY, XZ, YZ };
 PreviewMesh plane(PlaneOrientation orientation = PlaneOrientation::XY, bool twoSided = true);
 PreviewMesh planeGrid(PlaneOrientation orientation = PlaneOrientation::XY, int subdivisions = 64);
 PreviewMesh cube();
-PreviewMesh sphere(int segments = 64, int rings = 32);
+PreviewMesh sphere(int segments = 128, int rings = 64);
 void normalizeAndCenter(PreviewMesh& mesh);
 void generateMissingNormals(PreviewMesh& mesh);
 void generateTangents(PreviewMesh& mesh, int uvSet = 0);
