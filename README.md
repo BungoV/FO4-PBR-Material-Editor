@@ -118,9 +118,18 @@ scratch for this project and do not depend on Bethesda's Material Editor.
   cube, sphere, or imported static FBX/Fallout 4 NIF mesh. It includes UV0/UV1 and submesh
   selection, perspective/orthographic and axis views, a generated studio
   cubemap, DDS cubemaps and floating-point 2:1 OpenEXR preview environments,
-  an independently rotatable key light, lighting presets, exposure, backgrounds,
-  a ground plane, adjustable real-time key-light shadows, comparison, and
-  material debug views.
+  an independently rotatable key light, lighting presets (including Rim
+  Backlight and Overhead Softbox studio rigs), exposure, selectable tonemap
+  operators (ACES, AgX, Reinhard, Linear), backgrounds, a ground plane,
+  PCSS-style contact-hardening key-light shadows, depth-based SSAO, bloom,
+  a camera turntable, overlay-free PNG viewport screenshots, comparison,
+  material debug views, and a Substance-style PBR Validation render mode
+  that false-colors non-physical albedo/metallic values.
+  A progressive path-traced reference mode (BVH-accelerated, 1 spp/frame up
+  to 512 spp) renders true soft area shadows, bounce light, and traced
+  reflections for ground-truth material checks; it simplifies to the primary
+  layer with smooth vertex normals and pauses raster-only effects while
+  active.
   Specular image-based lighting uses a GGX-prefiltered cubemap across its full
   roughness mip range and a generated split-sum BRDF lookup table; the sharp
   source cubemap remains separate for the background and mirror reflections.
