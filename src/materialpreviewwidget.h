@@ -114,6 +114,8 @@ public:
     void setTurntable(bool enabled, float degreesPerSecond);
     QImage captureScreenshot();
     void setSsao(bool enabled, float strength);
+    void setPathTraced(bool enabled);
+    bool pathTraced() const { return m_pathTraced; }
     void setGroundEnabled(bool enabled);
     void setGridEnabled(bool enabled);
     void setFreeCamera(bool enabled);
@@ -221,6 +223,21 @@ private:
     std::unique_ptr<QOpenGLShaderProgram> m_ssaoProgram;
     std::unique_ptr<QOpenGLFramebufferObject> m_ssaoFboA, m_ssaoFboB;  // half-res AO + blur ping-pong
     GLuint m_sceneDepthTexture = 0; // sampleable D24S8 attached to m_sceneFbo for SSAO
+    // Path-traced reference mode: mesh BVH in texture buffers, progressive
+    // 1 spp/frame accumulation in float ping-pong targets, tonemap at present.
+    std::unique_ptr<QOpenGLShaderProgram> m_traceProgram, m_presentProgram;
+    std::unique_ptr<QOpenGLFramebufferObject> m_accumFboA, m_accumFboB;
+    GLuint m_bvhNodesBuffer = 0, m_bvhNodesTexture = 0;         // 2 RGBA32F texels per node
+    GLuint m_bvhTrianglesBuffer = 0, m_bvhTrianglesTexture = 0; // 8 RGBA32F texels per triangle
+    int m_bvhNodeCount = 0, m_bvhTriangleCount = 0;
+    bool m_bvhDirty = true;
+    bool m_pathTraced = false;
+    int m_accumSamples = 0;
+    int m_traceFrame = 0;
+    int m_materialGeneration = 0;
+    QByteArray m_traceStateHash;
+    void uploadTraceBvh();
+    void renderPathTraced(int pixelWidth, int pixelHeight);
     std::unique_ptr<QOpenGLVertexArrayObject> m_gridVao;
     QOpenGLBuffer m_gridBuffer{QOpenGLBuffer::VertexBuffer};
     int m_gridVertexCount = 0;
@@ -538,6 +555,7 @@ private:
     DragNumericEdit* m_bloomStrength = nullptr;
     QCheckBox* m_ssao = nullptr;
     DragNumericEdit* m_ssaoStrength = nullptr;
+    QCheckBox* m_pathTrace = nullptr;
     QCheckBox* m_compare = nullptr;
     QLabel* m_importStatus = nullptr;
     // Dynamic surface-state simulation controls (States tab): one slider per

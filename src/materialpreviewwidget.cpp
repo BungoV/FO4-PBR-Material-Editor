@@ -263,6 +263,11 @@ PbrPreviewGL::~PbrPreviewGL()
     m_bloomProgram.reset(); m_compositeProgram.reset(); m_sceneFbo.reset(); m_bloomFboA.reset(); m_bloomFboB.reset();
     m_ssaoProgram.reset(); m_ssaoFboA.reset(); m_ssaoFboB.reset();
     if (m_sceneDepthTexture) { glDeleteTextures(1, &m_sceneDepthTexture); m_sceneDepthTexture = 0; }
+    m_traceProgram.reset(); m_presentProgram.reset(); m_accumFboA.reset(); m_accumFboB.reset();
+    if (m_bvhNodesTexture) { glDeleteTextures(1, &m_bvhNodesTexture); m_bvhNodesTexture = 0; }
+    if (m_bvhTrianglesTexture) { glDeleteTextures(1, &m_bvhTrianglesTexture); m_bvhTrianglesTexture = 0; }
+    if (m_bvhNodesBuffer) { glDeleteBuffers(1, &m_bvhNodesBuffer); m_bvhNodesBuffer = 0; }
+    if (m_bvhTrianglesBuffer) { glDeleteBuffers(1, &m_bvhTrianglesBuffer); m_bvhTrianglesBuffer = 0; }
     m_environmentPrefilterProgram.reset(); m_brdfIntegrationProgram.reset(); m_shadowProgram.reset();
     doneCurrent();
 }
@@ -1296,6 +1301,7 @@ void PbrPreviewGL::setObjectTransform(const QVector3D& rotationDegrees, const QV
     }
     m_objectRotation = rotationDegrees;
     m_objectTranslation = translation;
+    m_bvhDirty = true; // trace triangles are stored with the model transform baked in
     update();
 }
 
@@ -2686,6 +2692,197 @@ void PbrPreviewGL::initializeGL()
     if (!m_ssaoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
         || !m_ssaoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, ssaoFragment)
         || !m_ssaoProgram->link()) recordShaderFailure("ssao", m_ssaoProgram->log());
+    // Path-traced reference: BVH traversal + 1 spp progressive accumulation.
+    // Reference-mode simplifications: primary UV set only, smooth vertex
+    // normals (no tangent-space normal maps), no layers/states/parallax.
+    m_traceProgram = std::make_unique<QOpenGLShaderProgram>();
+    static const char* traceFragment = R"GLSL(
+        #version 330 core
+        in vec2 vUv;out vec4 fragColor;
+        uniform samplerBuffer uBvhNodes,uBvhTriangles;
+        uniform sampler2D uBase,uRmaos,uEmissive,uAccum;
+        uniform samplerCube uEnvironment;
+        uniform mat4 uInvViewProjection;
+        uniform vec3 uCameraPosition,uKeyDirection,uKeyColor,uBaseFallback,uTint,uEmissiveColorFallback;
+        uniform vec2 uResolution;
+        uniform int uFrame,uSampleCount;
+        uniform float uKeyIntensity,uEnvironmentYaw,uEnvironmentIntensity,uColorScale;
+        uniform float uRoughnessFallback,uMetallicFallback,uAoFallback,uEmissiveMaskFallback,uEmissiveIntensity;
+        uniform bool uGroundEnabled,uUseBaseMap,uUseRmaosMap,uUseEmissiveMap;
+        const float PI=3.14159265359;
+        const float GROUND_Y=-1.08;
+        float rnd(inout uint s){s=s*747796405u+2891336453u;uint w=((s>>((s>>28u)+4u))^s)*277803737u;return float((w>>22u)^w)/4294967296.0;}
+        vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
+        vec3 environmentDirection(vec3 v){v=rotateY(v,radians(uEnvironmentYaw));return vec3(v.x,v.z,-v.y);}
+        vec3 envRadiance(vec3 dir){return texture(uEnvironment,environmentDirection(dir)).rgb*uEnvironmentIntensity;}
+        struct Hit{float t;vec3 n;vec2 uv;bool ground;};
+        bool aabbHit(vec3 ro,vec3 rinv,vec3 bmin,vec3 bmax,float tMax){
+            vec3 t1=(bmin-ro)*rinv,t2=(bmax-ro)*rinv;
+            vec3 tminv=min(t1,t2),tmaxv=max(t1,t2);
+            float tn=max(max(tminv.x,tminv.y),tminv.z);
+            float tf=min(min(tmaxv.x,tmaxv.y),tmaxv.z);
+            return tf>=max(tn,0.0)&&tn<tMax;
+        }
+        bool traceScene(vec3 ro,vec3 rd,bool shadowOnly,out Hit hit){
+            hit.t=1e30;hit.ground=false;
+            vec3 rinv=1.0/rd;
+            // Ground disc first (analytic; matches the raster plane at y=-1.08, extent 5).
+            if(uGroundEnabled&&abs(rd.y)>1e-6){
+                float t=(GROUND_Y-ro.y)/rd.y;
+                if(t>0.001&&t<hit.t){
+                    vec3 p=ro+rd*t;
+                    if(abs(p.x)<=5.0&&abs(p.z)<=5.0){hit.t=t;hit.n=vec3(0,1,0);hit.uv=vec2(0);hit.ground=true;if(shadowOnly)return true;}
+                }
+            }
+            int stack[48];int sp=0;stack[sp++]=0;
+            while(sp>0){
+                int ni=stack[--sp];
+                vec4 t0=texelFetch(uBvhNodes,ni*2),t1=texelFetch(uBvhNodes,ni*2+1);
+                if(!aabbHit(ro,rinv,t0.xyz,t1.xyz,hit.t))continue;
+                int leftFirst=int(t0.w),count=int(t1.w);
+                if(count==0){
+                    if(sp<46){stack[sp++]=leftFirst;stack[sp++]=leftFirst+1;}
+                    continue;
+                }
+                for(int i=leftFirst;i<leftFirst+count;++i){
+                    vec4 a=texelFetch(uBvhTriangles,i*8),b=texelFetch(uBvhTriangles,i*8+1),c=texelFetch(uBvhTriangles,i*8+2);
+                    vec3 v0=a.xyz,e1=b.xyz,e2=c.xyz;
+                    vec3 pv=cross(rd,e2);float det=dot(e1,pv);
+                    if(abs(det)<1e-9)continue;
+                    float invDet=1.0/det;vec3 tv=ro-v0;
+                    float u=dot(tv,pv)*invDet;if(u<0.0||u>1.0)continue;
+                    vec3 qv=cross(tv,e1);float v=dot(rd,qv)*invDet;if(v<0.0||u+v>1.0)continue;
+                    float t=dot(e2,qv)*invDet;
+                    if(t<=0.001||t>=hit.t)continue;
+                    vec4 d=texelFetch(uBvhTriangles,i*8+3),e=texelFetch(uBvhTriangles,i*8+4),f=texelFetch(uBvhTriangles,i*8+5);
+                    hit.t=t;hit.ground=false;
+                    hit.n=normalize(d.xyz*(1.0-u-v)+e.xyz*u+f.xyz*v);
+                    hit.uv=vec2(a.w,b.w)*(1.0-u-v)+vec2(c.w,d.w)*u+vec2(e.w,f.w)*v;
+                    if(shadowOnly)return true;
+                }
+            }
+            return hit.t<1e29;
+        }
+        void material(Hit hit,out vec3 base,out float rough,out float metal,out float ao,out vec3 emission){
+            if(hit.ground){base=vec3(0.62);rough=0.85;metal=0.0;ao=1.0;emission=vec3(0);return;}
+            base=(uUseBaseMap?pow(texture(uBase,hit.uv).rgb,vec3(2.2)):pow(uBaseFallback,vec3(2.2)))*pow(uTint,vec3(2.2))*uColorScale;
+            if(uUseRmaosMap){vec4 rmaos=texture(uRmaos,hit.uv);rough=rmaos.r;metal=rmaos.g;ao=rmaos.b;}
+            else{rough=uRoughnessFallback;metal=uMetallicFallback;ao=uAoFallback;}
+            rough=max(rough,0.045);
+            vec4 emissiveSample=uUseEmissiveMap?texture(uEmissive,hit.uv):vec4(0);
+            emission=(uUseEmissiveMap?pow(emissiveSample.rgb,vec3(2.2))*emissiveSample.a
+                                     :pow(uEmissiveColorFallback,vec3(2.2))*uEmissiveMaskFallback)*uEmissiveIntensity;
+        }
+        vec3 fresnel(float VoH,vec3 f0){return f0+(vec3(1.0)-f0)*pow(1.0-VoH,5.0);}
+        float dGgx(float NoH,float a){float a2=a*a;float d=NoH*NoH*(a2-1.0)+1.0;return a2/(PI*d*d);}
+        float g1(float NoX,float k){return NoX/(NoX*(1.0-k)+k);}
+        vec3 cosineSample(vec3 n,inout uint seed){
+            float r1=rnd(seed),r2=rnd(seed);
+            float phi=6.2831853*r1,sr=sqrt(r2);
+            vec3 up=abs(n.y)<0.999?vec3(0,1,0):vec3(1,0,0);
+            vec3 t=normalize(cross(up,n)),b=cross(n,t);
+            return normalize(t*cos(phi)*sr+b*sin(phi)*sr+n*sqrt(max(0.0,1.0-r2)));
+        }
+        vec3 ggxSample(vec3 n,vec3 v,float rough,inout uint seed){
+            float a=rough*rough;
+            float r1=rnd(seed),r2=rnd(seed);
+            float phi=6.2831853*r1;
+            float cosTheta=sqrt((1.0-r2)/(1.0+(a*a-1.0)*r2));
+            float sinTheta=sqrt(max(0.0,1.0-cosTheta*cosTheta));
+            vec3 up=abs(n.y)<0.999?vec3(0,1,0):vec3(1,0,0);
+            vec3 t=normalize(cross(up,n)),b=cross(n,t);
+            vec3 h=normalize(t*cos(phi)*sinTheta+b*sin(phi)*sinTheta+n*cosTheta);
+            return reflect(-v,h);
+        }
+        vec3 directLight(vec3 p,vec3 n,vec3 v,vec3 base,float rough,float metal,inout uint seed){
+            if(uKeyIntensity<=0.0)return vec3(0);
+            // Cone-jittered key direction for soft shadows.
+            vec3 l=normalize(uKeyDirection);
+            vec3 up=abs(l.y)<0.999?vec3(0,1,0):vec3(1,0,0);
+            vec3 t=normalize(cross(up,l)),b=cross(l,t);
+            float r1=rnd(seed)*6.2831853,r2=rnd(seed)*0.03;
+            l=normalize(l+t*cos(r1)*r2+b*sin(r1)*r2);
+            float NoL=dot(n,l);
+            if(NoL<=0.0)return vec3(0);
+            Hit shadowHit;
+            if(traceScene(p+n*0.002,l,true,shadowHit))return vec3(0);
+            vec3 h=normalize(v+l);
+            float NoV=max(dot(n,v),0.001),NoH=max(dot(n,h),0.0),VoH=max(dot(v,h),0.0);
+            vec3 f0=mix(vec3(0.04),base,metal);
+            float alpha=rough*rough,k=(rough+1.0)*(rough+1.0)/8.0;
+            vec3 spec=dGgx(NoH,alpha)*g1(NoL,k)*g1(NoV,k)*fresnel(VoH,f0)/max(4.0*NoL*NoV,0.001);
+            vec3 diffuse=base*(1.0-metal)/PI;
+            return (diffuse+spec)*uKeyColor*uKeyIntensity*NoL;
+        }
+        void main(){
+            uint seed=uint(gl_FragCoord.x)*1973u+uint(gl_FragCoord.y)*9277u+uint(uFrame)*26699u+1u;
+            vec2 jitter=(vec2(rnd(seed),rnd(seed))-0.5)/uResolution;
+            vec2 ndc=(vUv+jitter)*2.0-1.0;
+            vec4 pw=uInvViewProjection*vec4(ndc,1.0,1.0);
+            vec3 rd=normalize(pw.xyz/pw.w-uCameraPosition);
+            vec3 ro=uCameraPosition;
+            vec3 radiance=vec3(0),throughput=vec3(1);
+            for(int bounce=0;bounce<3;++bounce){
+                Hit hit;
+                if(!traceScene(ro,rd,false,hit)){radiance+=throughput*envRadiance(rd);break;}
+                vec3 p=ro+rd*hit.t;
+                vec3 n=hit.n;if(dot(n,rd)>0.0)n=-n;
+                vec3 v=-rd;
+                vec3 base;float rough,metal,ao;vec3 emission;
+                material(hit,base,rough,metal,ao,emission);
+                radiance+=throughput*emission;
+                radiance+=throughput*directLight(p,n,v,base,rough,metal,seed);
+                if(bounce==2)break;
+                // Russian-roulette-free continuation: pick diffuse or specular
+                // with equal probability and compensate by 2x.
+                vec3 f0=mix(vec3(0.04),base,metal);
+                if(rnd(seed)<0.5){
+                    rd=cosineSample(n,seed);
+                    throughput*=base*(1.0-metal)*2.0*mix(1.0,ao,0.85); // cosine pdf cancels NoL/PI
+                }else{
+                    rd=ggxSample(n,v,rough,seed);
+                    if(dot(rd,n)<=0.0)break;
+                    vec3 h=normalize(v+rd);
+                    throughput*=fresnel(max(dot(v,h),0.0),f0)*g1(max(dot(n,rd),0.001),rough*rough*0.5)*2.0;
+                }
+                if(max(throughput.r,max(throughput.g,throughput.b))<0.005)break;
+                ro=p+n*0.002;
+            }
+            radiance=clamp(radiance,vec3(0),vec3(60.0)); // fireflies
+            vec3 previous=texture(uAccum,vUv).rgb;
+            vec3 average=uSampleCount==0?radiance:mix(previous,radiance,1.0/float(uSampleCount+1));
+            fragColor=vec4(average,1.0);
+        }
+    )GLSL";
+    if (!m_traceProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
+        || !m_traceProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, traceFragment)
+        || !m_traceProgram->link()) recordShaderFailure("trace", m_traceProgram->log());
+    m_presentProgram = std::make_unique<QOpenGLShaderProgram>();
+    static const char* presentFragment = R"GLSL(
+        #version 330 core
+        in vec2 vUv;out vec4 fragColor;
+        uniform sampler2D uSource;
+        uniform float uExposure;
+        uniform int uTonemapOperator;
+        vec3 agxContrast(vec3 x){vec3 x2=x*x;vec3 x4=x2*x2;return 15.5*x4*x2-40.14*x4*x+31.96*x4-6.868*x2*x+0.4298*x2+0.1191*x-0.00232;}
+        vec3 tonemap(vec3 c){
+            c*=exp2(uExposure);
+            if(uTonemapOperator==0){const float a=2.51,b=.03,d=2.43,e=.59,f=.14;c=clamp((c*(a*c+b))/(c*(d*c+e)+f),0.0,1.0);}
+            else if(uTonemapOperator==1){
+                const mat3 agxMat=mat3(0.842479062253094,0.0423282422610123,0.0423756549057051,0.0784335999999992,0.878468636469772,0.0784336,0.0792237451477643,0.0791661274605434,0.879142973793104);
+                const mat3 agxInv=mat3(1.19687900512017,-0.0528968517574562,-0.0529716355144438,-0.0980208811401368,1.15190312990417,-0.0980434501171241,-0.0990297440797205,-0.0989611768448433,1.15107367264116);
+                vec3 v=agxMat*c;v=clamp(log2(max(v,vec3(1e-10))),-12.47393,4.026069);v=(v+12.47393)/(12.47393+4.026069);
+                return clamp(agxInv*agxContrast(v),0.0,1.0);
+            }
+            else if(uTonemapOperator==2){c=c/(c+vec3(1));}
+            else{c=clamp(c,0.0,1.0);}
+            return pow(max(c,vec3(0)),vec3(1.0/2.2));
+        }
+        void main(){fragColor=vec4(tonemap(texture(uSource,vUv).rgb),1.0);}
+    )GLSL";
+    if (!m_presentProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, postVertex)
+        || !m_presentProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, presentFragment)
+        || !m_presentProgram->link()) recordShaderFailure("present", m_presentProgram->log());
     else {
         // Deterministic cosine-weighted hemisphere kernel, denser near the origin.
         m_ssaoProgram->bind();
@@ -2878,6 +3075,7 @@ void PbrPreviewGL::uploadTexture(std::unique_ptr<QOpenGLTexture>& texture, const
 
 void PbrPreviewGL::uploadTextures()
 {
+    ++m_materialGeneration; // path-traced accumulation restarts on any material change
     uploadTexture(m_baseTexture,m_baseImage,Qt::white);
     uploadTexture(m_normalTexture,m_normalImage,QColor(128,128,255));
     uploadTexture(m_heightTexture,m_heightImage,QColor::fromRgbF(m_heightCenter,m_heightCenter,m_heightCenter));
@@ -3050,6 +3248,7 @@ void PbrPreviewGL::uploadMesh()
     m_program->enableAttributeArray(4);m_program->setAttributeBuffer(4,GL_FLOAT,offsetof(PreviewVertex,uv1),2,stride);
     m_program->enableAttributeArray(5);m_program->setAttributeBuffer(5,GL_FLOAT,offsetof(PreviewVertex,color),4,stride);
     m_groundVao->release(); m_program->release(); m_meshDirty=false;
+    m_bvhDirty=true; // the path tracer's acceleration structure mirrors this mesh
 }
 
 QMatrix4x4 PbrPreviewGL::viewMatrix() const
@@ -3270,6 +3469,12 @@ void PbrPreviewGL::drawViewportOverlays()
         painter.setPen(QPen(QColor(240,196,80,220),1.0));
         painter.drawLine(splitX,0,splitX,height());
     }
+    if(m_pathTraced){
+        // Convergence readout for the progressive reference render.
+        painter.setPen(QColor(223,226,230,200));
+        painter.drawText(QRectF(8,height()-24,width()-16,18),Qt::AlignLeft|Qt::AlignVCenter,
+            m_accumSamples>=512?tr("Path traced — converged (512 spp)"):tr("Path traced — %1 spp").arg(m_accumSamples));
+    }
     if(m_freeCamera){
         // FPS crosshair + flight hint.
         painter.setRenderHint(QPainter::Antialiasing,true);
@@ -3465,6 +3670,221 @@ void PbrPreviewGL::applyCommonUniforms(QOpenGLShaderProgram& p)
     p.setUniformValue("uTonemapOperator",m_tonemapOperator);
 }
 
+namespace {
+
+// CPU-side BVH for the path-traced reference mode. Triangles carry baked
+// world-space positions plus smooth normals and UV0 for material fetches.
+struct TraceTriangle {
+    QVector3D v0, e1, e2;
+    QVector3D n0, n1, n2;
+    QVector2D uv0, uv1, uv2;
+    QVector3D centroid;
+};
+
+struct TraceNode {
+    QVector3D bmin{1e30f, 1e30f, 1e30f}, bmax{-1e30f, -1e30f, -1e30f};
+    int leftFirst = 0; // internal: left child index (right = left + 1); leaf: first triangle
+    int count = 0;     // 0 = internal, >0 = leaf triangle count
+};
+
+void growNode(TraceNode& node, const TraceTriangle& tri)
+{
+    const QVector3D corners[3] = { tri.v0, tri.v0 + tri.e1, tri.v0 + tri.e2 };
+    for (const QVector3D& c : corners) {
+        node.bmin.setX(std::min(node.bmin.x(), c.x())); node.bmin.setY(std::min(node.bmin.y(), c.y())); node.bmin.setZ(std::min(node.bmin.z(), c.z()));
+        node.bmax.setX(std::max(node.bmax.x(), c.x())); node.bmax.setY(std::max(node.bmax.y(), c.y())); node.bmax.setZ(std::max(node.bmax.z(), c.z()));
+    }
+}
+
+void buildTraceBvhNode(QVector<TraceNode>& nodes, QVector<TraceTriangle>& triangles, int nodeIndex, int first, int count)
+{
+    TraceNode& start = nodes[nodeIndex];
+    start.leftFirst = first; start.count = count;
+    start.bmin = QVector3D(1e30f, 1e30f, 1e30f); start.bmax = -start.bmin;
+    for (int i = first; i < first + count; ++i) growNode(nodes[nodeIndex], triangles[i]);
+    if (count <= 4) return;
+    const QVector3D extent = nodes[nodeIndex].bmax - nodes[nodeIndex].bmin;
+    int axis = 0;
+    if (extent.y() > extent.x()) axis = 1;
+    if (extent.z() > extent[axis]) axis = 2;
+    const float split = nodes[nodeIndex].bmin[axis] + extent[axis] * 0.5f;
+    int mid = first;
+    for (int i = first; i < first + count; ++i)
+        if (triangles[i].centroid[axis] < split) std::swap(triangles[i], triangles[mid++]);
+    if (mid == first || mid == first + count) mid = first + count / 2; // degenerate: median fallback
+    const int left = nodes.size();
+    nodes.append(TraceNode()); nodes.append(TraceNode());
+    nodes[nodeIndex].leftFirst = left; nodes[nodeIndex].count = 0;
+    buildTraceBvhNode(nodes, triangles, left, first, mid - first);
+    buildTraceBvhNode(nodes, triangles, left + 1, mid, first + count - mid);
+}
+
+} // namespace
+
+void PbrPreviewGL::uploadTraceBvh()
+{
+    QVector<TraceTriangle> triangles;
+    if (m_mesh.isValid()) {
+        const QMatrix4x4 model = objectModelMatrix();
+        const QMatrix3x3 normalMatrix = model.normalMatrix();
+        const auto mapNormal = [&normalMatrix](const QVector3D& n) {
+            return QVector3D(
+                normalMatrix(0,0)*n.x()+normalMatrix(0,1)*n.y()+normalMatrix(0,2)*n.z(),
+                normalMatrix(1,0)*n.x()+normalMatrix(1,1)*n.y()+normalMatrix(1,2)*n.z(),
+                normalMatrix(2,0)*n.x()+normalMatrix(2,1)*n.y()+normalMatrix(2,2)*n.z()).normalized();
+        };
+        triangles.reserve(m_mesh.indices.size() / 3);
+        for (int i = 0; i + 2 < m_mesh.indices.size(); i += 3) {
+            const PreviewVertex& a = m_mesh.vertices[int(m_mesh.indices[i])];
+            const PreviewVertex& b = m_mesh.vertices[int(m_mesh.indices[i + 1])];
+            const PreviewVertex& c = m_mesh.vertices[int(m_mesh.indices[i + 2])];
+            TraceTriangle tri;
+            tri.v0 = model.map(a.position);
+            tri.e1 = model.map(b.position) - tri.v0;
+            tri.e2 = model.map(c.position) - tri.v0;
+            if (QVector3D::crossProduct(tri.e1, tri.e2).lengthSquared() < 1e-14f) continue;
+            tri.n0 = mapNormal(a.normal); tri.n1 = mapNormal(b.normal); tri.n2 = mapNormal(c.normal);
+            tri.uv0 = a.uv0; tri.uv1 = b.uv0; tri.uv2 = c.uv0;
+            tri.centroid = tri.v0 + (tri.e1 + tri.e2) / 3.0f;
+            triangles.append(tri);
+        }
+    }
+    QVector<TraceNode> nodes;
+    if (!triangles.isEmpty()) {
+        nodes.append(TraceNode());
+        buildTraceBvhNode(nodes, triangles, 0, 0, triangles.size());
+    }
+    m_bvhTriangleCount = triangles.size();
+    m_bvhNodeCount = nodes.size();
+    // Nodes: 2 RGBA32F texels {bmin, leftFirst} {bmax, count}.
+    QVector<float> nodeData; nodeData.reserve(nodes.size() * 8);
+    for (const TraceNode& n : nodes) {
+        nodeData << n.bmin.x() << n.bmin.y() << n.bmin.z() << float(n.leftFirst)
+                 << n.bmax.x() << n.bmax.y() << n.bmax.z() << float(n.count);
+    }
+    // Triangles: 8 RGBA32F texels — v0/e1/e2 (w carries uv), n0/n1/n2 (w carries uv), 2 spare-free.
+    QVector<float> triData; triData.reserve(triangles.size() * 32);
+    for (const TraceTriangle& t : triangles) {
+        triData << t.v0.x() << t.v0.y() << t.v0.z() << t.uv0.x()
+                << t.e1.x() << t.e1.y() << t.e1.z() << t.uv0.y()
+                << t.e2.x() << t.e2.y() << t.e2.z() << t.uv1.x()
+                << t.n0.x() << t.n0.y() << t.n0.z() << t.uv1.y()
+                << t.n1.x() << t.n1.y() << t.n1.z() << t.uv2.x()
+                << t.n2.x() << t.n2.y() << t.n2.z() << t.uv2.y()
+                << 0.0f << 0.0f << 0.0f << 0.0f
+                << 0.0f << 0.0f << 0.0f << 0.0f;
+    }
+    const auto uploadBuffer = [this](GLuint& buffer, GLuint& texture, const QVector<float>& data) {
+        if (!buffer) glGenBuffers(1, &buffer);
+        glBindBuffer(GL_TEXTURE_BUFFER, buffer);
+        const float zero[4] = {0, 0, 0, 0};
+        glBufferData(GL_TEXTURE_BUFFER, data.isEmpty() ? GLsizeiptr(sizeof(zero)) : GLsizeiptr(data.size() * sizeof(float)),
+            data.isEmpty() ? reinterpret_cast<const void*>(zero) : reinterpret_cast<const void*>(data.constData()), GL_STATIC_DRAW);
+        if (!texture) glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_BUFFER, texture);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, buffer);
+        glBindTexture(GL_TEXTURE_BUFFER, 0);
+        glBindBuffer(GL_TEXTURE_BUFFER, 0);
+    };
+    uploadBuffer(m_bvhNodesBuffer, m_bvhNodesTexture, nodeData);
+    uploadBuffer(m_bvhTrianglesBuffer, m_bvhTrianglesTexture, triData);
+    m_bvhDirty = false;
+    m_accumSamples = 0;
+}
+
+void PbrPreviewGL::setPathTraced(bool enabled)
+{
+    if (m_pathTraced == enabled) return;
+    m_pathTraced = enabled;
+    m_accumSamples = 0;
+    update();
+}
+
+void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
+{
+    if (m_bvhDirty) uploadTraceBvh();
+    if (!m_accumFboA || m_accumFboA->size() != QSize(pixelWidth, pixelHeight)) {
+        QOpenGLFramebufferObjectFormat accumFormat;
+        accumFormat.setInternalTextureFormat(GL_RGBA32F);
+        m_accumFboA = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
+        m_accumFboB = std::make_unique<QOpenGLFramebufferObject>(pixelWidth, pixelHeight, accumFormat);
+        m_accumSamples = 0;
+    }
+    // Any change in what the tracer can see restarts accumulation.
+    QByteArray state;
+    QDataStream stream(&state, QIODevice::WriteOnly);
+    stream << m_yaw << m_pitch << m_distance << m_pan.x() << m_pan.y() << int(m_projection)
+           << m_keyYaw << m_keyPitch << m_keyIntensity << m_keyColor.rgba()
+           << m_environmentYaw << m_environmentIntensity << int(m_background)
+           << m_groundEnabled << m_materialGeneration << m_bvhTriangleCount;
+    if (state != m_traceStateHash) { m_traceStateHash = state; m_accumSamples = 0; }
+
+    const QMatrix4x4 view = viewMatrix(), projection = projectionMatrix();
+    const QMatrix4x4 inverse = (projection * view).inverted();
+    const QVector4D eye4 = view.inverted() * QVector4D(0, 0, 0, 1);
+
+    glDisable(GL_DEPTH_TEST);
+    m_accumFboB->bind();
+    glViewport(0, 0, pixelWidth, pixelHeight);
+    m_traceProgram->bind();
+    m_traceProgram->setUniformValue("uBvhNodes", 22);
+    m_traceProgram->setUniformValue("uBvhTriangles", 23);
+    glActiveTexture(GL_TEXTURE22); glBindTexture(GL_TEXTURE_BUFFER, m_bvhNodesTexture);
+    glActiveTexture(GL_TEXTURE23); glBindTexture(GL_TEXTURE_BUFFER, m_bvhTrianglesTexture);
+    glActiveTexture(GL_TEXTURE0);
+    m_baseTexture->bind(0); m_rmaosTexture->bind(2); m_emissiveTexture->bind(3); m_environmentTexture->bind(5);
+    m_accumFboA->texture(); // ensure created
+    glActiveTexture(GL_TEXTURE7); glBindTexture(GL_TEXTURE_2D, m_accumFboA->texture());
+    glActiveTexture(GL_TEXTURE0);
+    m_traceProgram->setUniformValue("uBase", 0);
+    m_traceProgram->setUniformValue("uRmaos", 2);
+    m_traceProgram->setUniformValue("uEmissive", 3);
+    m_traceProgram->setUniformValue("uEnvironment", 5);
+    m_traceProgram->setUniformValue("uAccum", 7);
+    m_traceProgram->setUniformValue("uInvViewProjection", inverse);
+    m_traceProgram->setUniformValue("uCameraPosition", eye4.toVector3DAffine());
+    m_traceProgram->setUniformValue("uResolution", QVector2D(float(pixelWidth), float(pixelHeight)));
+    m_traceProgram->setUniformValue("uFrame", m_traceFrame);
+    m_traceProgram->setUniformValue("uSampleCount", m_accumSamples);
+    m_traceProgram->setUniformValue("uKeyDirection", keyDirection());
+    m_traceProgram->setUniformValue("uKeyColor", QVector3D(m_keyColor.redF(), m_keyColor.greenF(), m_keyColor.blueF()));
+    m_traceProgram->setUniformValue("uKeyIntensity", effectiveKeyIntensity());
+    m_traceProgram->setUniformValue("uEnvironmentYaw", m_environmentYaw);
+    m_traceProgram->setUniformValue("uEnvironmentIntensity", m_environmentIntensity);
+    m_traceProgram->setUniformValue("uGroundEnabled", m_groundEnabled);
+    m_traceProgram->setUniformValue("uUseBaseMap", m_hasBase && !m_overrideBaseColor);
+    m_traceProgram->setUniformValue("uUseRmaosMap", m_hasRmaos);
+    m_traceProgram->setUniformValue("uUseEmissiveMap", m_hasEmissive);
+    m_traceProgram->setUniformValue("uBaseFallback", QVector3D(m_baseColor.redF(), m_baseColor.greenF(), m_baseColor.blueF()));
+    m_traceProgram->setUniformValue("uTint", QVector3D(m_tint.redF(), m_tint.greenF(), m_tint.blueF()));
+    m_traceProgram->setUniformValue("uColorScale", m_colorScale);
+    m_traceProgram->setUniformValue("uRoughnessFallback", m_roughness);
+    m_traceProgram->setUniformValue("uMetallicFallback", m_metallic);
+    m_traceProgram->setUniformValue("uAoFallback", m_ao);
+    m_traceProgram->setUniformValue("uEmissiveColorFallback", QVector3D(m_emissiveColor.redF(), m_emissiveColor.greenF(), m_emissiveColor.blueF()));
+    m_traceProgram->setUniformValue("uEmissiveMaskFallback", m_emissiveMask);
+    m_traceProgram->setUniformValue("uEmissiveIntensity", m_emissiveIntensity);
+    m_vao->bind();
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    m_traceProgram->release();
+    std::swap(m_accumFboA, m_accumFboB); // A now holds the freshest average
+
+    glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
+    glViewport(0, 0, pixelWidth, pixelHeight);
+    m_presentProgram->bind();
+    m_presentProgram->setUniformValue("uSource", 0);
+    m_presentProgram->setUniformValue("uExposure", m_exposure);
+    m_presentProgram->setUniformValue("uTonemapOperator", m_tonemapOperator);
+    glBindTexture(GL_TEXTURE_2D, m_accumFboA->texture());
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    m_vao->release();
+    m_presentProgram->release();
+    glEnable(GL_DEPTH_TEST);
+
+    ++m_traceFrame;
+    if (m_accumSamples < 512) { ++m_accumSamples; update(); } // keep converging while idle
+}
+
 void PbrPreviewGL::paintGL()
 {
     glViewport(0,0,int(width()*devicePixelRatioF()),int(height()*devicePixelRatioF()));
@@ -3474,6 +3894,11 @@ void PbrPreviewGL::paintGL()
     if(m_companionsDirty) uploadCompanionTextures();
     if(m_meshDirty) uploadMesh();
     if(m_environmentDirty){createEnvironmentCubemap();m_environmentDirty=false;}
+    if(m_pathTraced&&m_traceProgram&&m_traceProgram->isLinked()&&m_presentProgram&&m_presentProgram->isLinked()){
+        renderPathTraced(int(width()*devicePixelRatioF()),int(height()*devicePixelRatioF()));
+        drawViewportOverlays();
+        return;
+    }
     renderShadowMap();
     const int pixelWidth=int(width()*devicePixelRatioF()),pixelHeight=int(height()*devicePixelRatioF());
     const bool bloomActive=m_bloomEnabled&&m_bloomStrength>0.001f
@@ -4351,9 +4776,11 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     m_ssaoStrength->setToolTip(tr("How strongly the occlusion darkens the scene."));
     ssaoLayout->addWidget(m_ssao);ssaoLayout->addWidget(m_ssaoStrength,1);
     m_antiAliasing=new QComboBox(display);m_antiAliasing->addItem(tr("Off"),1);m_antiAliasing->addItem(tr("MSAA 2x"),2);m_antiAliasing->addItem(tr("MSAA 4x"),4);m_antiAliasing->addItem(tr("MSAA 8x"),8);m_antiAliasing->setCurrentIndex(2);m_antiAliasing->setToolTip(tr("Multisampled viewport rendering. Editor preference only; never stored in the material."));
+    m_pathTrace=new QCheckBox(tr("Path-traced reference"),display);
+    m_pathTrace->setToolTip(tr("Progressive path tracing of the preview scene: true soft shadows, bounce light, and real reflections, converging while the camera is still. Reference simplifications: primary layer only, smooth vertex normals (no normal maps), no states or parallax. Bloom, SSAO, MSAA, and debug views pause while active."));
     m_ground=new QCheckBox(tr("Show ground plane"),display);m_ground->setChecked(true);m_compare=new QCheckBox(tr("Compare with defaults (split view)"),display);m_compare->setToolTip(tr("Split the object between the current material and its default values."));
     m_grid=new QCheckBox(tr("Ground grid with axis directions"),display);m_grid->setChecked(true);m_grid->setToolTip(tr("NifSkope-style grid on the ground: X axis red, Z axis blue, direction labels at the ends."));
-    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
+    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),m_pathTrace);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
     auto* referenceRow=new QWidget(display);auto* referenceLayout=new QHBoxLayout(referenceRow);referenceLayout->setContentsMargins(0,0,0,0);referenceLayout->setSpacing(5);
     auto* referenceLoad=new QPushButton(tr("Load…"),referenceRow);referenceLoad->setToolTip(tr("Show a second read-only material beside this one with a synchronized camera. Lighting and environment are snapshotted when the reference loads."));
     auto* referenceClear=new QPushButton(tr("Clear"),referenceRow);referenceClear->setEnabled(false);
@@ -4500,6 +4927,10 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     };
     connect(m_ssao,&QCheckBox::toggled,this,applySsao);
     connect(m_ssaoStrength,qOverload<double>(&QDoubleSpinBox::valueChanged),this,applySsao);
+    connect(m_pathTrace,&QCheckBox::toggled,this,[this](bool checked){
+        m_materialCanvas->setPathTraced(checked); // reference canvas stays rasterized
+        savePreviewSettings();
+    });
     connect(m_tonemap,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int index){
         m_materialCanvas->setTonemapOperator(index);
         m_referenceCanvas->setTonemapOperator(index);
@@ -4713,7 +5144,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
     m_shape->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/shape"),0).toInt(),0,3));
     m_planeOrientation->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/planeOrientation"),0).toInt(),0,2));m_twoSided->setChecked(s.value(QStringLiteral("Preview/twoSided"),true).toBool());
     m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(QStringLiteral("Preview/debug"),0).toInt(),0,20));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
-    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
+    m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));{QSignalBlocker pathTraceBlocker(m_pathTrace);m_pathTrace->setChecked(s.value(QStringLiteral("Preview/pathTraced"),false).toBool());}m_materialCanvas->setPathTraced(m_pathTrace->isChecked());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
     const int aaIndex=m_antiAliasing->findData(s.value(QStringLiteral("Preview/antiAliasing"),4).toInt());m_antiAliasing->setCurrentIndex(aaIndex>=0?aaIndex:2);m_materialCanvas->setMsaaSamples(m_antiAliasing->currentData().toInt());
     {
         const auto restoreField=[&s](DragNumericEdit* field,const QString& key){QSignalBlocker blocker(field);field->setValue(s.value(key,0.0).toDouble());};
@@ -4737,7 +5168,7 @@ void MaterialPreviewWidget::loadPreviewSettings()
 void MaterialPreviewWidget::savePreviewSettings() const
 {
     const bool preserveManual=m_manualLightStored&&m_deriveExrLighting->isChecked();
-    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
+    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/pathTraced"),m_pathTrace->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
 }
 
 void MaterialPreviewWidget::reloadPreviewCubemaps()
