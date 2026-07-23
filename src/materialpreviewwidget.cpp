@@ -1579,6 +1579,11 @@ void PbrPreviewGL::initializeGL()
             uv=mat2(c,-s,s,c)*(uv-vec2(.5))+vec2(.5);return addressUv(uv,addressMode);
         }
         vec3 environmentDirection(vec3 v){v=rotateY(v,radians(uEnvironmentYaw));return vec3(v.x,v.z,-v.y);}
+        // 128-centred unpack: s*2-1 maps the stored "flat" texel 128 to
+        // +0.0039, a constant tangent-space tilt whose world direction rotates
+        // with the tangent frame - meridian streaks and a pole pinwheel on
+        // smooth spheres. (s*255-128)/127 maps 128 to exactly zero.
+        vec2 unpackNormalXY(vec2 s){return clamp((s*255.0-vec2(128.0))/127.0,-1.0,1.0);}
         vec3 agxContrast(vec3 x){vec3 x2=x*x;vec3 x4=x2*x2;return 15.5*x4*x2-40.14*x4*x+31.96*x4-6.868*x2*x+0.4298*x2+0.1191*x-0.00232;}
         vec3 tonemap(vec3 c){
             c*=exp2(uExposure);
@@ -2033,15 +2038,15 @@ void PbrPreviewGL::initializeGL()
                 tertiaryCoverage=clamp(tertiaryCoverage*(1.0+uOscCoverageAmp[2]*layerOsc.z),0.0,1.0);
             }
             vec3 N=geometricN;
-            if((uHasNormal||uOverrideNormal)&&!defaults){vec3 encoded=uOverrideNormal?uNormalFallback:layer0Sample(uNormal,uv).xyz;vec3 map=encoded*2.0-1.0;map.xy*=uNormalStrength*uGlobalNormalStrength*max(0.0,1.0+uOscNormalAmp[0]*layerOsc.x);map.z=sqrt(max(.001,1.0-dot(map.xy,map.xy)));N=uNormalSpace==0?normalize(tangentToWorld*map):normalize(map);}
+            if((uHasNormal||uOverrideNormal)&&!defaults){vec3 encoded=uOverrideNormal?uNormalFallback:layer0Sample(uNormal,uv).xyz;vec3 map=vec3(unpackNormalXY(encoded.xy),encoded.z*2.0-1.0);map.xy*=uNormalStrength*uGlobalNormalStrength*max(0.0,1.0+uOscNormalAmp[0]*layerOsc.x);map.z=sqrt(max(.001,1.0-dot(map.xy,map.xy)));N=uNormalSpace==0?normalize(tangentToWorld*map):normalize(map);}
             if(uSecondaryLayerActive&&layerCoverage>0.0&&(uHasSecondaryNormal||uOverrideSecondaryNormal)&&!defaults){
                 vec3 encoded=uOverrideSecondaryNormal?uSecondaryNormalFallback:texture(uSecondaryNormal,uv1).xyz;
-                vec3 map=encoded*2.0-1.0;map.xy*=uSecondaryNormalStrength*uGlobalNormalStrength*max(0.0,1.0+uOscNormalAmp[1]*layerOsc.y);map.z=sqrt(max(.001,1.0-dot(map.xy,map.xy)));
+                vec3 map=vec3(unpackNormalXY(encoded.xy),0.0);map.xy*=uSecondaryNormalStrength*uGlobalNormalStrength*max(0.0,1.0+uOscNormalAmp[1]*layerOsc.y);map.z=sqrt(max(.001,1.0-dot(map.xy,map.xy)));
                 vec3 secondaryN=uNormalSpace==0?normalize(tangentToWorld*map):normalize(map);N=normalize(mix(N,secondaryN,layerCoverage));
             }
             if(uTertiaryLayerActive&&tertiaryCoverage>0.0&&(uHasTertiaryNormal||uOverrideTertiaryNormal)&&!defaults){
                 vec3 encoded=uOverrideTertiaryNormal?uTertiaryNormalFallback:texture(uTertiaryNormal,uv2).xyz;
-                vec3 map=encoded*2.0-1.0;map.xy*=uTertiaryNormalStrength*uGlobalNormalStrength*max(0.0,1.0+uOscNormalAmp[2]*layerOsc.z);map.z=sqrt(max(.001,1.0-dot(map.xy,map.xy)));
+                vec3 map=vec3(unpackNormalXY(encoded.xy),0.0);map.xy*=uTertiaryNormalStrength*uGlobalNormalStrength*max(0.0,1.0+uOscNormalAmp[2]*layerOsc.z);map.z=sqrt(max(.001,1.0-dot(map.xy,map.xy)));
                 vec3 tertiaryN=uNormalSpace==0?normalize(tangentToWorld*map):normalize(map);N=normalize(mix(N,tertiaryN,tertiaryCoverage));
             }
             if(hasSpecial(2)&&!defaults){
@@ -2193,7 +2198,7 @@ void PbrPreviewGL::initializeGL()
                 // (fabric weave, pores, machining) blended whiteout-style.
                 vec4 detail=specialSample(uDetailNormalLayer,uv*uDetailNormalScale);
                 float detailMask=detail.a;
-                vec2 detailXy=(detail.rg*2.0-1.0)*uDetailNormalStrength*detailMask;
+                vec2 detailXy=unpackNormalXY(detail.rg)*uDetailNormalStrength*detailMask;
                 N=normalize(N+tangentToWorld*vec3(detailXy,0.0));
                 // B carries micro roughness breakup at the same detail scale.
                 rough=clamp(rough+(detail.b-.5)*2.0*uDetailRoughVariation*detailMask,0.0,1.0);
@@ -2400,7 +2405,7 @@ void PbrPreviewGL::initializeGL()
                 vec4 aniso=specialSample(uAnisotropyLayer,uv);
                 float anisoAmount=clamp(aniso.b*uAnisotropyIntensity,0.0,1.0)*aniso.a;
                 if(anisoAmount>.001){
-                    vec2 dir2=aniso.rg*2.0-1.0;if(dot(dir2,dir2)<1e-6)dir2=vec2(1.0,0.0);dir2=normalize(dir2);
+                    vec2 dir2=unpackNormalXY(aniso.rg);if(dot(dir2,dir2)<1e-6)dir2=vec2(1.0,0.0);dir2=normalize(dir2);
                     float rotA=radians(uAnisotropyRotation);dir2=mat2(cos(rotA),-sin(rotA),sin(rotA),cos(rotA))*dir2;
                     vec3 aT=normalize(tangentToWorld*vec3(dir2,0.0));vec3 aB=normalize(cross(N,aT));aT=cross(aB,N);
                     float at=max(alpha*(1.0+.9*anisoAmount),.0005),ab=max(alpha*(1.0-.9*anisoAmount),.0005);
@@ -2436,7 +2441,7 @@ void PbrPreviewGL::initializeGL()
             vec3 diffuseN=N;float specularOcclusion=1.0;
             if(hasSpecial(uBentNormalLayer)&&!defaults){
                 vec4 bent=specialSample(uBentNormalLayer,uv);
-                vec3 bentTs=vec3(bent.rg*2.0-1.0,0.0);bentTs.z=sqrt(max(.001,1.0-dot(bentTs.xy,bentTs.xy)));
+                vec3 bentTs=vec3(unpackNormalXY(bent.rg),0.0);bentTs.z=sqrt(max(.001,1.0-dot(bentTs.xy,bentTs.xy)));
                 vec3 bentN=normalize(mix(N,normalize(tangentToWorld*bentTs),clamp(uBentNormalStrength,0.0,1.0)*bent.a));
                 diffuseN=bentN;
                 // Cone-style specular occlusion from bent-normal visibility + AO,
@@ -2525,7 +2530,7 @@ void PbrPreviewGL::initializeGL()
             for(int ci=0;ci<3;++ci){
                 if(defaults||!hasSpecial(uCoatSpecialLayer[ci]))continue;
                 vec2 coatUv=ci==0?uv0:(ci==1?uv1:uv2);
-                vec4 coat=specialSample(uCoatSpecialLayer[ci],coatUv);vec3 coatTs=vec3(coat.rg*2.0-1.0,1.0);coatTs.xy*=uCoatNormalStrength[ci];coatTs.z=sqrt(max(.001,1.0-dot(coatTs.xy,coatTs.xy)));vec3 coatN=normalize(tangentToWorld*coatTs);
+                vec4 coat=specialSample(uCoatSpecialLayer[ci],coatUv);vec3 coatTs=vec3(unpackNormalXY(coat.rg),1.0);coatTs.xy*=uCoatNormalStrength[ci];coatTs.z=sqrt(max(.001,1.0-dot(coatTs.xy,coatTs.xy)));vec3 coatN=normalize(tangentToWorld*coatTs);
                 float coatRough=clamp(coat.b,.025,1.0),coatCoverage=coat.a*uCoatStrength[ci],coatNoV=max(dot(coatN,V),.001),coatNoL=max(dot(coatN,L),0.0);
                 float coatF0=pow((uCoatIor[ci]-1.0)/(uCoatIor[ci]+1.0),2.0);vec3 coatF=fresnel(max(dot(V,normalize(V+L)),0.0),vec3(coatF0));
                 float coatAlpha=coatRough*coatRough,coatNoH=max(dot(coatN,normalize(V+L)),0.0),coatK=(coatRough+1.0)*(coatRough+1.0)/8.0;
@@ -2537,7 +2542,7 @@ void PbrPreviewGL::initializeGL()
             }
 
             if((uShaderMode==6||(uShaderMode==8&&hasSpecial(12)))&&hasSpecial(12)&&!defaults){
-                vec4 cornea=specialSample(12,uv);vec3 corneaTs=vec3(cornea.rg*2.0-1.0,1.0);corneaTs.z=sqrt(max(.001,1.0-dot(corneaTs.xy,corneaTs.xy)));vec3 corneaN=normalize(tangentToWorld*corneaTs);
+                vec4 cornea=specialSample(12,uv);vec3 corneaTs=vec3(unpackNormalXY(cornea.rg),1.0);corneaTs.z=sqrt(max(.001,1.0-dot(corneaTs.xy,corneaTs.xy)));vec3 corneaN=normalize(tangentToWorld*corneaTs);
                 float wetRough=clamp(cornea.b,.015,1.0),wetNoV=max(dot(corneaN,V),.001),wetF0=pow((uEyeCorneaIor-1.0)/(uEyeCorneaIor+1.0),2.0);
                 vec3 wetEnv=textureLod(uPrefilteredEnvironment,environmentDirection(reflect(-V,corneaN)),wetRough*uPrefilteredEnvironmentMaxLod).rgb;vec2 wetBrdf=texture(uBrdfLut,vec2(wetNoV,wetRough)).rg;
                 color+=wetEnv*(wetF0*wetBrdf.x+wetBrdf.y)*cornea.a*uEyeWetness*uEnvironmentIntensity;
@@ -2838,7 +2843,7 @@ void PbrPreviewGL::initializeGL()
             if(dot(t,t)<1e-8)return n;
             t=normalize(t-n*dot(t,n));
             vec3 b=cross(n,t)*tw.w;
-            vec2 nm=(texture(uNormal,hit.uv).rg*2.0-1.0)*uNormalStrength; // RG normal (BC5 layout)
+            vec2 nm=clamp((texture(uNormal,hit.uv).rg*255.0-vec2(128.0))/127.0,-1.0,1.0)*uNormalStrength; // RG normal, 128-centred unpack
             float nz=sqrt(max(1.0-dot(nm,nm),0.0));
             return normalize(t*nm.x+b*nm.y+n*nz);
         }
