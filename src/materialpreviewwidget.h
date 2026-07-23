@@ -64,7 +64,7 @@ public:
         AmbientOcclusion = 5, F0 = 6, Emissive = 7, UvChecker = 8,
         Wireframe = 9, TangentBasis = 10, Opacity = 11, TangentNormal = 12,
         Height = 13, RoughnessMetallic = 14, Rmaos = 15, EmissiveMask = 16,
-        LayerCoverage = 17, EmissiveColor = 18
+        LayerCoverage = 17, EmissiveColor = 18, Curvature = 19
     };
     enum class AxisView { Front, Back, Left, Right, Top, Bottom };
     struct EnvironmentLight {
@@ -108,6 +108,7 @@ public:
         float environmentIntensity, float environmentYaw, float exposure);
     void setBackground(Background background);
     void setDebugView(DebugView view);
+    void setDebugSplit(float fraction);
     void setGroundEnabled(bool enabled);
     void setGridEnabled(bool enabled);
     void setFreeCamera(bool enabled);
@@ -130,6 +131,7 @@ signals:
     void cameraChanged();
     void projectionChanged();
     void lightAnglesChanged(float yawDegrees, float pitchDegrees);
+    void environmentYawDragged(float deltaDegrees);
     void shaderErrorsChanged(const QString& log);
     void meshTrianglePicked(int triangleIndex);
 
@@ -348,6 +350,7 @@ private:
     Projection m_projection = Projection::Perspective;
     Background m_background = Background::Cubemap;
     DebugView m_debugView = DebugView::Shaded;
+    float m_debugSplit = 0.0f; // 0 = the map fills the view; else shaded left of the divider
     bool m_groundEnabled = true, m_shadowsEnabled = true, m_comparisonEnabled = false;
     bool m_gridEnabled = true;
     // Navigation gizmo interaction state.
@@ -462,7 +465,6 @@ private:
     TexturePreviewCanvas* m_textureCanvas = nullptr;
     QWidget* m_buttonHost = nullptr;
     QHBoxLayout* m_buttons = nullptr;
-    QToolButton* m_settingsToggle = nullptr;
     QSplitter* m_previewSplitter = nullptr; // viewport above, settings below — user-draggable height
     QWidget* m_settingsBottom = nullptr;
     QGroupBox* m_controls = nullptr;
@@ -509,6 +511,7 @@ private:
     QComboBox* m_debug = nullptr;
     QCheckBox* m_ground = nullptr;
     QCheckBox* m_grid = nullptr;
+    DragNumericEdit* m_debugSplit = nullptr;
     QCheckBox* m_compare = nullptr;
     QLabel* m_importStatus = nullptr;
     // Dynamic surface-state simulation controls (States tab): one slider per
