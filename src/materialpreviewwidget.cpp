@@ -2908,7 +2908,7 @@ void PbrPreviewGL::initializeGL()
                 vec3 v=-rd;
                 vec3 base;float rough,metal,ao;vec3 emission;
                 material(hit,base,rough,metal,ao,emission);
-                if(bounce==0){fragAux=vec4(n,hit.t);fragAlbedo=vec4(base+emission,1.0);}
+                if(bounce==0){fragAux=vec4(n,hit.t);fragAlbedo=vec4(base+emission,rough);} // alpha = roughness, gates the denoiser
                 // NEE covers the diffuse response, so diffuse-continued paths
                 // skip implicit emission; specular paths keep it (mirror glows).
                 if(specularPath||!uNeeEnabled)radiance+=throughput*emission;
@@ -2954,27 +2954,36 @@ void PbrPreviewGL::initializeGL()
         void main(){
             vec4 caux=texture(uAux,vUv);
             vec3 cn=caux.xyz;float cd=caux.w;
-            bool cbg=dot(cn,cn)<0.25; // background pixels only mix with background
+            bool cbg=dot(cn,cn)<0.25; // background: deterministic env lookup, nothing to denoise
+            vec4 calb=texture(uAlbedo,vUv);
+            // Roughness gates the filter: sharp speculars are lighting detail
+            // demodulation cannot protect, and tight GGX lobes converge fast
+            // anyway. Rough surfaces carry the actual Monte Carlo noise.
+            float gate=cbg?0.0:smoothstep(0.12,0.45,calb.a);
             const float kernel[3]=float[3](0.375,0.25,0.0625);
             bool demodIn=(uDemodPhase&1)!=0,demodOut=(uDemodPhase&2)!=0;
-            vec3 sum=vec3(0);float wsum=0.0;
-            for(int j=-2;j<=2;++j)for(int i=-2;i<=2;++i){
-                vec2 suv=vUv+vec2(float(i),float(j))*uTexel*float(uStepSize);
-                vec4 saux=texture(uAux,suv);
-                bool sbg=dot(saux.xyz,saux.xyz)<0.25;
-                float nw=(cbg||sbg)?((cbg&&sbg)?1.0:0.0):pow(max(dot(cn,saux.xyz),0.0),24.0);
-                float dw=exp(-abs(cd-saux.w)/(abs(cd)*0.25+0.05)); // loose: grazing ground has steep per-texel depth slope
-                float w=kernel[abs(i)]*kernel[abs(j)]*nw*dw;
-                if(isnan(w)||isinf(w))w=0.0;
-                vec3 sample_=texture(uColor,suv).rgb;
-                if(demodIn)sample_/=texture(uAlbedo,suv).rgb+vec3(0.004); // filter irradiance, not texture
-                sum+=sample_*w;wsum+=w;
+            vec3 center=texture(uColor,vUv).rgb;
+            if(demodIn)center/=calb.rgb+vec3(0.004);
+            vec3 result=center;
+            if(gate>0.001){
+                vec3 sum=vec3(0);float wsum=0.0;
+                for(int j=-2;j<=2;++j)for(int i=-2;i<=2;++i){
+                    vec2 suv=vUv+vec2(float(i),float(j))*uTexel*float(uStepSize);
+                    vec4 saux=texture(uAux,suv);
+                    bool sbg=dot(saux.xyz,saux.xyz)<0.25;
+                    float nw=(cbg||sbg)?((cbg&&sbg)?1.0:0.0):pow(max(dot(cn,saux.xyz),0.0),24.0);
+                    float dw=exp(-abs(cd-saux.w)/(abs(cd)*0.25+0.05)); // loose: grazing ground has steep per-texel depth slope
+                    float w=kernel[abs(i)]*kernel[abs(j)]*nw*dw;
+                    if(isnan(w)||isinf(w))w=0.0;
+                    vec3 sample_=texture(uColor,suv).rgb;
+                    if(demodIn)sample_/=texture(uAlbedo,suv).rgb+vec3(0.004); // filter irradiance, not texture
+                    sum+=sample_*w;wsum+=w;
+                }
+                vec3 filtered=wsum>1e-6?sum/wsum:center;
+                if(any(isnan(filtered)))filtered=center;
+                result=mix(center,filtered,gate);
             }
-            vec3 fallback=texture(uColor,vUv).rgb;
-            if(demodIn)fallback/=texture(uAlbedo,vUv).rgb+vec3(0.004);
-            vec3 result=wsum>1e-6?sum/wsum:fallback;
-            if(any(isnan(result)))result=fallback;
-            if(demodOut)result*=texture(uAlbedo,vUv).rgb+vec3(0.004);
+            if(demodOut)result*=calb.rgb+vec3(0.004);
             fragColor=vec4(result,1.0);
         }
     )GLSL";
