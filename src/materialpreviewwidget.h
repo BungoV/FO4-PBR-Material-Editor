@@ -109,6 +109,7 @@ public:
     void setBackground(Background background);
     void setDebugView(DebugView view);
     void setDebugSplit(float fraction);
+    void setBloom(bool enabled, float strength);
     void setGroundEnabled(bool enabled);
     void setGridEnabled(bool enabled);
     void setFreeCamera(bool enabled);
@@ -209,6 +210,10 @@ private:
     std::unique_ptr<QOpenGLVertexArrayObject> m_vao;
     std::unique_ptr<QOpenGLVertexArrayObject> m_groundVao;
     std::unique_ptr<QOpenGLShaderProgram> m_lineProgram;
+    std::unique_ptr<QOpenGLShaderProgram> m_bloomProgram;      // bright pass + separable blur
+    std::unique_ptr<QOpenGLShaderProgram> m_compositeProgram;  // scene + bloom
+    std::unique_ptr<QOpenGLFramebufferObject> m_sceneFbo;      // resolved scene when bloom is on
+    std::unique_ptr<QOpenGLFramebufferObject> m_bloomFboA, m_bloomFboB; // half-res ping-pong
     std::unique_ptr<QOpenGLVertexArrayObject> m_gridVao;
     QOpenGLBuffer m_gridBuffer{QOpenGLBuffer::VertexBuffer};
     int m_gridVertexCount = 0;
@@ -351,6 +356,8 @@ private:
     Background m_background = Background::Cubemap;
     DebugView m_debugView = DebugView::Shaded;
     float m_debugSplit = 0.0f; // 0 = the map fills the view; else shaded left of the divider
+    bool m_bloomEnabled = true;
+    float m_bloomStrength = 0.4f;
     bool m_groundEnabled = true, m_shadowsEnabled = true, m_comparisonEnabled = false;
     bool m_gridEnabled = true;
     // Navigation gizmo interaction state.
@@ -512,6 +519,8 @@ private:
     QCheckBox* m_ground = nullptr;
     QCheckBox* m_grid = nullptr;
     DragNumericEdit* m_debugSplit = nullptr;
+    QCheckBox* m_bloom = nullptr;
+    DragNumericEdit* m_bloomStrength = nullptr;
     QCheckBox* m_compare = nullptr;
     QLabel* m_importStatus = nullptr;
     // Dynamic surface-state simulation controls (States tab): one slider per
