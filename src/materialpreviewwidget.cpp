@@ -2710,7 +2710,7 @@ void PbrPreviewGL::initializeGL()
         uniform samplerBuffer uBvhNodes,uBvhTriangles;
         uniform sampler2D uBase,uNormal,uRmaos,uEmissive,uAccum,uBrdfLut;
         uniform samplerCube uEnvironment,uPrefilteredEnvironment;
-        uniform float uPrefilteredEnvironmentMaxLod;
+        uniform float uPrefilteredEnvironmentMaxLod,uEnvironmentSourceMaxLod;
         uniform mat4 uInvViewProjection;
         uniform vec3 uCameraPosition,uKeyDirection,uKeyColor,uBaseFallback,uTint,uEmissiveColorFallback;
         uniform vec3 uSubsurfaceProfileColor,uTransmissionTint;
@@ -2726,6 +2726,24 @@ void PbrPreviewGL::initializeGL()
         vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
         vec3 environmentDirection(vec3 v){v=rotateY(v,radians(uEnvironmentYaw));return vec3(v.x,v.z,-v.y);}
         vec3 envRadiance(vec3 dir){return texture(uEnvironment,environmentDirection(dir)).rgb*uEnvironmentIntensity;}
+        // Deterministic cosine-convolved sky irradiance, same as the raster's
+        // diffuse IBL: HDR hotspots are integrated instead of sampled, so
+        // diffuse env lighting carries no Monte Carlo noise at all.
+        vec3 diffuseIrradianceEnv(vec3 n){
+            vec3 up=abs(n.y)<.999?vec3(0,1,0):vec3(1,0,0);
+            vec3 tangent=normalize(cross(up,n)),bitangent=cross(n,tangent);
+            vec3 irradiance=vec3(0.0);
+            const int sampleCount=32;
+            const float goldenAngle=2.39996323;
+            float sourceLod=max(uEnvironmentSourceMaxLod-2.0,0.0);
+            for(int i=0;i<sampleCount;++i){
+                float xi=(float(i)+.5)/float(sampleCount);
+                float radius=sqrt(xi),phi=float(i)*goldenAngle;
+                vec3 d=normalize(tangent*(cos(phi)*radius)+bitangent*(sin(phi)*radius)+n*sqrt(max(1.0-xi,0.0)));
+                irradiance+=textureLod(uEnvironment,environmentDirection(d),sourceLod).rgb;
+            }
+            return irradiance/float(sampleCount)*uEnvironmentIntensity;
+        }
         struct Hit{float t;vec3 n;vec2 uv;bool ground;int tri;};
         bool aabbHit(vec3 ro,vec3 rinv,vec3 bmin,vec3 bmax,float tMax){
             vec3 t1=(bmin-ro)*rinv,t2=(bmax-ro)*rinv;
@@ -2899,18 +2917,23 @@ void PbrPreviewGL::initializeGL()
             vec3 radiance=vec3(0),throughput=vec3(1);
             bool specularPath=true; // camera rays count as specular for the NEE split
             float pathRoughness=-1.0; // >=0 after a specular continuation: prefiltered env lookup on miss
+            vec3 diffuseNormal=vec3(0,1,0); // shading normal at the last diffuse bounce
             fragAux=vec4(0,0,0,1e8);
             fragAlbedo=vec4(1);
             for(int bounce=0;bounce<3;++bounce){
                 Hit hit;
                 if(!traceScene(ro,rd,1e30,false,hit)){
-                    // Split-sum specular: a reflected ray that reaches the sky
-                    // reads the roughness-matched prefiltered mip - the same
-                    // integral the raster uses - so glossy reflections are
-                    // noise-free at 1 spp. Camera rays keep the sharp source.
-                    radiance+=throughput*(pathRoughness>=0.0
-                        ?textureLod(uPrefilteredEnvironment,environmentDirection(rd),pathRoughness*uPrefilteredEnvironmentMaxLod).rgb*uEnvironmentIntensity
-                        :envRadiance(rd));
+                    // Rays that reach the sky resolve deterministically, like
+                    // the raster's IBL: camera rays read the sharp source,
+                    // specular paths the roughness-matched prefiltered mip, and
+                    // diffuse paths the cosine-convolved irradiance (the ray
+                    // itself only supplies sky VISIBILITY - binary noise
+                    // instead of the HDR-hotspot lottery).
+                    radiance+=throughput*(bounce==0
+                        ?envRadiance(rd)
+                        :(pathRoughness>=0.0
+                            ?textureLod(uPrefilteredEnvironment,environmentDirection(rd),pathRoughness*uPrefilteredEnvironmentMaxLod).rgb*uEnvironmentIntensity
+                            :diffuseIrradianceEnv(diffuseNormal)));
                     break;
                 }
                 vec3 p=ro+rd*hit.t;
@@ -2919,7 +2942,7 @@ void PbrPreviewGL::initializeGL()
                 vec3 v=-rd;
                 vec3 base;float rough,metal,ao;vec3 emission;
                 material(hit,base,rough,metal,ao,emission);
-                if(bounce==0){fragAux=vec4(n,hit.t);fragAlbedo=vec4(base+emission,rough);} // alpha = roughness, gates the denoiser
+                if(bounce==0){fragAux=vec4(n,hit.t);fragAlbedo=vec4(base+emission,dot(base,vec3(0.333))*(1.0-metal));} // alpha = diffuse energy, gates the denoiser
                 // NEE covers the diffuse response, so diffuse-continued paths
                 // skip implicit emission; specular paths keep it (mirror glows).
                 if(specularPath||!uNeeEnabled)radiance+=throughput*emission;
@@ -2941,6 +2964,7 @@ void PbrPreviewGL::initializeGL()
                     throughput*=base*(1.0-metal)*mix(1.0,ao,0.85)/max(pDiffuse,1e-4); // cosine pdf cancels NoL/PI
                     specularPath=false;
                     pathRoughness=-1.0;
+                    diffuseNormal=n;
                 }else{
                     // Deterministic mirror direction + split-sum energy (BRDF
                     // LUT), lobe width deferred to the prefiltered env on miss.
@@ -2981,9 +3005,11 @@ void PbrPreviewGL::initializeGL()
             // Roughness gates the filter: sharp speculars are lighting detail
             // demodulation cannot protect, and tight GGX lobes converge fast
             // anyway. Rough surfaces carry the actual Monte Carlo noise.
-            // Speculars are deterministic (split-sum) so gloss and mid-gloss
-            // need no filtering; only genuinely rough, diffuse-noise surfaces do.
-            float gate=cbg?0.0:smoothstep(0.35,0.65,calb.a);
+            // Speculars and env-diffuse are deterministic; the only stochastic
+            // content is sky-visibility, bounce GI, and soft shadows, all of
+            // which scale with the surface's DIFFUSE energy - so that gates
+            // the filter. Metals and dark gloss pass through untouched.
+            float gate=cbg?0.0:smoothstep(0.03,0.25,calb.a);
             const float kernel[3]=float[3](0.375,0.25,0.0625);
             bool demodIn=(uDemodPhase&1)!=0,demodOut=(uDemodPhase&2)!=0;
             vec3 center=texture(uColor,vUv).rgb;
@@ -4053,6 +4079,7 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     m_traceProgram->setUniformValue("uPrefilteredEnvironment", 12);
     m_traceProgram->setUniformValue("uBrdfLut", 13);
     m_traceProgram->setUniformValue("uPrefilteredEnvironmentMaxLod", m_prefilteredEnvironmentMaxLod);
+    m_traceProgram->setUniformValue("uEnvironmentSourceMaxLod", float(qMax(0, m_environmentTexture->mipLevels() - 1)));
     m_traceProgram->setUniformValue("uInvViewProjection", inverse);
     m_traceProgram->setUniformValue("uCameraPosition", eye4.toVector3DAffine());
     m_traceProgram->setUniformValue("uResolution", QVector2D(float(pixelWidth), float(pixelHeight)));
