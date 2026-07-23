@@ -108,6 +108,7 @@ public:
         float environmentIntensity, float environmentYaw, float exposure);
     void setBackground(Background background);
     void setDebugView(DebugView view);
+    void setDebugViewLeft(DebugView view);
     void setDebugSplit(float fraction);
     void setBloom(bool enabled, float strength);
     void setTonemapOperator(int op);
@@ -384,6 +385,7 @@ private:
     Projection m_projection = Projection::Perspective;
     Background m_background = Background::Cubemap;
     DebugView m_debugView = DebugView::Shaded;
+    DebugView m_debugViewLeft = DebugView::Shaded; // left half of the split view
     float m_debugSplit = 0.0f; // 0 = the map fills the view; else shaded left of the divider
     bool m_bloomEnabled = true;
     float m_bloomStrength = 0.4f;
@@ -532,6 +534,7 @@ private:
     QComboBox* m_view = nullptr;
     QComboBox* m_lightingPreset = nullptr;
     QComboBox* m_tonemap = nullptr;
+    QComboBox* m_debugLeft = nullptr;
     QCheckBox* m_deriveExrLighting = nullptr;
     DragNumericEdit* m_keyIntensity = nullptr;
     DragNumericEdit* m_keyYaw = nullptr;
