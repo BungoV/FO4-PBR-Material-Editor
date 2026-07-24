@@ -14,7 +14,9 @@ SOURCES += \
     src/clicommands.cpp \
     src/converter.cpp \
     src/convertercore.cpp \
+    src/converternodes.cpp \
     src/convertworkspace.cpp \
+    src/nodegraph.cpp \
     src/geometryao.cpp \
     src/maskpaint.cpp \
     src/normalderive.cpp \

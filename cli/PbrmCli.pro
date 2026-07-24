@@ -13,6 +13,8 @@ SOURCES += main_cli.cpp \
     ../src/clicommands.cpp \
     ../src/converter.cpp \
     ../src/convertercore.cpp \
+    ../src/converternodes.cpp \
+    ../src/nodegraph.cpp \
     ../src/geometryao.cpp \
     ../src/maskpaint.cpp \
     ../src/previewmesh.cpp \

@@ -1,6 +1,8 @@
 #include "bgsmreader.h"
 #include "converter.h"
 #include "convertercore.h"
+#include "converternodes.h"
+#include "nodegraph.h"
 #include "normalderive.h"
 #include "geometryao.h"
 #include "maskpaint.h"
@@ -1966,6 +1968,137 @@ int main(int argc, char* argv[])
         check(imported.radius > 0.99f && imported.radius < 1.01f, QStringLiteral("imported NIF is normalized to unit radius"));
         check(!imported.submeshes.isEmpty() && imported.indices.size() % 3 == 0,
             QStringLiteral("imported NIF exposes indexed static submeshes"));
+    }
+
+    {
+        // Node graph: core mechanics (typing, cycles, ordering, serialization,
+        // caching) plus the converter library's parity with the orchestrator's
+        // math — a graph and a batch run must agree.
+        NodeGraph::Registry registry;
+        ConverterNodes::registerAll(registry);
+        check(registry.find(QStringLiteral("convert.fo4")) && registry.find(QStringLiteral("convert.fo76"))
+                && registry.find(QStringLiteral("derive.normal")) && registry.find(QStringLiteral("image.channelPack")),
+            QStringLiteral("converter node library registers its pipeline stages"));
+
+        const NodeGraph::NodeTypeSpec* invertSpec = registry.find(QStringLiteral("image.invert"));
+        const NodeGraph::NodeTypeSpec* deriveSpec = registry.find(QStringLiteral("derive.normal"));
+        NodeGraph::Graph graph;
+        const QString first = graph.addNode(QStringLiteral("image.invert"), *invertSpec, QPointF(0, 0));
+        const QString second = graph.addNode(QStringLiteral("image.invert"), *invertSpec, QPointF(200, 0));
+        const QString derive = graph.addNode(QStringLiteral("derive.normal"), *deriveSpec, QPointF(0, 200));
+        QString linkError;
+        check(graph.connect(registry, {first, QStringLiteral("image"), second, QStringLiteral("image")}, &linkError),
+            QStringLiteral("compatible ports link: %1").arg(linkError));
+        check(!graph.connect(registry, {second, QStringLiteral("image"), first, QStringLiteral("image")}, &linkError)
+                && linkError.contains(QStringLiteral("cycle")),
+            QStringLiteral("a link that would close a cycle is rejected"));
+        check(!graph.connect(registry, {derive, QStringLiteral("noiseMetric"), first, QStringLiteral("image")}, &linkError),
+            QStringLiteral("a scalar output cannot feed an image input"));
+        check(graph.topologicalOrder().size() == 3, QStringLiteral("topological order covers every node"));
+        const NodeGraph::Graph restored = NodeGraph::Graph::fromJson(graph.toJson());
+        check(restored.nodes.size() == graph.nodes.size() && restored.connections.size() == graph.connections.size()
+                && restored.node(first) && restored.node(first)->typeId == QStringLiteral("image.invert"),
+            QStringLiteral("graphs round-trip through JSON"));
+
+        QStringList graphErrors;
+        check(ConverterNodes::defaultFo4Graph().validate(registry, &graphErrors),
+            QStringLiteral("default FO4 graph validates: %1").arg(graphErrors.join(QStringLiteral("; "))));
+        check(ConverterNodes::defaultFo76Graph().validate(registry, &graphErrors),
+            QStringLiteral("default FO76 graph validates: %1").arg(graphErrors.join(QStringLiteral("; "))));
+
+        // Node-level parity: the convert.fo4 node is a faithful wrapper, tested
+        // by invoking it with constructed inputs — no synthetic file format,
+        // no disk, so the test exercises the graph rather than a test fixture.
+        {
+            Bgsm::Material material;
+            material.version = 2;
+            material.kind = Bgsm::Kind::Bgsm;
+            material.environmentMapping = true;
+            material.environmentMappingMaskScale = 1.0f;
+            material.specularEnabled = true;
+            material.specularMult = 1.7f;
+            material.smoothness = 0.82f;
+
+            QImage diffuse(16, 16, QImage::Format_RGBA8888);
+            QImage specular(16, 16, QImage::Format_RGBA8888);
+            for (int y = 0; y < 16; ++y)
+                for (int x = 0; x < 16; ++x) {
+                    // Dark diffuse + strong spec: the metal-recovery path.
+                    diffuse.setPixelColor(x, y, QColor(20 + x, 18, 16, 255));
+                    specular.setPixelColor(x, y, QColor(200 + (x % 40), 180, 0, 255));
+                }
+
+            const NodeGraph::NodeTypeSpec* convertSpec = registry.find(QStringLiteral("convert.fo4"));
+            NodeGraph::EvalArgs args;
+            args.params = convertSpec->defaultParams();
+            args.inputs.insert(QStringLiteral("material"),
+                NodeGraph::Value::fromOpaque(QLatin1String(ConverterNodes::kMaterialTag),
+                    std::static_pointer_cast<void>(std::make_shared<Bgsm::Material>(material))));
+            args.inputs.insert(QStringLiteral("diffuse"), NodeGraph::Value::fromImage(diffuse));
+            args.inputs.insert(QStringLiteral("specular"), NodeGraph::Value::fromImage(specular));
+            NodeGraph::EvalOutput nodeOutput;
+            convertSpec->evaluate(args, &nodeOutput);
+
+            Converter::Fo4Sources sources;
+            sources.diffuse = diffuse;
+            sources.specular = specular;
+            const Converter::ConvertedImages expected = Converter::convertFo4(sources, material, Converter::Options());
+            check(nodeOutput.error.isEmpty()
+                    && nodeOutput.outputs.value(QStringLiteral("baseColor")).image() == expected.baseColor
+                    && nodeOutput.outputs.value(QStringLiteral("rmaos")).image() == expected.rmaos,
+                QStringLiteral("convert.fo4 node matches a direct convertFo4 call texel for texel: %1").arg(nodeOutput.error));
+            check(qFuzzyCompare(nodeOutput.outputs.value(QStringLiteral("metalCoverage")).scalar() + 1.0f,
+                    expected.metalCoverage + 1.0f) && expected.metalCoverage > 0.0f,
+                QStringLiteral("convert.fo4 node reports the orchestrator's metal coverage"));
+
+            // Per-parameter fidelity: the node's params reach the math.
+            args.params.insert(QStringLiteral("glossCurve"), 2.5);
+            NodeGraph::EvalOutput curved;
+            convertSpec->evaluate(args, &curved);
+            Converter::Options curvedOptions;
+            curvedOptions.glossCurve = 2.5f;
+            check(curved.outputs.value(QStringLiteral("rmaos")).image()
+                    == Converter::convertFo4(sources, material, curvedOptions).rmaos,
+                QStringLiteral("node parameters reach the conversion math"));
+        }
+
+        // Evaluator: dependency order, thumbnails, and incremental caching, on
+        // a graph of pure generators so the test needs nothing from disk.
+        {
+            NodeGraph::Graph chain;
+            const QString constant = chain.addNode(QStringLiteral("image.constant"),
+                *registry.find(QStringLiteral("image.constant")), QPointF(0, 0));
+            const QString levels = chain.addNode(QStringLiteral("image.levels"),
+                *registry.find(QStringLiteral("image.levels")), QPointF(200, 0));
+            const QString inverted = chain.addNode(QStringLiteral("image.invert"), *invertSpec, QPointF(400, 0));
+            chain.node(constant)->params.insert(QStringLiteral("size"), 32);
+            chain.node(constant)->params.insert(QStringLiteral("r"), 0.25);
+            chain.connect(registry, {constant, QStringLiteral("image"), levels, QStringLiteral("image")});
+            chain.connect(registry, {levels, QStringLiteral("image"), inverted, QStringLiteral("image")});
+
+            NodeGraph::Evaluator evaluator(registry);
+            NodeGraph::EvalContext context;
+            const QHash<QString, NodeGraph::NodeResult> first = evaluator.evaluate(chain, context);
+            check(first[constant].error.isEmpty() && first[inverted].error.isEmpty()
+                    && first[inverted].outputs.value(QStringLiteral("image")).image().size() == QSize(32, 32),
+                QStringLiteral("the evaluator runs a chain in dependency order"));
+            check(!first[constant].thumbnails.value(QStringLiteral("image")).isNull()
+                    && !first[inverted].thumbnails.value(QStringLiteral("image")).isNull(),
+                QStringLiteral("every image output carries a thumbnail"));
+            check(first[inverted].outputs.value(QStringLiteral("image")).image().pixelColor(4, 4).red()
+                    == 255 - first[levels].outputs.value(QStringLiteral("image")).image().pixelColor(4, 4).red(),
+                QStringLiteral("values actually flow down the chain"));
+
+            const QHash<QString, NodeGraph::NodeResult> second = evaluator.evaluate(chain, context);
+            bool allCached = true;
+            for (auto it = second.constBegin(); it != second.constEnd(); ++it) allCached = allCached && it.value().cached;
+            check(allCached, QStringLiteral("an unchanged second evaluation is served entirely from cache"));
+
+            chain.node(levels)->params.insert(QStringLiteral("gamma"), 2.0);
+            const QHash<QString, NodeGraph::NodeResult> third = evaluator.evaluate(chain, context);
+            check(third[constant].cached && !third[levels].cached && !third[inverted].cached,
+                QStringLiteral("a parameter change re-runs that node and its dependents, not its inputs"));
+        }
     }
 
     QTextStream(stdout) << "Failures: " << failures << Qt::endl;
