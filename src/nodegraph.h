@@ -90,6 +90,9 @@ struct EvalContext {
     QString referenceMesh; // optional NIF for geometry bakes
     bool previewMode = true; // preview evaluates but never writes to disk
     int thumbnailSize = 128;
+    // Preview-only source downsample so interactive edits stay responsive on
+    // 2K/4K sources; 0 evaluates at full resolution (what conversion uses).
+    int previewMaxSize = 0;
 };
 
 struct EvalArgs {

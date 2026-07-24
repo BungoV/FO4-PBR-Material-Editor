@@ -318,10 +318,23 @@ void registerAll(Registry& registry)
                 return;
             }
             QString error;
-            const QImage image = TextureImage::load(authored, args.context.textureRoot, &error);
+            QImage image = TextureImage::load(authored, args.context.textureRoot, &error);
+            if (image.isNull()) {
+                output->outputs.insert(QStringLiteral("image"), Value::fromImage(image));
+                output->notes.append(QStringLiteral("missing: %1").arg(authored));
+                return;
+            }
+            const int full = std::max(image.width(), image.height());
+            const int cap = args.context.previewMaxSize;
+            if (args.context.previewMode && cap > 0 && full > cap) {
+                image = image.scaled(image.width() * cap / full, image.height() * cap / full,
+                    Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+                output->notes.append(QStringLiteral("%1×%2 (preview of %3px)")
+                    .arg(image.width()).arg(image.height()).arg(full));
+            } else {
+                output->notes.append(QStringLiteral("%1×%2").arg(image.width()).arg(image.height()));
+            }
             output->outputs.insert(QStringLiteral("image"), Value::fromImage(image));
-            if (image.isNull()) output->notes.append(QStringLiteral("missing: %1").arg(authored));
-            else output->notes.append(QStringLiteral("%1×%2").arg(image.width()).arg(image.height()));
         };
         registry.add(spec);
     }

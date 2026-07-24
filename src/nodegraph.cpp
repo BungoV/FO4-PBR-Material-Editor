@@ -357,6 +357,7 @@ QHash<QString, NodeResult> Evaluator::evaluate(const Graph& graph, const EvalCon
     QByteArray contextBytes;
     contextBytes += context.textureRoot.toUtf8() + '\x1f' + context.sourcePath.toUtf8() + '\x1f'
         + context.outputRoot.toUtf8() + '\x1f' + context.referenceMesh.toUtf8() + '\x1f'
+        + QByteArray::number(context.previewMaxSize) + '\x1f'
         + (context.previewMode ? "preview" : "write");
     const quint64 contextKey = hashBytes(contextBytes);
 

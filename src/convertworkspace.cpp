@@ -1,10 +1,12 @@
 #include "convertworkspace.h"
 
 #include "bgsmreader.h"
+#include "converternodes.h"
 #include "dragnumericedit.h"
 #include "maskpaint.h"
 #include "materialdocument.h"
 #include "materialpreviewwidget.h"
+#include "nodecanvas.h"
 #include "textureimage.h"
 
 #include <QCheckBox>
@@ -26,6 +28,7 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QStackedWidget>
 #include <QThread>
 #include <QTimer>
 #include <QTreeWidget>
@@ -104,7 +107,9 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     m_queue->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_queue->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_queue->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    connect(m_queue, &QTreeWidget::currentItemChanged, this, [this] { loadOverrideControls(); updateDetail(); });
+    connect(m_queue, &QTreeWidget::currentItemChanged, this, [this] {
+        loadOverrideControls(); updateDetail(); syncGraphToSelection();
+    });
     sideLayout->addWidget(m_queue, 1);
 
     // The review loop: walk exactly the materials that need eyes.
@@ -164,6 +169,14 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     connect(m_cancelButton, &QPushButton::clicked, this, &ConvertWorkspace::cancelRun);
     actionsRow->addWidget(m_cancelButton);
     actionsRow->addStretch();
+    m_graphToggle = new QPushButton(tr("Node Graph"), main);
+    m_graphToggle->setCheckable(true);
+    m_graphToggle->setToolTip(tr("Edit the conversion as a node graph, with a live preview on every stage."));
+    connect(m_graphToggle, &QPushButton::toggled, this, [this](bool on) {
+        m_centerStack->setCurrentIndex(on ? 1 : 0);
+        if (on) { syncGraphToSelection(); evaluateGraph(); }
+    });
+    actionsRow->addWidget(m_graphToggle);
     m_openInAuthor = new QPushButton(tr("Open in Author"), main);
     m_openInAuthor->setEnabled(false);
     m_openInAuthor->setToolTip(tr("Open the converted sibling .pbrm in the Author workspace."));
@@ -329,7 +342,11 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     findingsLayout->addWidget(m_detail);
     mainLayout->addWidget(findingsGroup, 1);
 
-    splitter->addWidget(main);
+    // The centre pane switches between the batch panel and the node graph.
+    m_centerStack = new QStackedWidget(splitter);
+    m_centerStack->addWidget(main);
+    buildGraphMode(m_centerStack);
+    splitter->addWidget(m_centerStack);
 
     // ---- Far right: the same live 3D preview the editor uses, showing the
     // selected material's CONVERTED sibling with the output mod folder as
@@ -625,6 +642,111 @@ void ConvertWorkspace::updateDetail()
             m_detail->addItem(tr("Texture: %1").arg(QDir::toNativeSeparators(texture)));
     }
     m_openInAuthor->setEnabled(entry.result.converted && QFileInfo::exists(entry.result.pbrmPath));
+}
+
+void ConvertWorkspace::buildGraphMode(QWidget* parent)
+{
+    ConverterNodes::registerAll(m_nodeRegistry);
+
+    auto* page = new QWidget(parent);
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(6);
+
+    auto* actions = new QHBoxLayout();
+    actions->setSpacing(7);
+    auto* reset = new QPushButton(tr("Reset to Default"), page);
+    reset->setToolTip(tr("Rebuild the profile's stock conversion graph, discarding edits."));
+    connect(reset, &QPushButton::clicked, this, [this] {
+        m_graphProfile.clear();
+        syncGraphToSelection();
+    });
+    actions->addWidget(reset);
+    auto* frame = new QPushButton(tr("Frame All"), page);
+    connect(frame, &QPushButton::clicked, this, [this] { if (m_canvas) m_canvas->frameAll(); });
+    actions->addWidget(frame);
+    actions->addStretch();
+    auto* hint = new QLabel(tr("Right-click to add nodes · drag ports to wire · click an output to preview it"), page);
+    hint->setObjectName(QStringLiteral("Muted"));
+    actions->addWidget(hint);
+    layout->addLayout(actions);
+
+    auto* split = new QSplitter(Qt::Horizontal, page);
+    m_canvas = new NodeCanvas(m_nodeRegistry, split);
+    m_inspector = new NodeInspector(m_nodeRegistry, split);
+    split->addWidget(m_canvas);
+    split->addWidget(m_inspector);
+    split->setStretchFactor(0, 3);
+    split->setStretchFactor(1, 1);
+    split->setSizes({720, 240});
+    layout->addWidget(split, 1);
+    m_centerStack->addWidget(page);
+
+    // Debounced re-evaluation: dragging a node or a slider should not run the
+    // pipeline on every intermediate value.
+    m_graphEval = new QTimer(this);
+    m_graphEval->setSingleShot(true);
+    m_graphEval->setInterval(180);
+    connect(m_graphEval, &QTimer::timeout, this, &ConvertWorkspace::evaluateGraph);
+
+    connect(m_canvas, &NodeCanvas::graphEdited, this, [this] {
+        m_nodeGraph = m_canvas->graph();
+        m_graphEval->start();
+    });
+    connect(m_canvas, &NodeCanvas::nodeSelected, this, [this](const QString& nodeId) {
+        if (nodeId.isEmpty()) { m_inspector->clear(); return; }
+        m_inspector->showNode(&m_nodeGraph, nodeId, m_lastGraphResults.value(nodeId));
+    });
+    connect(m_inspector, &NodeInspector::parameterChanged, this,
+        [this](const QString& nodeId, const QString& paramId, const QJsonValue& value) {
+            if (NodeGraph::Node* node = m_nodeGraph.node(nodeId)) {
+                node->params.insert(paramId, value);
+                m_canvas->setGraph(m_nodeGraph);
+                m_graphEval->start();
+            }
+        });
+}
+
+void ConvertWorkspace::syncGraphToSelection()
+{
+    if (!m_canvas) return;
+    QTreeWidgetItem* item = m_queue->currentItem();
+    const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
+    if (row < 0 || row >= m_entries.size()) return;
+
+    Bgsm::Material material;
+    if (!Bgsm::readFile(m_entries[row].materialPath, &material, nullptr)) return;
+    const QString profile = material.version > 2 ? QStringLiteral("FO76") : QStringLiteral("FO4");
+    // Edits survive moving between materials of the same title; switching
+    // titles loads that profile's stock graph.
+    if (profile != m_graphProfile) {
+        m_graphProfile = profile;
+        m_nodeGraph = ConverterNodes::defaultGraphFor(material);
+        m_canvas->setGraph(m_nodeGraph);
+        m_canvas->frameAll();
+    }
+    m_graphEval->start();
+}
+
+void ConvertWorkspace::evaluateGraph()
+{
+    if (!m_canvas || m_centerStack->currentIndex() != 1) return;
+    QTreeWidgetItem* item = m_queue->currentItem();
+    const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
+    if (row < 0 || row >= m_entries.size()) return;
+
+    NodeGraph::EvalContext context;
+    context.sourcePath = m_entries[row].materialPath;
+    context.textureRoot = m_textureRootEdit->text().trimmed();
+    context.outputRoot = m_outputEdit->text().trimmed();
+    context.referenceMesh = m_masks.value(currentMaterialKey()).nifPath;
+    context.previewMode = true;
+    context.previewMaxSize = 512; // interactive previews; conversion runs full res
+    m_lastGraphResults = m_nodeEvaluator.evaluate(m_nodeGraph, context);
+    m_canvas->setResults(m_lastGraphResults);
+    if (!m_canvas->selectedNode().isEmpty())
+        m_inspector->showNode(&m_nodeGraph, m_canvas->selectedNode(),
+            m_lastGraphResults.value(m_canvas->selectedNode()));
 }
 
 void ConvertWorkspace::updatePreview(const QueueEntry* entry)

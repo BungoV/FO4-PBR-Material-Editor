@@ -1,6 +1,7 @@
 #pragma once
 
 #include "converter.h"
+#include "nodegraph.h"
 
 #include <QHash>
 #include <QWidget>
@@ -16,11 +17,14 @@ class QLineEdit;
 class QListWidget;
 class QPushButton;
 class QSpinBox;
+class QStackedWidget;
 class QThread;
 class QTimer;
 class QTreeWidget;
 class QTreeWidgetItem;
 class MaterialPreviewWidget;
+class NodeCanvas;
+class NodeInspector;
 
 // The Convert workspace (docs/FO4-Conversion.md): scan a source tree for
 // .bgsm/.bgem materials, run the automatic conversion pipeline over them on
@@ -118,6 +122,22 @@ private:
 
     QTimer* m_liveReconvert = nullptr;   // debounced reconvert while override sliders move
     QString m_sourceImagesFor;           // material whose source maps are loaded in the preview
+
+    // Node-graph mode: the conversion pipeline as an editable graph with a
+    // live thumbnail on every node.
+    void buildGraphMode(QWidget* parent);
+    void evaluateGraph();
+    void syncGraphToSelection();
+    NodeGraph::Registry m_nodeRegistry;
+    NodeGraph::Evaluator m_nodeEvaluator{m_nodeRegistry};
+    NodeGraph::Graph m_nodeGraph;
+    QString m_graphProfile;              // "FO4"/"FO76" the loaded graph was built for
+    QStackedWidget* m_centerStack = nullptr;
+    NodeCanvas* m_canvas = nullptr;
+    NodeInspector* m_inspector = nullptr;
+    QPushButton* m_graphToggle = nullptr;
+    QTimer* m_graphEval = nullptr;
+    QHash<QString, NodeGraph::NodeResult> m_lastGraphResults;
     QHash<QString, MaterialOverride> m_overrides;
     QHash<QString, MaskState> m_masks;
     QVector<int> m_maskElements;      // cached element ids for the loaded mesh

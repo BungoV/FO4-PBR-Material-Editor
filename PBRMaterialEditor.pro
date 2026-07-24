@@ -16,6 +16,7 @@ SOURCES += \
     src/convertercore.cpp \
     src/converternodes.cpp \
     src/convertworkspace.cpp \
+    src/nodecanvas.cpp \
     src/nodegraph.cpp \
     src/geometryao.cpp \
     src/maskpaint.cpp \
@@ -44,7 +45,10 @@ HEADERS += \
     src/clicommands.h \
     src/converter.h \
     src/convertercore.h \
+    src/converternodes.h \
     src/convertworkspace.h \
+    src/nodecanvas.h \
+    src/nodegraph.h \
     src/geometryao.h \
     src/maskpaint.h \
     src/normalderive.h \
