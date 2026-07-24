@@ -17,7 +17,7 @@ class QLineEdit;
 class QListWidget;
 class QPushButton;
 class QSpinBox;
-class QStackedWidget;
+class QSplitter;
 class QThread;
 class QTimer;
 class QTreeWidget;
@@ -97,20 +97,10 @@ private:
     QPushButton* m_convertSelectedButton = nullptr;
     QPushButton* m_convertAllButton = nullptr;
     QPushButton* m_cancelButton = nullptr;
-    QDoubleSpinBox* m_recovery = nullptr;
-    QDoubleSpinBox* m_glossCurve = nullptr;
-    QDoubleSpinBox* m_derivationSize = nullptr;
-    QCheckBox* m_heightInBlue = nullptr;
-    QCheckBox* m_detailAo = nullptr;
-    QCheckBox* m_metalDiagnostic = nullptr;
     QPushButton* m_prevFlagged = nullptr;
     QPushButton* m_nextFlagged = nullptr;
     QLabel* m_flaggedSummary = nullptr;
-    QCheckBox* m_overrideEnabled = nullptr;
-    QDoubleSpinBox* m_overrideRecovery = nullptr;
-    QDoubleSpinBox* m_overrideGlossCurve = nullptr;
-    QDoubleSpinBox* m_overrideSpecPercentile = nullptr;
-    QPushButton* m_reconvertButton = nullptr;
+    class QHBoxLayout* m_actionsRow = nullptr; // hoisted above the graph
     QGroupBox* m_selectedGroup = nullptr;
     QPushButton* m_maskLoadNif = nullptr;
     QComboBox* m_maskFillMode = nullptr;
@@ -120,22 +110,20 @@ private:
     QPushButton* m_maskSave = nullptr;
     QLabel* m_maskStatus = nullptr;
 
-    QTimer* m_liveReconvert = nullptr;   // debounced reconvert while override sliders move
     QString m_sourceImagesFor;           // material whose source maps are loaded in the preview
 
     // Node-graph mode: the conversion pipeline as an editable graph with a
     // live thumbnail on every node.
-    void buildGraphMode(QWidget* parent);
+    void buildGraphMode(QSplitter* parent);
     void evaluateGraph();
     void syncGraphToSelection();
+    void showNodeInPreview(const QString& nodeId);
     NodeGraph::Registry m_nodeRegistry;
     NodeGraph::Evaluator m_nodeEvaluator{m_nodeRegistry};
     NodeGraph::Graph m_nodeGraph;
     QString m_graphProfile;              // "FO4"/"FO76" the loaded graph was built for
-    QStackedWidget* m_centerStack = nullptr;
     NodeCanvas* m_canvas = nullptr;
     NodeInspector* m_inspector = nullptr;
-    QPushButton* m_graphToggle = nullptr;
     QTimer* m_graphEval = nullptr;
     QHash<QString, NodeGraph::NodeResult> m_lastGraphResults;
     QHash<QString, MaterialOverride> m_overrides;

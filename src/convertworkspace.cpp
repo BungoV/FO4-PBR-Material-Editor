@@ -135,7 +135,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
 
     // ---- Center: actions on top, then batch options, the selected
     // material's tools, and the findings — one concern per card.
-    auto* main = new QFrame(splitter);
+    auto* main = new QFrame(this); // holder only; its children are redistributed below
     auto* mainLayout = new QVBoxLayout(main);
     mainLayout->setContentsMargins(7, 7, 7, 7);
     mainLayout->setSpacing(7);
@@ -170,14 +170,6 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     connect(m_cancelButton, &QPushButton::clicked, this, &ConvertWorkspace::cancelRun);
     actionsRow->addWidget(m_cancelButton);
     actionsRow->addStretch();
-    m_graphToggle = new QPushButton(tr("Node Graph"), main);
-    m_graphToggle->setCheckable(true);
-    m_graphToggle->setToolTip(tr("Edit the conversion as a node graph, with a live preview on every stage."));
-    connect(m_graphToggle, &QPushButton::toggled, this, [this](bool on) {
-        m_centerStack->setCurrentIndex(on ? 1 : 0);
-        if (on) { syncGraphToSelection(); evaluateGraph(); }
-    });
-    actionsRow->addWidget(m_graphToggle);
     m_openInAuthor = new QPushButton(tr("Open in Author"), main);
     m_openInAuthor->setEnabled(false);
     m_openInAuthor->setToolTip(tr("Open the converted sibling .pbrm in the Author workspace."));
@@ -189,108 +181,14 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
             emit openInAuthorRequested(m_entries[row].result.pbrmPath);
     });
     actionsRow->addWidget(m_openInAuthor);
-    mainLayout->addLayout(actionsRow);
+    m_actionsRow = actionsRow;
 
-    // Batch options: apply to every conversion this workspace runs.
-    auto* batchGroup = new QGroupBox(tr("Batch Options"), main);
-    auto* batchGrid = new QGridLayout(batchGroup);
-    batchGrid->setContentsMargins(9, 9, 9, 9);
-    batchGrid->setHorizontalSpacing(9);
-    batchGrid->setVerticalSpacing(6);
-    m_recovery = makeSpin(settings.value(QStringLiteral("Convert/recovery"), 1.0).toDouble(), 0.0, 1.0, 0.05);
-    m_recovery->setToolTip(tr("How strongly dark FO4 metal albedo is rebuilt from spec + cubemap hue."));
-    m_glossCurve = makeSpin(settings.value(QStringLiteral("Convert/glossCurve"), 1.0).toDouble(), 0.25, 4.0, 0.05);
-    m_glossCurve->setToolTip(tr("Response curve for the gloss/smoothness to roughness inversion (1 = linear)."));
-    m_derivationSize = makeSpin(settings.value(QStringLiteral("Convert/derivationSize"), 512).toInt(), 64, 2048, 64, 0);
-    m_derivationSize->setToolTip(tr("Resolution cap for the height/AO derivations (curvature always runs full-res)."));
-    batchGrid->addWidget(new QLabel(tr("Metal recovery"), batchGroup), 0, 0);
-    batchGrid->addWidget(m_recovery, 0, 1);
-    batchGrid->addWidget(new QLabel(tr("Gloss curve"), batchGroup), 0, 2);
-    batchGrid->addWidget(m_glossCurve, 0, 3);
-    batchGrid->addWidget(new QLabel(tr("Derivation size"), batchGroup), 0, 4);
-    batchGrid->addWidget(m_derivationSize, 0, 5);
-    batchGrid->setColumnStretch(6, 1);
-    m_detailAo = new QCheckBox(tr("Detail AO into RMAOS.B (FO4 sources)"), batchGroup);
-    m_detailAo->setChecked(settings.value(QStringLiteral("Convert/detailAo"), true).toBool());
-    m_heightInBlue = new QCheckBox(tr("Derived height into Normal.B"), batchGroup);
-    m_heightInBlue->setChecked(settings.value(QStringLiteral("Convert/heightInBlue"), false).toBool());
-    m_metalDiagnostic = new QCheckBox(tr("Write metallic diagnostic mask"), batchGroup);
-    m_metalDiagnostic->setChecked(settings.value(QStringLiteral("Convert/metalDiagnostic"), false).toBool());
-    batchGrid->addWidget(m_detailAo, 1, 0, 1, 2);
-    batchGrid->addWidget(m_heightInBlue, 1, 2, 1, 2);
-    batchGrid->addWidget(m_metalDiagnostic, 1, 4, 1, 3);
-    mainLayout->addWidget(batchGroup);
-
-    // Selected material: overrides + correction masking, disabled until a
-    // queue row is chosen so the scope is unmistakable.
-    m_selectedGroup = new QGroupBox(tr("Selected Material"), main);
+    // Correction masking stays material-scoped, so it keeps its own group,
+    // disabled until a queue row is chosen.
+    m_selectedGroup = new QGroupBox(tr("Selected Material"), side);
     auto* selectedLayout = new QVBoxLayout(m_selectedGroup);
     selectedLayout->setContentsMargins(9, 9, 9, 9);
     selectedLayout->setSpacing(6);
-
-    auto* overrideRow = new QHBoxLayout();
-    overrideRow->setSpacing(9);
-    m_overrideEnabled = new QCheckBox(tr("Override math"), m_selectedGroup);
-    m_overrideEnabled->setToolTip(tr("Tune the conversion for this material only; batch runs keep the global options."));
-    overrideRow->addWidget(m_overrideEnabled);
-    m_overrideRecovery = makeSpin(1.0, 0.0, 1.0, 0.05);
-    m_overrideGlossCurve = makeSpin(1.0, 0.25, 4.0, 0.05);
-    m_overrideSpecPercentile = makeSpin(0.98, 0.5, 1.0, 0.01);
-    m_overrideSpecPercentile->setToolTip(tr("Percentile used to tame blown-out FO4 spec maps; lower clamps harder."));
-    overrideRow->addWidget(new QLabel(tr("Recovery"), m_selectedGroup));
-    overrideRow->addWidget(m_overrideRecovery);
-    overrideRow->addWidget(new QLabel(tr("Gloss curve"), m_selectedGroup));
-    overrideRow->addWidget(m_overrideGlossCurve);
-    overrideRow->addWidget(new QLabel(tr("Spec clamp %"), m_selectedGroup));
-    overrideRow->addWidget(m_overrideSpecPercentile);
-    overrideRow->addStretch();
-    m_reconvertButton = new QPushButton(tr("Reconvert This"), m_selectedGroup);
-    m_reconvertButton->setToolTip(tr("Convert only the selected material with these overrides."));
-    connect(m_reconvertButton, &QPushButton::clicked, this, [this] { startRun(false, RunScope::CurrentRow); });
-    overrideRow->addWidget(m_reconvertButton);
-    selectedLayout->addLayout(overrideRow);
-    const auto storeOverride = [this] {
-        QTreeWidgetItem* item = m_queue->currentItem();
-        const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
-        if (row < 0 || row >= m_entries.size()) return;
-        const QString key = m_entries[row].materialPath.toLower();
-        const QString maskPath = m_overrides.value(key).maskPath; // survives the toggle
-        if (m_overrideEnabled->isChecked()) {
-            m_overrides.insert(key, {float(m_overrideRecovery->value()), float(m_overrideGlossCurve->value()),
-                float(m_overrideSpecPercentile->value()), maskPath});
-        } else if (!maskPath.isEmpty()) {
-            m_overrides.insert(key, {1.0f, 1.0f, 0.98f, maskPath});
-        } else {
-            m_overrides.remove(key);
-        }
-    };
-    // Live tuning: moving a slider implies override intent, so the checkbox
-    // self-enables, the override stores, and a debounced reconvert of the
-    // selected material refreshes the preview without pressing the button.
-    m_liveReconvert = new QTimer(this);
-    m_liveReconvert->setSingleShot(true);
-    connect(m_liveReconvert, &QTimer::timeout, this, [this] {
-        if (m_running) { m_liveReconvert->start(400); return; } // a run is in flight; retry shortly
-        QTreeWidgetItem* item = m_queue->currentItem();
-        const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
-        if (row < 0 || row >= m_entries.size()) return;
-        startRun(false, RunScope::CurrentRow);
-    });
-    const auto liveAdjust = [this, storeOverride] {
-        if (!m_overrideEnabled->isChecked()) {
-            const QSignalBlocker blocker(m_overrideEnabled);
-            m_overrideEnabled->setChecked(true);
-        }
-        storeOverride();
-        m_liveReconvert->start(500);
-    };
-    connect(m_overrideEnabled, &QCheckBox::toggled, this, [this, storeOverride] {
-        storeOverride();
-        m_liveReconvert->start(500);
-    });
-    connect(m_overrideRecovery, qOverload<double>(&QDoubleSpinBox::valueChanged), this, liveAdjust);
-    connect(m_overrideGlossCurve, qOverload<double>(&QDoubleSpinBox::valueChanged), this, liveAdjust);
-    connect(m_overrideSpecPercentile, qOverload<double>(&QDoubleSpinBox::valueChanged), this, liveAdjust);
 
     // Correction masking: load the material's reference NIF, click parts in
     // the preview to force dielectric/metal, save the 0.5-neutral sidecar.
@@ -332,22 +230,21 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     m_maskStatus->setWordWrap(true);
     selectedLayout->addWidget(m_maskStatus);
     m_selectedGroup->setEnabled(false);
-    mainLayout->addWidget(m_selectedGroup);
+    sideLayout->addWidget(m_selectedGroup);
 
-    auto* findingsGroup = new QGroupBox(tr("Findings"), main);
+    auto* findingsGroup = new QGroupBox(tr("Findings"), side);
     auto* findingsLayout = new QVBoxLayout(findingsGroup);
     findingsLayout->setContentsMargins(9, 9, 9, 9);
     m_detail = new QListWidget(findingsGroup);
     m_detail->setWordWrap(true);
     m_detail->setFrameShape(QFrame::NoFrame);
+    m_detail->setMaximumHeight(150);
     findingsLayout->addWidget(m_detail);
-    mainLayout->addWidget(findingsGroup, 1);
+    sideLayout->addWidget(findingsGroup);
 
-    // The centre pane switches between the batch panel and the node graph.
-    m_centerStack = new QStackedWidget(splitter);
-    m_centerStack->addWidget(main);
-    buildGraphMode(m_centerStack);
-    splitter->addWidget(m_centerStack);
+    // The centre pane IS the graph: the conversion's settings are its node
+    // parameters, so there is no second panel to switch to.
+    buildGraphMode(splitter);
 
     // ---- Far right: the same live 3D preview the editor uses, showing the
     // selected material's CONVERTED sibling with the output mod folder as
@@ -357,7 +254,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     splitter->addWidget(m_preview);
     // The 3D viewport opens at a third of the window width, matching the
     // authoring workspace.
-    splitter->setSizes({330, 950, 640});
+    splitter->setSizes({340, 940, 640});
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 2);
     splitter->setStretchFactor(2, 1);
@@ -384,12 +281,6 @@ void ConvertWorkspace::persistSettings() const
     settings.setValue(QStringLiteral("Convert/sourceRoot"), m_sourceEdit->text());
     settings.setValue(QStringLiteral("Convert/textureRoot"), m_textureRootEdit->text());
     settings.setValue(QStringLiteral("Convert/outputRoot"), m_outputEdit->text());
-    settings.setValue(QStringLiteral("Convert/recovery"), m_recovery->value());
-    settings.setValue(QStringLiteral("Convert/glossCurve"), m_glossCurve->value());
-    settings.setValue(QStringLiteral("Convert/derivationSize"), m_derivationSize->value());
-    settings.setValue(QStringLiteral("Convert/detailAo"), m_detailAo->isChecked());
-    settings.setValue(QStringLiteral("Convert/heightInBlue"), m_heightInBlue->isChecked());
-    settings.setValue(QStringLiteral("Convert/metalDiagnostic"), m_metalDiagnostic->isChecked());
 }
 
 void ConvertWorkspace::browseFolder(QLineEdit* edit, const QString& title)
@@ -441,16 +332,12 @@ void ConvertWorkspace::scanSources()
 
 Converter::JobOptions ConvertWorkspace::collectOptions(bool dryRun) const
 {
+    // Conversion math now lives in the graph's nodes; this only carries where
+    // the run writes and how it reports.
     Converter::JobOptions job;
     job.outputRoot = QDir::fromNativeSeparators(m_outputEdit->text().trimmed());
     job.textureRoot = QDir::fromNativeSeparators(m_textureRootEdit->text().trimmed());
     job.dryRun = dryRun;
-    job.detailAo = m_detailAo->isChecked();
-    job.heightInBlue = m_heightInBlue->isChecked();
-    job.writeMetallicDiagnostic = m_metalDiagnostic->isChecked();
-    job.math.recoveryStrength = float(m_recovery->value());
-    job.math.glossCurve = float(m_glossCurve->value());
-    job.derive.derivationSize = int(m_derivationSize->value());
     return job;
 }
 
@@ -486,12 +373,7 @@ void ConvertWorkspace::startRun(bool dryRun, RunScope scope)
         paths.append(m_entries[row].materialPath);
         Converter::JobOptions rowJob = job;
         const auto override = m_overrides.constFind(m_entries[row].materialPath.toLower());
-        if (override != m_overrides.constEnd()) {
-            rowJob.math.recoveryStrength = override->recovery;
-            rowJob.math.glossCurve = override->glossCurve;
-            rowJob.math.specNormalizePercentile = override->specPercentile;
-            rowJob.correctionMaskPath = override->maskPath;
-        }
+        if (override != m_overrides.constEnd()) rowJob.correctionMaskPath = override->maskPath;
         // A loaded reference mesh also drives the geometry AO bake.
         const auto maskState = m_masks.constFind(m_entries[row].materialPath.toLower());
         if (maskState != m_masks.constEnd()) rowJob.geometryNifPath = maskState->nifPath;
@@ -505,7 +387,8 @@ void ConvertWorkspace::startRun(bool dryRun, RunScope scope)
     m_queueSummary->setText(dryRun ? tr("Dry run in progress…") : tr("Converting…"));
     updateButtons();
 
-    m_worker = QThread::create([this, jobs, rows, paths] {
+    const NodeGraph::Graph graph = m_nodeGraph; // snapshot: edits during a run do not change it
+    m_worker = QThread::create([this, jobs, rows, paths, graph] {
         Converter::TextureCache cache;
         for (int index = 0; index < rows.size(); ++index) {
             if (m_cancelRequested) {
@@ -517,7 +400,21 @@ void ConvertWorkspace::startRun(bool dryRun, RunScope scope)
                 if (row < m_queue->topLevelItemCount())
                     m_queue->topLevelItem(row)->setText(1, tr("Converting…"));
             }, Qt::QueuedConnection);
-            const Converter::JobResult result = Converter::convertMaterial(paths[index], jobs[index], &cache);
+            // The graph is the pipeline: it produces this material's images,
+            // and the orchestrator writes them exactly as it writes a batch
+            // conversion (proven byte-identical).
+            Converter::JobOptions rowJob = jobs[index];
+            QStringList graphErrors;
+            rowJob.supplied = ConverterNodes::runGraph(graph, paths[index],
+                rowJob.textureRoot, rowJob.geometryNifPath, &graphErrors);
+            Converter::JobResult result;
+            if (!rowJob.supplied.active) {
+                result.materialPath = paths[index];
+                result.errors.append(graphErrors.isEmpty()
+                    ? QStringLiteral("the graph produced no output") : graphErrors.join(QStringLiteral("; ")));
+            } else {
+                result = Converter::convertMaterial(paths[index], rowJob, &cache);
+            }
             QMetaObject::invokeMethod(this, [this, row, result] {
                 handleResult(row, result);
             }, Qt::QueuedConnection);
@@ -555,22 +452,15 @@ void ConvertWorkspace::stepFlagged(int direction)
 
 void ConvertWorkspace::loadOverrideControls()
 {
+    // Conversion tuning moved into the graph; only the mask tools are still
+    // scoped to one material.
     QTreeWidgetItem* item = m_queue->currentItem();
     const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
     const bool valid = row >= 0 && row < m_entries.size();
-    const QSignalBlocker a(m_overrideEnabled), b(m_overrideRecovery), c(m_overrideGlossCurve), d(m_overrideSpecPercentile);
     m_selectedGroup->setEnabled(valid);
     m_selectedGroup->setTitle(valid
         ? tr("Selected Material — %1").arg(QFileInfo(m_entries[row].materialPath).fileName())
         : tr("Selected Material"));
-    m_reconvertButton->setEnabled(valid && !m_running);
-    if (!valid) { m_overrideEnabled->setChecked(false); return; }
-    const auto override = m_overrides.constFind(m_entries[row].materialPath.toLower());
-    const bool has = override != m_overrides.constEnd();
-    m_overrideEnabled->setChecked(has);
-    m_overrideRecovery->setValue(has ? override->recovery : m_recovery->value());
-    m_overrideGlossCurve->setValue(has ? override->glossCurve : m_glossCurve->value());
-    m_overrideSpecPercentile->setValue(has ? override->specPercentile : 0.98);
 }
 
 void ConvertWorkspace::cancelRun()
@@ -645,17 +535,18 @@ void ConvertWorkspace::updateDetail()
     m_openInAuthor->setEnabled(entry.result.converted && QFileInfo::exists(entry.result.pbrmPath));
 }
 
-void ConvertWorkspace::buildGraphMode(QWidget* parent)
+void ConvertWorkspace::buildGraphMode(QSplitter* parent)
 {
     ConverterNodes::registerAll(m_nodeRegistry);
 
     auto* page = new QWidget(parent);
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setContentsMargins(6, 6, 6, 6);
     layout->setSpacing(6);
 
     auto* actions = new QHBoxLayout();
     actions->setSpacing(7);
+    if (m_actionsRow) { layout->addLayout(m_actionsRow); m_actionsRow = nullptr; }
     auto* reset = new QPushButton(tr("Reset to Default"), page);
     reset->setToolTip(tr("Rebuild the profile's stock conversion graph, discarding edits."));
     connect(reset, &QPushButton::clicked, this, [this] {
@@ -710,7 +601,7 @@ void ConvertWorkspace::buildGraphMode(QWidget* parent)
     split->setStretchFactor(1, 1);
     split->setSizes({720, 240});
     layout->addWidget(split, 1);
-    m_centerStack->addWidget(page);
+    parent->addWidget(page);
 
     // Debounced re-evaluation: dragging a node or a slider should not run the
     // pipeline on every intermediate value.
@@ -724,8 +615,15 @@ void ConvertWorkspace::buildGraphMode(QWidget* parent)
         m_graphEval->start();
     });
     connect(m_canvas, &NodeCanvas::nodeSelected, this, [this](const QString& nodeId) {
-        if (nodeId.isEmpty()) { m_inspector->clear(); return; }
+        if (nodeId.isEmpty()) {
+            m_inspector->clear();
+            // Back to the converted material on the surface.
+            m_preview->canvas()->setNodeOutputImage(QImage());
+            m_preview->setRenderMode(PbrPreviewGL::DebugView::Shaded);
+            return;
+        }
         m_inspector->showNode(&m_nodeGraph, nodeId, m_lastGraphResults.value(nodeId));
+        showNodeInPreview(nodeId);
     });
     connect(m_inspector, &NodeInspector::parameterChanged, this,
         [this](const QString& nodeId, const QString& paramId, const QJsonValue& value) {
@@ -760,7 +658,7 @@ void ConvertWorkspace::syncGraphToSelection()
 
 void ConvertWorkspace::evaluateGraph()
 {
-    if (!m_canvas || m_centerStack->currentIndex() != 1) return;
+    if (!m_canvas) return;
     QTreeWidgetItem* item = m_queue->currentItem();
     const int row = item ? m_queue->indexOfTopLevelItem(item) : -1;
     if (row < 0 || row >= m_entries.size()) return;
@@ -774,9 +672,30 @@ void ConvertWorkspace::evaluateGraph()
     context.previewMaxSize = 512; // interactive previews; conversion runs full res
     m_lastGraphResults = m_nodeEvaluator.evaluate(m_nodeGraph, context);
     m_canvas->setResults(m_lastGraphResults);
-    if (!m_canvas->selectedNode().isEmpty())
+    if (!m_canvas->selectedNode().isEmpty()) {
         m_inspector->showNode(&m_nodeGraph, m_canvas->selectedNode(),
             m_lastGraphResults.value(m_canvas->selectedNode()));
+        showNodeInPreview(m_canvas->selectedNode());
+    }
+}
+
+void ConvertWorkspace::showNodeInPreview(const QString& nodeId)
+{
+    // Selecting a node puts its output on the preview surface at full
+    // resolution — the graph thumbnail is only 128px, this is the real look.
+    const NodeGraph::Node* node = m_nodeGraph.node(nodeId);
+    const NodeGraph::NodeTypeSpec* spec = node ? m_nodeRegistry.find(node->typeId) : nullptr;
+    if (!spec) return;
+    const NodeGraph::NodeResult& result = m_lastGraphResults.value(nodeId);
+    QImage image;
+    for (const NodeGraph::PortSpec& port : spec->outputs) {
+        if (port.type != NodeGraph::ValueType::Image) continue;
+        const QImage candidate = result.outputs.value(port.id).image();
+        if (!candidate.isNull()) { image = candidate; break; }
+    }
+    m_preview->canvas()->setNodeOutputImage(image);
+    m_preview->setRenderMode(image.isNull()
+        ? PbrPreviewGL::DebugView::Shaded : PbrPreviewGL::DebugView::NodeOutput);
 }
 
 void ConvertWorkspace::updatePreview(const QueueEntry* entry)
@@ -927,5 +846,4 @@ void ConvertWorkspace::updateButtons()
     m_convertSelectedButton->setEnabled(!m_running && haveQueue);
     m_convertAllButton->setEnabled(!m_running && haveQueue);
     m_cancelButton->setEnabled(m_running);
-    m_reconvertButton->setEnabled(!m_running && haveQueue && m_queue->currentItem());
 }

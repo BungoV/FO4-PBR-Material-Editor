@@ -263,6 +263,7 @@ PbrPreviewGL::~PbrPreviewGL()
     m_bloomProgram.reset(); m_compositeProgram.reset(); m_sceneFbo.reset(); m_bloomFboA.reset(); m_bloomFboB.reset();
     m_ssaoProgram.reset(); m_ssaoFboA.reset(); m_ssaoFboB.reset();
     for (auto& sourceTexture : m_sourceTextures) sourceTexture.reset();
+    m_nodeOutputTexture.reset();
     if (m_sceneDepthTexture) { glDeleteTextures(1, &m_sceneDepthTexture); m_sceneDepthTexture = 0; }
     m_traceProgram.reset(); m_presentProgram.reset(); m_denoiseProgram.reset();
     m_accumFboA.reset(); m_accumFboB.reset(); m_denoiseFboA.reset(); m_denoiseFboB.reset();
@@ -1149,6 +1150,13 @@ void PbrPreviewGL::setSourceComparisonImages(const QImage& diffuse, const QImage
     update();
 }
 
+void PbrPreviewGL::setNodeOutputImage(const QImage& image)
+{
+    m_nodeOutputImage = image;
+    m_nodeOutputDirty = true;
+    update();
+}
+
 void PbrPreviewGL::uploadSourceComparisonTextures()
 {
     for (int i = 0; i < 4; ++i) {
@@ -1566,6 +1574,7 @@ void PbrPreviewGL::initializeGL()
         uniform bool uMirrorPrimaryUv;
         uniform int uTonemapOperator;
         uniform sampler2D uSource0,uSource1,uSource2,uSource3; // converter source maps
+        uniform sampler2D uNodeOutput;                         // selected graph node's output
         const float PI=3.14159265359;
         vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
         vec2 addressUv(vec2 uv,int mode){
@@ -2381,6 +2390,7 @@ void PbrPreviewGL::initializeGL()
             if(dbgView==22){fragColor=vec4(texture(uSource1,uv).rgb,1);return;}
             if(dbgView==23){fragColor=vec4(texture(uSource2,uv).rgb,1);return;}
             if(dbgView==24){fragColor=vec4(texture(uSource3,uv).rgb,1);return;}
+            if(dbgView==25){fragColor=vec4(texture(uNodeOutput,uv).rgb,1);return;}
             if(unlitMaterial){vec3 unlit=base*uUnlitIntensity+particleEdgeGlow;if(uUnlitVertexColor)unlit*=vColor.rgb;fragColor=vec4(uUnlitExposure?tonemap(unlit):pow(max(unlit,vec3(0.0)),vec3(1.0/2.2)),opacity);return;}
             if(uSpecularAa&&!defaults){
                 // Tokuyoshi/Kaplanyan screen-space variance: widen the lobe where
@@ -4050,6 +4060,26 @@ void PbrPreviewGL::setPathTraced(bool enabled)
     update();
 }
 
+void PbrPreviewGL::setFlatView(bool enabled)
+{
+    if (m_flatView == enabled) return;
+    m_flatView = enabled;
+    if (enabled) {
+        m_shapeBeforeFlat = m_shape;
+        setPlaneOptions(PreviewMeshes::PlaneOrientation::XY, true);
+        setShape(Shape::Plane);
+        setProjection(Projection::Orthographic);
+        setAxisView(AxisView::Front);
+        frameObject();
+    } else {
+        setShape(m_shapeBeforeFlat);
+        setProjection(Projection::Perspective);
+        frameObject();
+    }
+    emit projectionChanged();
+    update();
+}
+
 void PbrPreviewGL::setTraceDenoise(bool enabled)
 {
     if (m_traceDenoise == enabled) return;
@@ -4346,6 +4376,17 @@ void PbrPreviewGL::paintGL()
     m_secondaryBaseTexture->bind(6);m_secondaryNormalTexture->bind(7);m_secondaryRmaosTexture->bind(8);m_secondaryEmissiveTexture->bind(9);m_layerCoverageTexture->bind(10);m_gradientTexture->bind(11);
     m_tertiaryBaseTexture->bind(16);m_tertiaryNormalTexture->bind(17);m_tertiaryRmaosTexture->bind(18);m_tertiaryEmissiveTexture->bind(19);m_tertiaryCoverageTexture->bind(20);
     m_interiorTexture->bind(21);m_program->setUniformValue("uInterior",21);
+    if(m_nodeOutputDirty){
+        QImage image=m_nodeOutputImage;
+        if(image.isNull()){image=QImage(2,2,QImage::Format_RGBA8888);image.fill(QColor(40,40,44));}
+        m_nodeOutputTexture=std::make_unique<QOpenGLTexture>(image.convertToFormat(QImage::Format_RGBA8888).mirrored(),
+            QOpenGLTexture::DontGenerateMipMaps);
+        m_nodeOutputTexture->setMinificationFilter(QOpenGLTexture::Linear);
+        m_nodeOutputTexture->setMagnificationFilter(QOpenGLTexture::Linear);
+        m_nodeOutputTexture->setWrapMode(QOpenGLTexture::Repeat);
+        m_nodeOutputDirty=false;
+    }
+    if(m_nodeOutputTexture){m_nodeOutputTexture->bind(28);m_program->setUniformValue("uNodeOutput",28);}
     if(m_sourceDirty)uploadSourceComparisonTextures();
     if(m_sourceTextures[0]){
         m_sourceTextures[0]->bind(24);m_sourceTextures[1]->bind(25);m_sourceTextures[2]->bind(26);m_sourceTextures[3]->bind(27);
@@ -5157,6 +5198,13 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     ssaoLayout->addWidget(m_ssao);ssaoLayout->addWidget(m_ssaoStrength,1);
     m_antiAliasing=new QComboBox(display);m_antiAliasing->addItem(tr("Off"),1);m_antiAliasing->addItem(tr("MSAA 2x"),2);m_antiAliasing->addItem(tr("MSAA 4x"),4);m_antiAliasing->addItem(tr("MSAA 8x"),8);m_antiAliasing->setCurrentIndex(2);m_antiAliasing->setToolTip(tr("Multisampled viewport rendering. Editor preference only; never stored in the material."));
     auto* traceRow=new QWidget(display);auto* traceLayout=new QHBoxLayout(traceRow);traceLayout->setContentsMargins(0,0,0,0);traceLayout->setSpacing(7);
+    m_flatView=new QCheckBox(tr("Flat 2D view"),display);
+    m_flatView->setToolTip(tr("Show the material on a lit camera-facing plane instead of the 3D mesh, like Substance Painter's 2D view."));
+    connect(m_flatView,&QCheckBox::toggled,this,[this](bool on){
+        m_materialCanvas->setFlatView(on);
+        m_shape->setEnabled(!on);
+        savePreviewSettings();
+    });
     m_pathTrace=new QCheckBox(tr("Path-traced reference"),traceRow);
     m_pathTrace->setToolTip(tr("Progressive path tracing of the preview scene: true soft shadows, bounce light, emissive illumination, and real reflections, converging while the camera is still. Uses tangent-space normal maps and the material's subsurface settings. Reference simplifications: primary layer only, no states or parallax. Bloom, SSAO, MSAA, and debug views pause while active."));
     m_traceDenoise=new QCheckBox(tr("Denoise"),traceRow);m_traceDenoise->setChecked(true);m_traceDenoise->setEnabled(false);
@@ -5164,7 +5212,7 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     traceLayout->addWidget(m_pathTrace);traceLayout->addStretch();traceLayout->addWidget(m_traceDenoise);
     m_ground=new QCheckBox(tr("Show ground plane"),display);m_ground->setChecked(true);m_compare=new QCheckBox(tr("Compare with defaults (split view)"),display);m_compare->setToolTip(tr("Split the object between the current material and its default values."));
     m_grid=new QCheckBox(tr("Ground grid with axis directions"),display);m_grid->setChecked(true);m_grid->setToolTip(tr("NifSkope-style grid on the ground: X axis red, Z axis blue, direction labels at the ends."));
-    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Split left mode"),m_debugLeft);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),traceRow);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
+    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Split left mode"),m_debugLeft);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),m_flatView);displayForm->addRow(QString(),traceRow);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
     auto* referenceRow=new QWidget(display);auto* referenceLayout=new QHBoxLayout(referenceRow);referenceLayout->setContentsMargins(0,0,0,0);referenceLayout->setSpacing(5);
     auto* referenceLoad=new QPushButton(tr("Load…"),referenceRow);referenceLoad->setToolTip(tr("Show a second read-only material beside this one with a synchronized camera. Lighting and environment are snapshotted when the reference loads."));
     auto* referenceClear=new QPushButton(tr("Clear"),referenceRow);referenceClear->setEnabled(false);
@@ -5568,6 +5616,15 @@ void MaterialPreviewWidget::reloadPreviewCubemaps()
     QSignalBlocker blocker(m_cubemap);m_cubemap->clear();m_cubemap->addItem(tr("Default — %1").arg(QFileInfo(defaultPath).fileName()),defaultPath);
     for(int i=0;i<qMin(names.size(),paths.size());++i)m_cubemap->addItem(names[i],paths[i]);
     int index=m_cubemap->findData(active);if(index<0)index=0;m_cubemap->setCurrentIndex(index);m_materialCanvas->setEnvironmentCubemap(m_cubemap->currentData().toString(),m_textureRoot);refreshDerivedEnvironmentLight(true);
+}
+
+void MaterialPreviewWidget::setRenderMode(PbrPreviewGL::DebugView view)
+{
+    const int index=m_debug->findData(int(view));
+    if(index<0){m_materialCanvas->setDebugView(view);return;} // node output has no combo row
+    QSignalBlocker blocker(m_debug);
+    m_debug->setCurrentIndex(index);
+    m_materialCanvas->setDebugView(view);
 }
 
 void MaterialPreviewWidget::setTextureRoot(const QString& root){m_textureRoot=root;m_materialCanvas->setMaterial(m_document,m_textureRoot);reloadPreviewCubemaps();}

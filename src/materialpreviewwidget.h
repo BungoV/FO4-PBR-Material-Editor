@@ -66,7 +66,8 @@ public:
         Height = 13, RoughnessMetallic = 14, Rmaos = 15, EmissiveMask = 16,
         LayerCoverage = 17, EmissiveColor = 18, Curvature = 19, Validation = 20,
         // Converter comparison views: the ORIGINAL FO4/FO76 source maps.
-        SourceDiffuse = 21, SourceSpec = 22, SourceNormal = 23, SourceExtra = 24
+        SourceDiffuse = 21, SourceSpec = 22, SourceNormal = 23, SourceExtra = 24,
+        NodeOutput = 25 // whatever the selected graph node produced
     };
     enum class AxisView { Front, Back, Left, Right, Top, Bottom };
     struct EnvironmentLight {
@@ -115,6 +116,10 @@ public:
     // Converter comparison: the pre-conversion source maps (diffuse, spec or
     // reflectance, normal, lighting/greyscale) shown by the Source* views.
     void setSourceComparisonImages(const QImage& diffuse, const QImage& spec, const QImage& normal, const QImage& extra);
+    // Shows one graph node's output on the preview surface; a null image
+    // returns the viewport to the material.
+    void setNodeOutputImage(const QImage& image);
+    bool hasNodeOutput() const { return !m_nodeOutputImage.isNull(); }
     void setBloom(bool enabled, float strength);
     void setTonemapOperator(int op);
     void setTurntable(bool enabled, float degreesPerSecond);
@@ -122,6 +127,10 @@ public:
     void setSsao(bool enabled, float strength);
     void setPathTraced(bool enabled);
     bool pathTraced() const { return m_pathTraced; }
+    // Substance-Painter-style flat view: the material on a camera-facing lit
+    // plane, orthographic and framed, instead of on the 3D mesh.
+    void setFlatView(bool enabled);
+    bool flatView() const { return m_flatView; }
     void setTraceDenoise(bool enabled);
     void setGroundEnabled(bool enabled);
     void setGridEnabled(bool enabled);
@@ -243,6 +252,8 @@ private:
     int m_bvhNodeCount = 0, m_bvhTriangleCount = 0;
     bool m_bvhDirty = true;
     bool m_pathTraced = false;
+    bool m_flatView = false;
+    Shape m_shapeBeforeFlat = Shape::Sphere; // restored when leaving the flat view
     int m_accumSamples = 0;
     int m_traceFrame = 0;
     int m_materialGeneration = 0;
@@ -395,6 +406,9 @@ private:
     std::unique_ptr<QOpenGLTexture> m_sourceTextures[4]; // converter source maps (diffuse/spec/normal/extra)
     QImage m_sourceImages[4];
     bool m_sourceDirty = false;
+    std::unique_ptr<QOpenGLTexture> m_nodeOutputTexture;
+    QImage m_nodeOutputImage;
+    bool m_nodeOutputDirty = false;
     float m_debugSplit = 0.0f; // 0 = the map fills the view; else shaded left of the divider
     bool m_bloomEnabled = true;
     float m_bloomStrength = 0.4f;
@@ -483,6 +497,9 @@ class MaterialPreviewWidget final : public QFrame {
 public:
     explicit MaterialPreviewWidget(QWidget* parent = nullptr, bool converterMode = false);
     void setTextureRoot(const QString& textureRoot);
+    // Drives the render-mode combo from outside (the converter selects a graph
+    // node and wants its output on the surface).
+    void setRenderMode(PbrPreviewGL::DebugView view);
     void setMaterial(const Pbr::MaterialDocument& document);
     void reloadPreviewCubemaps();
     PbrPreviewGL* canvas() const { return m_materialCanvas; }
@@ -575,6 +592,7 @@ private:
     DragNumericEdit* m_ssaoStrength = nullptr;
     QCheckBox* m_pathTrace = nullptr;
     QCheckBox* m_traceDenoise = nullptr;
+    QCheckBox* m_flatView = nullptr;
     QCheckBox* m_compare = nullptr;
     QLabel* m_importStatus = nullptr;
     // Dynamic surface-state simulation controls (States tab): one slider per
