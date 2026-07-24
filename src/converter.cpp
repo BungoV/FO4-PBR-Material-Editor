@@ -307,7 +307,14 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     // ---- Profile conversion ----
     ConvertedImages converted;
     const bool fallout76 = material.isFallout76();
-    if (fallout76) {
+    if (options.supplied.active) {
+        // The node graph already ran the profile conversion and derivations.
+        converted.baseColor = options.supplied.baseColor;
+        converted.rmaos = options.supplied.rmaos;
+        converted.emissive = options.supplied.emissive;
+        converted.metalCoverage = options.supplied.metalCoverage;
+        result.notes.append(options.supplied.notes);
+    } else if (fallout76) {
         Fo76Sources sources;
         sources.diffuse = diffuse;
         sources.reflectance = loadSource(material.specularTexture, options.textureRoot, &result.notes, QStringLiteral("reflectance (_r)"));
@@ -335,7 +342,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
 
     // ---- Derivations (curvature always; height/AO per options) ----
     NormalDerive::Results derived;
-    if (!normal.isNull())
+    if (!normal.isNull() && !options.supplied.active)
         derived = NormalDerive::derive(normal, options.derive);
     if (derived.denoised)
         result.notes.append(QStringLiteral("derivation-side denoise engaged (noise metric %1)").arg(derived.noiseMetric, 0, 'f', 3));
@@ -357,8 +364,9 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     if (options.detailAo && !fallout76 && !derived.ao.isNull())
         multiplyIntoAo(derived.ao);
     // Geometry AO from the reference mesh applies to both titles: crevices
-    // the low-poly geometry casts are not in any shipped map.
-    if (!options.geometryNifPath.trimmed().isEmpty()) {
+    // the low-poly geometry casts are not in any shipped map. A supplied
+    // RMAOS already carries whatever AO its graph baked.
+    if (!options.supplied.active && !options.geometryNifPath.trimmed().isEmpty()) {
         QString meshError;
         PreviewMesh referenceMesh = options.geometryNifPath.endsWith(QStringLiteral(".fbx"), Qt::CaseInsensitive)
             ? PreviewMeshes::loadStaticFbx(options.geometryNifPath, &meshError)
@@ -378,7 +386,10 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     // Shipped normal = original RG + derived curvature in A (+ height in B
     // when requested). Without a normal map the slots stay texture-free.
     QImage packedNormal;
-    if (!normal.isNull()) {
+    if (options.supplied.active) {
+        packedNormal = options.supplied.normal.isNull()
+            ? QImage() : options.supplied.normal.convertToFormat(QImage::Format_RGBA8888);
+    } else if (!normal.isNull()) {
         packedNormal = normal.convertToFormat(QImage::Format_RGBA8888);
         const QImage curvature = derived.curvature.isNull() ? QImage()
             : derived.curvature.scaled(packedNormal.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
@@ -398,7 +409,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     // ---- Outputs (dedup'd, collision-safe) ----
     const QString portableDirectory = portableOutputDirectory(diffusePath, materialRelative);
     const QString baseName = baseNameForOutputs(diffusePath);
-    const QString optionsSignature = QStringLiteral("|rs%1|f%2|gc%3|em%4|sp%5|cm%6|ga%7|")
+    const QString optionsSignature = options.supplied.signature + QStringLiteral("|rs%1|f%2|gc%3|em%4|sp%5|cm%6|ga%7|")
         .arg(options.math.recoveryStrength).arg(fallout76).arg(options.math.glossCurve)
         .arg(material.environmentMappingMaskScale).arg(options.math.specNormalizePercentile)
         .arg(options.correctionMaskPath.isEmpty() ? QString()

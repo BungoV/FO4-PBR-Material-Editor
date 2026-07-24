@@ -2006,6 +2006,47 @@ int main(int argc, char* argv[])
         check(ConverterNodes::defaultFo76Graph().validate(registry, &graphErrors),
             QStringLiteral("default FO76 graph validates: %1").arg(graphErrors.join(QStringLiteral("; "))));
 
+        // The stock graphs must reproduce the orchestrator's writes, so every
+        // shipped channel needs an explicit route to an output node. The normal
+        // is the one that bit: leaving B unconnected let channelPack default it
+        // to white, and the written DDS stopped matching a batch run.
+        for (const NodeGraph::Graph& stock : {ConverterNodes::defaultFo4Graph(), ConverterNodes::defaultFo76Graph()}) {
+            QHash<int, QString> outputsByRole;
+            for (const NodeGraph::Node& node : stock.nodes)
+                if (node.typeId == QStringLiteral("output.texture"))
+                    outputsByRole.insert(node.params.value(QStringLiteral("role")).toInt(), node.id);
+            check(outputsByRole.size() == 4, QStringLiteral("stock graph declares all four output roles"));
+            QString packId;
+            for (const NodeGraph::Connection& connection : stock.connectionsTo(outputsByRole.value(1)))
+                packId = connection.fromNode;
+            const NodeGraph::Node* pack = stock.node(packId);
+            check(pack && pack->typeId == QStringLiteral("image.channelPack"),
+                QStringLiteral("the shipped normal is assembled by a channel pack"));
+            QStringList packedPorts;
+            for (const NodeGraph::Connection& connection : stock.connectionsTo(packId))
+                packedPorts.append(connection.toPort);
+            check(packedPorts.contains(QStringLiteral("r")) && packedPorts.contains(QStringLiteral("g"))
+                    && packedPorts.contains(QStringLiteral("b")) && packedPorts.contains(QStringLiteral("a")),
+                QStringLiteral("the normal pack routes every channel including B: %1")
+                    .arg(packedPorts.join(QStringLiteral(","))));
+        }
+
+        // Graph files round-trip through disk (what `convert --graph` consumes).
+        {
+            QTemporaryDir graphDir;
+            if (graphDir.isValid()) {
+                const QString path = graphDir.filePath(QStringLiteral("stock.pbrgraph"));
+                QString saveError, loadError;
+                check(ConverterNodes::saveGraphFile(ConverterNodes::defaultFo76Graph(), path, &saveError),
+                    QStringLiteral("a graph writes to disk: %1").arg(saveError));
+                const NodeGraph::Graph reloaded = ConverterNodes::loadGraphFile(path, &loadError);
+                check(reloaded.nodes.size() == ConverterNodes::defaultFo76Graph().nodes.size()
+                        && reloaded.connections.size() == ConverterNodes::defaultFo76Graph().connections.size()
+                        && reloaded.validate(registry, &graphErrors),
+                    QStringLiteral("a graph file reloads and validates: %1").arg(loadError));
+            }
+        }
+
         // Node-level parity: the convert.fo4 node is a faithful wrapper, tested
         // by invoking it with constructed inputs — no synthetic file format,
         // no disk, so the test exercises the graph rather than a test fixture.

@@ -1,6 +1,7 @@
 #include "clicommands.h"
 
 #include "converter.h"
+#include "converternodes.h"
 #include "geometryao.h"
 #include "materialdocument.h"
 #include "texturearchive.h"
@@ -559,7 +560,7 @@ int runConvert(const QStringList& args)
 {
     const Options options = parseOptions(args, {QStringLiteral("--out"), QStringLiteral("--texture-root"),
         QStringLiteral("--recovery"), QStringLiteral("--gloss-curve"), QStringLiteral("--derivation-size"),
-        QStringLiteral("--correction-mask")});
+        QStringLiteral("--correction-mask"), QStringLiteral("--graph")});
     const QString outputRoot = options.value(QStringLiteral("--out"));
     const QString manifestName = QStringLiteral("/pbrm-conversion-manifest.json");
     if (outputRoot.isEmpty() || (options.paths.isEmpty() && !options.has(QStringLiteral("--clean")))) {
@@ -567,6 +568,7 @@ int runConvert(const QStringList& args)
                  "                    [--force] [--height-in-blue] [--no-detail-ao] [--metal-diagnostic]\n"
                  "                    [--recovery <0-1>] [--gloss-curve <v>] [--derivation-size <px>]\n"
                  "                    [--correction-mask <image>]  # 0.5-neutral metallic correction\n"
+                 "                    [--graph <file.pbrgraph>]    # convert through a node graph\n"
                  "                    <materials, folders, or .ba2 archives...>\n"
                  "       pbrm convert --out <mod folder> --clean   # remove exactly the recorded output\n" << Qt::flush;
         return 2;
@@ -629,6 +631,25 @@ int runConvert(const QStringList& args)
     if (options.has(QStringLiteral("--derivation-size")))
         job.derive.derivationSize = options.value(QStringLiteral("--derivation-size")).toInt();
     job.correctionMaskPath = options.value(QStringLiteral("--correction-mask"));
+
+    // --graph: the node graph produces the images; the orchestrator still owns
+    // portable paths, dedup, the sibling document, and the manifest.
+    NodeGraph::Graph conversionGraph;
+    const QString graphPath = options.value(QStringLiteral("--graph"));
+    if (!graphPath.isEmpty()) {
+        QString graphError;
+        conversionGraph = ConverterNodes::loadGraphFile(graphPath, &graphError);
+        QStringList graphErrors;
+        if (conversionGraph.nodes.isEmpty())
+            graphErrors.append(graphError.isEmpty() ? QStringLiteral("the graph is empty") : graphError);
+        else
+            conversionGraph.validate(ConverterNodes::sharedRegistry(), &graphErrors);
+        if (!graphErrors.isEmpty()) {
+            for (const QString& error : graphErrors) out() << "error: " << graphPath << ": " << error << "\n";
+            out() << Qt::flush;
+            return 2;
+        }
+    }
 
     struct MaterialSource {
         QString path;      // loose file, or the BA2 archive
@@ -703,8 +724,22 @@ int runConvert(const QStringList& args)
             continue;
         }
         Converter::JobResult jobResult;
-        if (source.entry.isEmpty()) {
-            jobResult = Converter::convertMaterial(source.path, job, &textureCache);
+        Converter::JobOptions materialJob = job;
+        if (!conversionGraph.nodes.isEmpty() && source.entry.isEmpty()) {
+            QStringList graphErrors;
+            materialJob.supplied = ConverterNodes::runGraph(conversionGraph, source.path,
+                job.textureRoot, job.geometryNifPath, &graphErrors);
+            if (!materialJob.supplied.active) {
+                jobResult.materialPath = material;
+                jobResult.errors.append(graphErrors.isEmpty()
+                    ? QStringLiteral("the graph produced no output") : graphErrors.join(QStringLiteral("; ")));
+                // Fall through to reporting: nothing is written for this one.
+            }
+        }
+        if (!jobResult.errors.isEmpty()) {
+            // graph failure above
+        } else if (source.entry.isEmpty()) {
+            jobResult = Converter::convertMaterial(source.path, materialJob, &textureCache);
         } else {
             QString extractError;
             const QByteArray data = TextureArchive::extract(source.path, source.entry, &extractError);
@@ -713,7 +748,7 @@ int runConvert(const QStringList& args)
                 jobResult.errors.append(extractError.isEmpty()
                     ? QStringLiteral("could not extract the material from the archive") : extractError);
             } else {
-                jobResult = Converter::convertMaterialData(source.path, source.entry, data, job, &textureCache);
+                jobResult = Converter::convertMaterialData(source.path, source.entry, data, materialJob, &textureCache);
             }
         }
         for (const QString& note : jobResult.notes) findings.append({material, false, note});
@@ -817,6 +852,28 @@ int runInspect(const QStringList& args)
     return failures > 0 ? 1 : 0;
 }
 
+int runExportGraph(const QStringList& args)
+{
+    const Options options = parseOptions(args, {QStringLiteral("--out"), QStringLiteral("--profile")});
+    const QString outputPath = options.value(QStringLiteral("--out"));
+    const QString profile = options.value(QStringLiteral("--profile")).toLower();
+    if (outputPath.isEmpty() || (profile != QStringLiteral("fo4") && profile != QStringLiteral("fo76"))) {
+        out() << "usage: pbrm export-graph --profile <fo4|fo76> --out <file.pbrgraph>\n"
+                 "       writes the stock conversion graph, ready to edit or run with convert --graph\n" << Qt::flush;
+        return 2;
+    }
+    const NodeGraph::Graph graph = profile == QStringLiteral("fo76")
+        ? ConverterNodes::defaultFo76Graph() : ConverterNodes::defaultFo4Graph();
+    QString error;
+    if (!ConverterNodes::saveGraphFile(graph, outputPath, &error)) {
+        out() << "error: " << error << "\n" << Qt::flush;
+        return 1;
+    }
+    out() << "wrote " << QDir::toNativeSeparators(outputPath) << " (" << graph.nodes.size() << " nodes, "
+          << graph.connections.size() << " links)\n" << Qt::flush;
+    return 0;
+}
+
 QString helpText()
 {
     return QStringLiteral(
@@ -837,6 +894,7 @@ QString helpText()
         "  inspect             texture diagnostics + per-channel statistics\n"
         "  convert             convert FO4/FO76 .bgsm/.bgem materials + textures to PBR\n"
         "                      (incremental via the manifest; --force re-runs, --clean rolls back)\n"
+        "  export-graph        write the stock conversion node graph for a title\n"
         "  material-info       dump parsed .bgsm/.bgem fields (textures, scalars, flags)\n"
         "  bake-ao             bake geometry AO from a reference mesh to an image\n"
         "\n"
@@ -857,6 +915,7 @@ int runVerb(const QString& verb, const QStringList& args)
     if (verb == QLatin1String("pack")) return runPack(args);
     if (verb == QLatin1String("inspect")) return runInspect(args);
     if (verb == QLatin1String("convert")) return runConvert(args);
+    if (verb == QLatin1String("export-graph")) return runExportGraph(args);
     if (verb == QLatin1String("material-info")) return runMaterialInfo(args);
     if (verb == QLatin1String("bake-ao")) return runBakeAo(args);
     out() << helpText() << Qt::flush;

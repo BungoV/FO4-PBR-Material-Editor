@@ -6,8 +6,11 @@
 #include "previewmesh.h"
 #include "textureimage.h"
 
+#include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
 #include <QJsonValue>
+#include <QSaveFile>
 #include <QtMath>
 
 using namespace NodeGraph;
@@ -862,6 +865,90 @@ Registry& defaultRegistry()
 
 } // namespace
 
+const Registry& sharedRegistry() { return defaultRegistry(); }
+
+Converter::SuppliedImages runGraph(const Graph& graph, const QString& materialPath,
+    const QString& textureRoot, const QString& referenceMesh, QStringList* errors)
+{
+    Converter::SuppliedImages supplied;
+    const Registry& registry = defaultRegistry();
+
+    EvalContext context;
+    context.sourcePath = materialPath;
+    context.textureRoot = textureRoot;
+    context.referenceMesh = referenceMesh;
+    context.previewMode = false;   // full resolution, no preview downsample
+    context.previewMaxSize = 0;
+    context.thumbnailSize = 0;     // no thumbnails needed for a write run
+
+    Evaluator evaluator(registry);
+    const QHash<QString, NodeResult> results = evaluator.evaluate(graph, context);
+
+    for (const Node& node : graph.nodes) {
+        const NodeResult& result = results.value(node.id);
+        if (!result.error.isEmpty() && errors) {
+            const NodeTypeSpec* spec = registry.find(node.typeId);
+            errors->append(QStringLiteral("%1: %2").arg(spec ? spec->name : node.typeId, result.error));
+        }
+        if (node.typeId == QStringLiteral("convert.fo4") || node.typeId == QStringLiteral("convert.fo76")) {
+            const Value coverage = result.outputs.value(QStringLiteral("metalCoverage"));
+            if (coverage.isValid()) supplied.metalCoverage = coverage.scalar();
+            supplied.notes.append(result.notes);
+        } else if (node.typeId == QStringLiteral("derive.normal")) {
+            supplied.notes.append(result.notes);
+        }
+        if (node.typeId != QStringLiteral("output.texture")) continue;
+        const QImage image = result.outputs.value(QStringLiteral("image")).image();
+        switch (node.params.value(QStringLiteral("role")).toInt()) {
+        case 0: supplied.baseColor = image; break;
+        case 1: supplied.normal = image; break;
+        case 2: supplied.rmaos = image; break;
+        case 3: supplied.emissive = image; break;
+        default: break;
+        }
+    }
+
+    // The graph's identity joins the incremental signature, so editing it
+    // invalidates previously converted outputs instead of silently skipping.
+    supplied.signature = QStringLiteral("|graph%1|")
+        .arg(QString::number(qHash(QJsonDocument(graph.toJson()).toJson(QJsonDocument::Compact)), 16));
+    supplied.active = !supplied.baseColor.isNull();
+    if (!supplied.active && errors)
+        errors->append(QStringLiteral("the graph produced no base colour output"));
+    return supplied;
+}
+
+Graph loadGraphFile(const QString& path, QString* error)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error) *error = file.errorString();
+        return {};
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        if (error) *error = QStringLiteral("Invalid graph file: %1").arg(parseError.errorString());
+        return {};
+    }
+    return Graph::fromJson(document.object());
+}
+
+bool saveGraphFile(const Graph& graph, const QString& path, QString* error)
+{
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    file.write(QJsonDocument(graph.toJson()).toJson(QJsonDocument::Indented));
+    if (!file.commit()) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    return true;
+}
+
 Graph defaultFo4Graph()
 {
     Builder builder(defaultRegistry());
@@ -902,16 +989,31 @@ Graph defaultFo4Graph()
     builder.link(derive, "ao", pack, "b");
     builder.link(rmaosF0, "image", pack, "a");
 
-    const QString outBase = builder.add("output.texture", 1000, 120,
+    // Shipped normal = the original's RGB untouched + derived signed curvature
+    // in A. B passes through rather than defaulting, so a graph run and a batch
+    // run write the same bytes (the height option overwrites B instead).
+    const QString normalR = builder.add("image.channel", 760, 640, {{QStringLiteral("channel"), 0}});
+    const QString normalG = builder.add("image.channel", 760, 730, {{QStringLiteral("channel"), 1}});
+    const QString normalB = builder.add("image.channel", 760, 820, {{QStringLiteral("channel"), 2}});
+    const QString normalPack = builder.add("image.channelPack", 1000, 680);
+    builder.link(normal, "image", normalR, "image");
+    builder.link(normal, "image", normalG, "image");
+    builder.link(normal, "image", normalB, "image");
+    builder.link(normalR, "image", normalPack, "r");
+    builder.link(normalG, "image", normalPack, "g");
+    builder.link(normalB, "image", normalPack, "b");
+    builder.link(derive, "curvature", normalPack, "a");
+
+    const QString outBase = builder.add("output.texture", 1240, 120,
         {{QStringLiteral("role"), 0}, {QStringLiteral("suffix"), QStringLiteral("_BC")}});
-    const QString outNormal = builder.add("output.texture", 1000, 230,
+    const QString outNormal = builder.add("output.texture", 1240, 680,
         {{QStringLiteral("role"), 1}, {QStringLiteral("suffix"), QStringLiteral("_N")}});
     const QString outRmaos = builder.add("output.texture", 1240, 440,
         {{QStringLiteral("role"), 2}, {QStringLiteral("suffix"), QStringLiteral("_RMAOS")}});
-    const QString outEmissive = builder.add("output.texture", 1000, 330,
+    const QString outEmissive = builder.add("output.texture", 1240, 260,
         {{QStringLiteral("role"), 3}, {QStringLiteral("suffix"), QStringLiteral("_E")}});
     builder.link(convert, "baseColor", outBase, "image");
-    builder.link(normal, "image", outNormal, "image");
+    builder.link(normalPack, "image", outNormal, "image");
     builder.link(pack, "image", outRmaos, "image");
     builder.link(convert, "emissive", outEmissive, "image");
     return builder.graph;
@@ -941,16 +1043,31 @@ Graph defaultFo76Graph()
     builder.link(glow, "image", convert, "glow");
     builder.link(normal, "image", derive, "normal");
 
-    const QString outBase = builder.add("output.texture", 800, 120,
+    // Shipped normal = the original's RGB untouched + derived signed curvature
+    // in A. B passes through rather than defaulting, so a graph run and a batch
+    // run write the same bytes (the height option overwrites B instead).
+    const QString normalR = builder.add("image.channel", 760, 640, {{QStringLiteral("channel"), 0}});
+    const QString normalG = builder.add("image.channel", 760, 730, {{QStringLiteral("channel"), 1}});
+    const QString normalB = builder.add("image.channel", 760, 820, {{QStringLiteral("channel"), 2}});
+    const QString normalPack = builder.add("image.channelPack", 1000, 680);
+    builder.link(normal, "image", normalR, "image");
+    builder.link(normal, "image", normalG, "image");
+    builder.link(normal, "image", normalB, "image");
+    builder.link(normalR, "image", normalPack, "r");
+    builder.link(normalG, "image", normalPack, "g");
+    builder.link(normalB, "image", normalPack, "b");
+    builder.link(derive, "curvature", normalPack, "a");
+
+    const QString outBase = builder.add("output.texture", 1000, 120,
         {{QStringLiteral("role"), 0}, {QStringLiteral("suffix"), QStringLiteral("_BC")}});
-    const QString outNormal = builder.add("output.texture", 800, 230,
+    const QString outNormal = builder.add("output.texture", 1240, 680,
         {{QStringLiteral("role"), 1}, {QStringLiteral("suffix"), QStringLiteral("_N")}});
-    const QString outRmaos = builder.add("output.texture", 800, 340,
+    const QString outRmaos = builder.add("output.texture", 1000, 340,
         {{QStringLiteral("role"), 2}, {QStringLiteral("suffix"), QStringLiteral("_RMAOS")}});
-    const QString outEmissive = builder.add("output.texture", 800, 450,
+    const QString outEmissive = builder.add("output.texture", 1000, 450,
         {{QStringLiteral("role"), 3}, {QStringLiteral("suffix"), QStringLiteral("_E")}});
     builder.link(convert, "baseColor", outBase, "image");
-    builder.link(normal, "image", outNormal, "image");
+    builder.link(normalPack, "image", outNormal, "image");
     builder.link(convert, "rmaos", outRmaos, "image");
     builder.link(convert, "emissive", outEmissive, "image");
     return builder.graph;

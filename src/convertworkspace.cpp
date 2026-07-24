@@ -23,6 +23,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -665,6 +666,35 @@ void ConvertWorkspace::buildGraphMode(QWidget* parent)
     auto* frame = new QPushButton(tr("Frame All"), page);
     connect(frame, &QPushButton::clicked, this, [this] { if (m_canvas) m_canvas->frameAll(); });
     actions->addWidget(frame);
+    auto* save = new QPushButton(tr("Save Graph…"), page);
+    save->setToolTip(tr("Write a .pbrgraph that `pbrm convert --graph` can run headlessly."));
+    connect(save, &QPushButton::clicked, this, [this] {
+        const QString path = QFileDialog::getSaveFileName(this, tr("Save conversion graph"),
+            m_outputEdit->text().trimmed(), tr("Conversion graphs (*.pbrgraph)"));
+        if (path.isEmpty()) return;
+        QString error;
+        if (!ConverterNodes::saveGraphFile(m_nodeGraph, path, &error))
+            QMessageBox::warning(this, tr("Save graph"), error);
+    });
+    actions->addWidget(save);
+    auto* load = new QPushButton(tr("Load Graph…"), page);
+    connect(load, &QPushButton::clicked, this, [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Load conversion graph"),
+            m_outputEdit->text().trimmed(), tr("Conversion graphs (*.pbrgraph)"));
+        if (path.isEmpty()) return;
+        QString error;
+        const NodeGraph::Graph loaded = ConverterNodes::loadGraphFile(path, &error);
+        if (loaded.nodes.isEmpty()) {
+            QMessageBox::warning(this, tr("Load graph"), error.isEmpty() ? tr("The graph is empty.") : error);
+            return;
+        }
+        m_nodeGraph = loaded;
+        m_graphProfile = QStringLiteral("(loaded)"); // survives selection changes
+        m_canvas->setGraph(m_nodeGraph);
+        m_canvas->frameAll();
+        m_graphEval->start();
+    });
+    actions->addWidget(load);
     actions->addStretch();
     auto* hint = new QLabel(tr("Right-click to add nodes · drag ports to wire · click an output to preview it"), page);
     hint->setObjectName(QStringLiteral("Muted"));

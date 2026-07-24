@@ -15,9 +15,25 @@
 // the automatic pipeline.
 namespace Converter {
 
+// A node graph can produce the converted images itself; when it does, the
+// orchestrator skips the profile conversion and derivations and keeps doing
+// everything else — portable paths, dedup, the sibling document, and the
+// manifest — so graph runs and batch runs land identically on disk.
+struct SuppliedImages {
+    bool active = false;
+    QImage baseColor;
+    QImage rmaos;
+    QImage emissive;
+    QImage normal;          // already packed (curvature in A, optional height in B)
+    float metalCoverage = 0;
+    QString signature;      // graph identity; joins the incremental options signature
+    QStringList notes;
+};
+
 struct JobOptions {
     Options math;
     NormalDerive::Options derive;
+    SuppliedImages supplied;
     QString outputRoot;        // the output mod folder (Materials/ + Textures/ grow inside)
     QString textureRoot;       // source resolution root; editor sources as fallback
     QString correctionMaskPath; // 0.5-neutral metallic correction (R channel); loose path or absolute
