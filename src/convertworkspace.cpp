@@ -60,6 +60,15 @@ namespace {
 // style.qss rather than the brighter body colour.
 const QColor kArrowInk(198, 203, 210);
 
+// Hermite ease, for the brush's soft edge. A hard disc tiles visibly when
+// strokes overlap; easing the outer half makes repeated passes build smoothly.
+double smoothstepd(double edge0, double edge1, double value)
+{
+    if (edge1 <= edge0) return value < edge0 ? 0.0 : 1.0;
+    const double t = std::clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
 QString canvasHint()
 {
     return QObject::tr("Right-click to add nodes · drag ports to wire · K cut · "
@@ -395,6 +404,54 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     maskRow->addWidget(m_maskSave);
     maskRow->addStretch();
     selectedLayout->addLayout(maskRow);
+
+    // Freehand brush over the 2D view. The fills above are for whole parts —
+    // "this boot is not metal" — and this is for everything they cannot reach:
+    // the strip of grime along a seam, the painted half of a panel. Both write
+    // the same 0.5-neutral mask, so a material can use either or both.
+    auto* brushRow = new QHBoxLayout();
+    brushRow->setSpacing(9);
+    m_maskBrushEnabled = new QCheckBox(tr("Brush"), m_selectedGroup);
+    m_maskBrushEnabled->setToolTip(tr("Paint the correction mask directly in the viewport. Best in the 2D view, "
+                                      "where the painted mask is tinted over the texture. Shift and Ctrl still pan "
+                                      "and dolly mid-stroke."));
+    connect(m_maskBrushEnabled, &QCheckBox::toggled, this, [this](bool on) {
+        m_preview->canvas()->setMaskPaintEnabled(on);
+        // One pointer, one meaning: arming the brush disarms the fill picker.
+        if (on && m_maskPickEnabled->isChecked()) m_maskPickEnabled->setChecked(false);
+        refreshMaskOverlay();
+    });
+    brushRow->addWidget(m_maskBrushEnabled);
+    brushRow->addWidget(new QLabel(tr("Size"), m_selectedGroup));
+    m_maskBrushSize = new QSlider(Qt::Horizontal, m_selectedGroup);
+    m_maskBrushSize->setRange(2, 250);   // thousandths of the UV square
+    m_maskBrushSize->setValue(40);
+    m_maskBrushSize->setMaximumWidth(110);
+    m_maskBrushSize->setToolTip(tr("Brush radius as a fraction of the texture, so it keeps its size on the "
+                                   "material however far you zoom."));
+    connect(m_maskBrushSize, &QSlider::valueChanged, this, [this](int value) {
+        m_preview->canvas()->setMaskBrushRadius(float(value) / 1000.0f);
+    });
+    brushRow->addWidget(m_maskBrushSize);
+    m_maskBrushFlow = new QSlider(Qt::Horizontal, m_selectedGroup);
+    m_maskBrushFlow->setRange(5, 100);
+    m_maskBrushFlow->setValue(60);
+    m_maskBrushFlow->setMaximumWidth(80);
+    m_maskBrushFlow->setToolTip(tr("How fast a stroke reaches full strength. Below 100 it builds up, so a light "
+                                   "pass nudges the inference instead of overriding it outright."));
+    brushRow->addWidget(new QLabel(tr("Flow"), m_selectedGroup));
+    brushRow->addWidget(m_maskBrushFlow);
+    m_maskBrushValue = new QComboBox(m_selectedGroup);
+    // Dielectric first: the FO4 stencil over-detects by design, so subtracting
+    // is the common direction and should be the one already selected.
+    m_maskBrushValue->addItem(tr("Paint Dielectric"), 0.0);
+    m_maskBrushValue->addItem(tr("Paint Metal"), 1.0);
+    m_maskBrushValue->addItem(tr("Erase to Inferred"), 0.5);
+    m_maskBrushValue->setToolTip(tr("What the brush paints. Erase returns those texels to whatever the graph inferred."));
+    brushRow->addWidget(m_maskBrushValue);
+    brushRow->addStretch();
+    selectedLayout->addLayout(brushRow);
+
     m_maskStatus = new QLabel(m_selectedGroup);
     m_maskStatus->setObjectName(QStringLiteral("Muted"));
     m_maskStatus->setWordWrap(true);
@@ -432,6 +489,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     // its texture root.
     m_preview = new MaterialPreviewWidget(splitter, /*converterMode=*/true);
     connect(m_preview->canvas(), &PbrPreviewGL::meshTrianglePicked, this, &ConvertWorkspace::handleTrianglePicked);
+    connect(m_preview->canvas(), &PbrPreviewGL::maskPainted, this, &ConvertWorkspace::handleMaskPainted);
     splitter->addWidget(m_preview);
     // The canvas is the work surface, so it takes the width the folded
     // setup rows and the deleted inspector column gave back.
@@ -1615,7 +1673,63 @@ void ConvertWorkspace::handleTrianglePicked(int triangle)
             if (!state.filledTriangles.contains(filled)) state.filledTriangles.append(filled);
     }
     m_preview->canvas()->setHighlightTriangles(state.filledTriangles);
+    refreshMaskOverlay();
     m_maskStatus->setText(tr("%n triangle(s) filled — Save Mask to apply", nullptr, int(state.filledTriangles.size())));
+}
+
+void ConvertWorkspace::handleMaskPainted(const QPointF& uv)
+{
+    const QString key = currentMaterialKey();
+    if (key.isEmpty()) return;
+    MaskState& state = m_masks[key];
+    if (state.mask.isNull()) state.mask = MaskPaint::neutralMask();
+
+    const float target = float(m_maskBrushValue->currentData().toDouble());
+    const float flow = float(m_maskBrushFlow->value()) / 100.0f;
+    const float radius = float(m_maskBrushSize->value()) / 1000.0f;
+
+    // UV wraps, so a stroke over a seam has to wrap with it — clamping would
+    // pile the whole brush up against the edge instead.
+    const int size = state.mask.width();
+    const double centreX = uv.x() * size;
+    const double centreY = uv.y() * size;
+    const double pixelRadius = std::max(double(radius) * size, 1.0);
+    const int span = int(std::ceil(pixelRadius));
+
+    for (int dy = -span; dy <= span; ++dy) {
+        for (int dx = -span; dx <= span; ++dx) {
+            const double distance = std::hypot(dx, dy);
+            if (distance > pixelRadius) continue;
+            // Soft edge: full strength for the inner half, easing to nothing at
+            // the rim, so overlapping passes build instead of tiling hard discs.
+            const double falloff = 1.0 - smoothstepd(pixelRadius * 0.5, pixelRadius, distance);
+            const float amount = float(falloff) * flow;
+            if (amount <= 0.0f) continue;
+            const int x = ((int(std::floor(centreX)) + dx) % size + size) % size;
+            const int y = ((int(std::floor(centreY)) + dy) % size + size) % size;
+            uchar* texel = state.mask.scanLine(y) + x * 4;
+            const float current = texel[0] / 255.0f;
+            const float blended = current + (target - current) * amount;
+            const uchar written = uchar(std::lround(std::clamp(blended, 0.0f, 1.0f) * 255.0f));
+            texel[0] = texel[1] = texel[2] = written;
+            texel[3] = 255;
+        }
+    }
+    ++m_brushStrokes;
+    refreshMaskOverlay();
+    m_maskStatus->setText(tr("painted — Save Mask to apply"));
+}
+
+void ConvertWorkspace::refreshMaskOverlay()
+{
+    const QString key = currentMaterialKey();
+    const auto state = key.isEmpty() ? m_masks.constEnd() : m_masks.constFind(key);
+    // Only while the brush is armed. A permanent tint would sit over every
+    // material the queue walks through and make the preview a liar about what
+    // the conversion looks like.
+    const bool show = m_maskBrushEnabled && m_maskBrushEnabled->isChecked()
+        && state != m_masks.constEnd() && !state->mask.isNull();
+    m_preview->canvas()->setMaskOverlay(show ? state->mask : QImage());
 }
 
 void ConvertWorkspace::clearMaskFills()

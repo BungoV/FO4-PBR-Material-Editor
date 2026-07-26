@@ -103,6 +103,11 @@ private:
     void loadOverrideControls();
     void loadMaskReference();
     void handleTrianglePicked(int triangle);
+    // One brush sample, in UV0. Stamps into the same 0.5-neutral mask the fills
+    // write, so a material can be corrected with either or both.
+    void handleMaskPainted(const QPointF& uv);
+    // Pushes the current mask to the viewport as a tinted overlay, or clears it.
+    void refreshMaskOverlay();
     void clearMaskFills();
     void saveMask();
     QString currentMaterialKey() const;
@@ -148,6 +153,11 @@ private:
     QPushButton* m_maskLoadNif = nullptr;
     QComboBox* m_maskFillMode = nullptr;
     QComboBox* m_maskFillValue = nullptr;
+    QCheckBox* m_maskBrushEnabled = nullptr;
+    QSlider* m_maskBrushSize = nullptr;
+    QSlider* m_maskBrushFlow = nullptr;
+    QComboBox* m_maskBrushValue = nullptr;
+    int m_brushStrokes = 0;   // reported alongside the fill count
     QCheckBox* m_maskPickEnabled = nullptr;
     QPushButton* m_maskClear = nullptr;
     QPushButton* m_maskSave = nullptr;

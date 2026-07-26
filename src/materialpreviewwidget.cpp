@@ -4156,6 +4156,90 @@ void PbrPreviewGL::drawViewportOverlays()
             tr("Free camera — WASD fly · Q/E down/up · Shift boost · wheel speed %1x · LMB confirm · RMB/Esc back")
                 .arg(double(m_freeCamSpeed),0,'f',2));
     }
+    drawMaskPaintOverlay(painter);
+}
+
+void PbrPreviewGL::drawMaskPaintOverlay(QPainter& painter)
+{
+    // The painted mask, tinted over the texture. Flat view only: the mask lives
+    // in UV space and the 2D plane IS the UV square, so one quad-to-quad
+    // transform puts it exactly where the texels are. Projecting a UV mask onto
+    // arbitrary 3D geometry with QPainter is not something this can do — the
+    // brush still works there, it just paints without the tint.
+    if(m_flatView&&!m_maskOverlay.isNull()){
+        const QMatrix4x4 mvp=projectionMatrix()*viewMatrix()*objectModelMatrix();
+        const auto project=[&](float u,float v){
+            // The XY plane spans -1..1 in object space for u,v = 0..1, and its
+            // V runs UP the screen — verified by --brush-check, not assumed.
+            // So no flip here: v=0 is the bottom edge. The mask image's row 0 is
+            // v=0 too (MaskPaint::rasterizeFill writes row = uv.y * height), so
+            // the quad below lists image (0,0) against the BOTTOM-left corner.
+            const QVector4D clip=mvp*QVector4D(u*2.0f-1.0f,v*2.0f-1.0f,0.0f,1.0f);
+            if(qFuzzyIsNull(clip.w()))return QPointF(-1,-1);
+            return QPointF((clip.x()/clip.w()*0.5f+0.5f)*width(),
+                (0.5f-clip.y()/clip.w()*0.5f)*height());
+        };
+        // Image (0,0) is mask row 0, which is v=0, which is the plane's BOTTOM.
+        const QPolygonF target({project(0,0),project(1,0),project(1,1),project(0,1)});
+        QTransform transform;
+        const QPolygonF source({QPointF(0,0),QPointF(m_maskOverlay.width(),0),
+            QPointF(m_maskOverlay.width(),m_maskOverlay.height()),QPointF(0,m_maskOverlay.height())});
+        if(QTransform::quadToQuad(source,target,transform)){
+            painter.save();
+            painter.setRenderHint(QPainter::SmoothPixmapTransform,true);
+            painter.setTransform(transform,true);
+            painter.drawImage(0,0,tintedMask(m_maskOverlay));
+            painter.restore();
+        }
+    }
+    // The brush ring. Sized from the UV radius through the same projection, so
+    // it shows the footprint on the TEXTURE rather than a fixed screen circle
+    // that lies the moment you zoom.
+    if(m_maskPaint&&m_brushCursor.x()>=0){
+        double pixels=24.0;
+        if(m_flatView){
+            const QMatrix4x4 mvp=projectionMatrix()*viewMatrix()*objectModelMatrix();
+            const auto projectX=[&](float u){
+                const QVector4D clip=mvp*QVector4D(u*2.0f-1.0f,0.0f,0.0f,1.0f);
+                return qFuzzyIsNull(clip.w())?0.0:double((clip.x()/clip.w()*0.5f+0.5f)*width());
+            };
+            pixels=std::abs(projectX(m_maskBrushRadius)-projectX(0.0f));
+        }
+        pixels=std::clamp(pixels,3.0,double(std::max(width(),height())));
+        painter.save();
+        painter.setBrush(Qt::NoBrush);
+        // Two rings, dark under light, so the cursor stays visible over both a
+        // blown-out highlight and a black diffuse.
+        painter.setPen(QPen(QColor(0,0,0,150),3.0));
+        painter.drawEllipse(m_brushCursor,pixels,pixels);
+        painter.setPen(QPen(QColor(255,255,255,220),1.0));
+        painter.drawEllipse(m_brushCursor,pixels,pixels);
+        painter.restore();
+    }
+}
+
+QImage PbrPreviewGL::tintedMask(const QImage& mask)
+{
+    // 0.5 is neutral and draws nothing. Below it forces dielectric and reads
+    // red; above forces metal and reads cyan. Opacity tracks distance from
+    // neutral, which is exactly the strength applyMetallicCorrection uses, so
+    // a faint stroke looks faint.
+    const QImage source=mask.convertToFormat(QImage::Format_RGBA8888);
+    QImage tint(source.width(),source.height(),QImage::Format_RGBA8888);
+    for(int y=0;y<source.height();++y){
+        const uchar* in=source.constScanLine(y);
+        uchar* out=tint.scanLine(y);
+        for(int x=0;x<source.width();++x){
+            const float value=in[x*4]/255.0f;
+            const float strength=std::clamp(std::abs(value-0.5f)*2.0f,0.0f,1.0f);
+            const bool metal=value>=0.5f;
+            out[x*4]=metal?40:235;
+            out[x*4+1]=metal?200:70;
+            out[x*4+2]=metal?235:60;
+            out[x*4+3]=uchar(std::lround(strength*150.0f));
+        }
+    }
+    return tint;
 }
 
 void PbrPreviewGL::setGridEnabled(bool enabled)
@@ -4171,7 +4255,55 @@ void PbrPreviewGL::setTrianglePickingEnabled(bool enabled)
     if(!enabled)unsetCursor();
 }
 
+QPointF PbrPreviewGL::pickUv(const QPointF& widgetPos) const
+{
+    // Same raycast as pickTriangle, keeping the barycentric weights it already
+    // computes and throws away. Interpolating the vertex UVs with them is what
+    // puts a brush stroke on the texel the cursor is over rather than on the
+    // triangle's centre.
+    float u = 0, v = 0;
+    const int triangle = pickTriangle(widgetPos, &u, &v);
+    if (triangle < 0) return QPointF(-1, -1);
+    const qsizetype base = qsizetype(triangle) * 3;
+    if (base + 2 >= m_mesh.indices.size()) return QPointF(-1, -1);
+    const QVector2D& a = m_mesh.vertices[int(m_mesh.indices[base])].uv0;
+    const QVector2D& b = m_mesh.vertices[int(m_mesh.indices[base + 1])].uv0;
+    const QVector2D& c = m_mesh.vertices[int(m_mesh.indices[base + 2])].uv0;
+    const QVector2D uv = a * (1.0f - u - v) + b * u + c * v;
+    return QPointF(uv.x(), uv.y());
+}
+
+void PbrPreviewGL::setMaskPaintEnabled(bool enabled)
+{
+    if (m_maskPaint == enabled) return;
+    m_maskPaint = enabled;
+    m_painting = false;
+    m_brushCursor = QPointF(-1, -1);
+    // The ring has to follow the cursor without a button held, and the 3D view
+    // only tracks the mouse when something else asked it to.
+    setMouseTracking(true);
+    setCursor(enabled ? Qt::BlankCursor : Qt::ArrowCursor);
+    update();
+}
+
+void PbrPreviewGL::setMaskBrushRadius(float uvRadius)
+{
+    m_maskBrushRadius = std::clamp(uvRadius, 0.002f, 0.5f);
+    update();
+}
+
+void PbrPreviewGL::setMaskOverlay(const QImage& mask)
+{
+    m_maskOverlay = mask;
+    update();
+}
+
 int PbrPreviewGL::pickTriangle(const QPointF& widgetPos) const
+{
+    return pickTriangle(widgetPos, nullptr, nullptr);
+}
+
+int PbrPreviewGL::pickTriangle(const QPointF& widgetPos, float* outU, float* outV) const
 {
     if(!m_mesh.isValid())return -1;
     // Widget point -> world ray, then bring the ray into OBJECT space so the
@@ -4206,7 +4338,11 @@ int PbrPreviewGL::pickTriangle(const QPointF& widgetPos) const
         const float v=invDet*QVector3D::dotProduct(direction,q);
         if(v<0.0f||u+v>1.0f)continue;
         const float t=invDet*QVector3D::dotProduct(edge2,q);
-        if(t>1e-5f&&t<bestDistance){bestDistance=t;best=int(i/3);}
+        if(t>1e-5f&&t<bestDistance){
+            bestDistance=t;best=int(i/3);
+            if(outU)*outU=u;
+            if(outV)*outV=v;
+        }
     }
     return best;
 }
@@ -5246,6 +5382,19 @@ void PbrPreviewGL::mousePressEvent(QMouseEvent* event)
         else if(event->button()==Qt::RightButton)cancelFreeCamera();  // back to where the flight started
         event->accept();return;
     }
+    // The brush takes an unmodified LMB before anything else claims it. Shift
+    // and Ctrl still pan and dolly, so the view stays navigable mid-stroke
+    // without disarming the brush.
+    if(m_maskPaint&&event->button()==Qt::LeftButton&&!(event->modifiers()&(Qt::ShiftModifier|Qt::ControlModifier))
+        &&navGizmoHitTest(event->position())<0){
+        const QPointF uv=pickUv(event->position());
+        if(uv.x()>=0.0){
+            m_painting=true;
+            m_brushCursor=event->position();
+            emit maskPainted(uv);
+            event->accept();return;
+        }
+    }
     if(m_trianglePicking&&event->button()==Qt::LeftButton&&!(event->modifiers()&(Qt::ShiftModifier|Qt::ControlModifier))
         &&navGizmoHitTest(event->position())<0){
         const int triangle=pickTriangle(event->position());
@@ -5281,9 +5430,21 @@ void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
         event->accept();return;
     }
     if(m_splitDrag){dragDebugSplit(event->position());m_lastMouse=event->position();event->accept();return;}
+    if(m_maskPaint){
+        // The ring tracks whether or not a button is down, so the brush size is
+        // visible before committing to a stroke.
+        m_brushCursor=event->position();
+        if(m_painting){
+            const QPointF uv=pickUv(event->position());
+            if(uv.x()>=0.0)emit maskPainted(uv);
+            m_lastMouse=event->position();
+            update();event->accept();return;
+        }
+        update();
+    }
     // Show the resize cursor whenever the divider is under the pointer, so it
     // reads as a handle rather than a painted line.
-    if(m_dragButton==Qt::NoButton)
+    if(m_dragButton==Qt::NoButton&&!m_maskPaint)
         setCursor(nearDebugSplit(event->position())?Qt::SplitHCursor:Qt::ArrowCursor);
     const QPointF delta=event->position()-m_lastMouse;m_lastMouse=event->position();
     if(m_navDrag){
@@ -5318,6 +5479,7 @@ void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
 
 void PbrPreviewGL::mouseReleaseEvent(QMouseEvent* event)
 {
+    if(m_painting&&event->button()==Qt::LeftButton){m_painting=false;update();}
     if(m_navDrag&&event->button()==Qt::LeftButton){m_navDrag=false;update();}
     if(m_splitDrag&&event->button()==Qt::LeftButton)m_splitDrag=false;
     if(event->button()==m_dragButton)m_dragButton=Qt::NoButton;
@@ -5416,6 +5578,10 @@ void PbrPreviewGL::focusOutEvent(QFocusEvent* event)
 void PbrPreviewGL::leaveEvent(QEvent* event)
 {
     if(m_navHover!=-1){m_navHover=-1;update();}
+    // Drop the ring on the way out, and end any stroke the release was missed
+    // for — dragging off the widget must not leave the brush stuck down.
+    if(m_brushCursor.x()>=0){m_brushCursor=QPointF(-1,-1);update();}
+    m_painting=false;
     QOpenGLWidget::leaveEvent(event);
 }
 

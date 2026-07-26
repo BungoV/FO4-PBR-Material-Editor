@@ -167,6 +167,24 @@ public:
     // the mesh and emits meshTrianglePicked instead of starting a drag.
     void setTrianglePickingEnabled(bool enabled);
     int pickTriangle(const QPointF& widgetPos) const;
+    // Barycentric weights of the hit come back through outU/outV when asked.
+    int pickTriangle(const QPointF& widgetPos, float* outU, float* outV) const;
+    // The UV0 coordinate under the cursor, or an invalid point on a miss. Same
+    // raycast as pickTriangle, carrying the barycentric weights through to the
+    // vertex UVs — so brush strokes land where the texture actually is, in the
+    // 2D view and on the 3D mesh alike.
+    QPointF pickUv(const QPointF& widgetPos) const;
+    // Brush mode. While enabled an unmodified LMB press-and-drag paints instead
+    // of orbiting, emitting maskPainted for each sample along the stroke.
+    void setMaskPaintEnabled(bool enabled);
+    bool maskPaintEnabled() const { return m_maskPaint; }
+    // Radius is a fraction of the 0-1 UV square, so a brush keeps its size on
+    // the texture whatever the zoom, exactly like Substance's.
+    void setMaskBrushRadius(float uvRadius);
+    float maskBrushRadius() const { return m_maskBrushRadius; }
+    // The painted mask, drawn over the surface so a stroke is visible before
+    // anything is reconverted. Null clears it.
+    void setMaskOverlay(const QImage& mask);
     void setHighlightTriangles(const QVector<quint32>& triangles);
     void setShadows(bool enabled, float intensity);
     void setDerivedEnvironmentShadow(bool enabled, float directionalWeight);
@@ -185,6 +203,9 @@ signals:
     void environmentYawDragged(float deltaDegrees);
     void shaderErrorsChanged(const QString& log);
     void meshTrianglePicked(int triangleIndex);
+    // One sample along a brush stroke, in UV0. Emitted on press and on every
+    // drag move; the viewport does not own the mask, it only says where.
+    void maskPainted(const QPointF& uv);
 
 protected:
     void initializeGL() override;
@@ -246,6 +267,8 @@ private:
     void drawGrid();
     void drawMaskHighlight();
     void drawViewportOverlays();
+    void drawMaskPaintOverlay(QPainter& painter);
+    static QImage tintedMask(const QImage& mask);
     void navGizmoLayout(QPointF& center, float& radius, float& ballRadius) const;
     void navGizmoBalls(QPointF positions[6], float depths[6]) const;
     int navGizmoHitTest(const QPointF& position) const;
@@ -294,6 +317,11 @@ private:
     QOpenGLBuffer m_gridBuffer{QOpenGLBuffer::VertexBuffer};
     int m_gridVertexCount = 0;
     bool m_trianglePicking = false;
+    bool m_maskPaint = false;
+    bool m_painting = false;          // LMB held with the brush armed
+    float m_maskBrushRadius = 0.04f;  // fraction of the UV square
+    QPointF m_brushCursor{-1, -1};    // widget space, for the ring
+    QImage m_maskOverlay;
     QVector<quint32> m_highlightTriangles;
     std::unique_ptr<QOpenGLVertexArrayObject> m_highlightVao;
     QOpenGLBuffer m_highlightIndexBuffer{QOpenGLBuffer::IndexBuffer};

@@ -542,6 +542,110 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+    // The brush maps a cursor position to a UV, and if that mapping is wrong
+    // every stroke lands somewhere other than where the user drew it — silently,
+    // because the tint would be wrong in exactly the same way and look right.
+    // Drives the real widget in flat view and checks known points.
+    const int brushIndex = application.arguments().indexOf(QStringLiteral("--brush-check"));
+    if (brushIndex >= 0 && brushIndex + 1 < application.arguments().size()) {
+        const QString reportPath = application.arguments().at(brushIndex + 1);
+        QStringList report;
+        int failures = 0;
+        const auto require = [&failures, &report](bool condition, const QString& what) {
+            report << QStringLiteral("%1: %2").arg(condition ? QStringLiteral("PASS")
+                                                             : QStringLiteral("FAIL"), what);
+            if (!condition) ++failures;
+        };
+
+        auto* preview = new MaterialPreviewWidget(nullptr, true);
+        preview->resize(900, 900);   // square, so the framed plane is not letterboxed
+        preview->show();
+        QApplication::processEvents();
+        PbrPreviewGL* canvas = preview->canvas();
+        canvas->setFlatView(true);
+        QApplication::processEvents();
+
+        const int w = canvas->width(), h = canvas->height();
+        require(w > 100 && h > 100, QStringLiteral("canvas has a usable size (%1x%2)").arg(w).arg(h));
+
+        const QPointF centre(w * 0.5, h * 0.5);
+        const QPointF centreUv = canvas->pickUv(centre);
+        require(centreUv.x() >= 0 && std::abs(centreUv.x() - 0.5) < 0.02
+                && std::abs(centreUv.y() - 0.5) < 0.02,
+            QStringLiteral("the viewport centre is UV 0.5,0.5 (got %1,%2)")
+                .arg(centreUv.x(), 0, 'f', 3).arg(centreUv.y(), 0, 'f', 3));
+
+        // Which way V runs is a property of the PLANE's authored UVs, not
+        // something to assume — it decides where the tinted overlay has to put
+        // the mask image, and a wrong guess mirrors the tint against the strokes
+        // while both still look plausible. Measured: V runs UP the screen.
+        const QPointF upperUv = canvas->pickUv(QPointF(w * 0.5, h * 0.5 - h * 0.2));
+        require(upperUv.x() >= 0 && upperUv.y() > centreUv.y(),
+            QStringLiteral("V runs up the screen, so the overlay's v=0 edge is the bottom (%1 vs %2)")
+                .arg(upperUv.y(), 0, 'f', 3).arg(centreUv.y(), 0, 'f', 3));
+        const QPointF rightUv = canvas->pickUv(QPointF(w * 0.5 + w * 0.2, h * 0.5));
+        require(rightUv.x() >= 0 && rightUv.x() > centreUv.x(),
+            QStringLiteral("U increases rightward (%1 vs %2)")
+                .arg(rightUv.x(), 0, 'f', 3).arg(centreUv.x(), 0, 'f', 3));
+
+        // Symmetry: equal offsets either side of centre land equally far from
+        // 0.5. A projection error would break this even when the centre is right.
+        const QPointF leftUv = canvas->pickUv(QPointF(w * 0.5 - w * 0.2, h * 0.5));
+        require(leftUv.x() >= 0
+                && std::abs((centreUv.x() - leftUv.x()) - (rightUv.x() - centreUv.x())) < 0.01,
+            QStringLiteral("the mapping is symmetric about the centre"));
+
+        // Off the plane entirely must miss rather than clamp to an edge texel.
+        const QPointF cornerUv = canvas->pickUv(QPointF(2, 2));
+        require(cornerUv.x() < 0,
+            QStringLiteral("a click off the plane reports a miss, not a clamped edge"));
+
+        // The stroke plumbing: arming the brush makes an unmodified LMB emit a
+        // UV instead of orbiting the camera.
+        int painted = 0;
+        QPointF lastUv(-1, -1);
+        QObject::connect(canvas, &PbrPreviewGL::maskPainted, canvas,
+            [&painted, &lastUv](const QPointF& uv) { ++painted; lastUv = uv; });
+        canvas->setMaskPaintEnabled(true);
+        QMouseEvent press(QEvent::MouseButtonPress, centre, canvas->mapToGlobal(centre.toPoint()),
+            Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &press);
+        require(painted == 1 && std::abs(lastUv.x() - 0.5) < 0.02,
+            QStringLiteral("an armed press paints one sample at the cursor's UV (%1 samples)").arg(painted));
+
+        const QPointF dragTo(w * 0.5 + w * 0.1, h * 0.5);
+        QMouseEvent move(QEvent::MouseMove, dragTo, canvas->mapToGlobal(dragTo.toPoint()),
+            Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &move);
+        require(painted == 2 && lastUv.x() > 0.5,
+            QStringLiteral("dragging keeps painting along the stroke (%1 samples)").arg(painted));
+
+        QMouseEvent release(QEvent::MouseButtonRelease, dragTo, canvas->mapToGlobal(dragTo.toPoint()),
+            Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &release);
+        QMouseEvent afterRelease(QEvent::MouseMove, centre, canvas->mapToGlobal(centre.toPoint()),
+            Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &afterRelease);
+        require(painted == 2, QStringLiteral("and stops on release (%1 samples)").arg(painted));
+
+        // Disarmed, the same press must go back to being a camera drag.
+        canvas->setMaskPaintEnabled(false);
+        QMouseEvent disarmed(QEvent::MouseButtonPress, centre, canvas->mapToGlobal(centre.toPoint()),
+            Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(canvas, &disarmed);
+        require(painted == 2, QStringLiteral("disarming returns LMB to the camera (%1 samples)").arg(painted));
+
+        report << QStringLiteral("Failures: %1").arg(failures);
+        QFile out(reportPath);
+        if (out.open(QIODevice::WriteOnly | QIODevice::Text))
+            out.write(report.join(QChar('\n')).toUtf8() + '\n');
+        // Delete rather than close: a QOpenGLWidget left alive past the return
+        // tears its context down during static destruction and the process
+        // exits 0xC0000142 even though every check passed.
+        delete preview;
+        return failures == 0 ? 0 : 1;
+    }
+
     // The FO4 counterpart of --survey-r and --survey-gloss, and the reason the
     // FO4 profile's numbers stop being "tuned on the X01 set". Everything the
     // FO4 inference rests on is measured here in one pass over the vanilla
