@@ -265,8 +265,8 @@ Converter::Options mathOptions(const QJsonObject& params)
     options.specNormalizePercentile = paramFloat(params, "specPercentile", options.specNormalizePercentile);
     options.metalSpecStart = paramFloat(params, "metalSpecStart", options.metalSpecStart);
     options.metalSpecFull = paramFloat(params, "metalSpecFull", options.metalSpecFull);
-    options.metalDarkStart = paramFloat(params, "metalDarkStart", options.metalDarkStart);
-    options.metalDarkFull = paramFloat(params, "metalDarkFull", options.metalDarkFull);
+    options.useCubemapMetalDeclaration = paramBool(params, "cubemapDeclaresMetal",
+        options.useCubemapMetalDeclaration);
     options.dielectricF0Min = paramFloat(params, "dielectricF0Min", options.dielectricF0Min);
     options.dielectricF0Max = paramFloat(params, "dielectricF0Max", options.dielectricF0Max);
     options.fo76ReflectanceStart = paramFloat(params, "fo76ReflectanceStart", options.fo76ReflectanceStart);
@@ -507,6 +507,16 @@ void registerAll(Registry& registry)
                     Value::fromScalar(material->translucency
                             ? std::clamp(material->translucencyTransmissiveScale, 0.0f, 4.0f)
                             : 0.0f));
+                // Reflective in game, dielectric after conversion. Worth saying
+                // once per material, because it is the single biggest visible
+                // difference between the vanilla look and the converted one,
+                // and the correction mask is how you get the metal back.
+                if (!fo76 && material->environmentMapping)
+                    output->notes.append(QStringLiteral(
+                        "reflective in game (%1) — converts dielectric")
+                            .arg(material->envmapTexture.trimmed().isEmpty()
+                                     ? QStringLiteral("no cubemap")
+                                     : QFileInfo(material->envmapTexture).fileName()));
 
                 output->status = QStringLiteral("%1 v%2 · %3 texture%4")
                     .arg(fo76 ? QStringLiteral("FO76") : QStringLiteral("FO4"))
@@ -699,7 +709,7 @@ void registerAll(Registry& registry)
         spec.summary = QStringLiteral("Metallic inference and metal albedo recovery for Fallout 4 sources.");
         spec.inputs = {materialPort("material", "Material"), imagePort("diffuse", "Diffuse"),
             imagePort("specular", "Specular (_s)", true), imagePort("glow", "Glow", true),
-            imagePort("envMask", "Env Mask", true), imagePort("correctionMask", "Correction Mask", true),
+            imagePort("correctionMask", "Correction Mask", true),
             colorPort("cubemapTint", "Cubemap Tint", true)};
         spec.outputs = {imagePort("baseColor", "Base Color"), imagePort("rmaos", "RMAOS"),
             imagePort("emissive", "Emissive"), imagePort("subsurface", "Subsurface"),
@@ -707,13 +717,16 @@ void registerAll(Registry& registry)
         spec.params = sharedMathParams();
         spec.params.prepend(floatParam("recovery", "Metal recovery", 1.0, 0.0, 1.0, 0.05,
             "How strongly dark vanilla metals are rebuilt toward their true albedo."));
-        spec.params.append(boolParam("normalizeSpec", "Normalize spec", true,
-            "Percentile-tame blown-out vanilla spec maps."));
+        spec.params.append(boolParam("cubemapDeclaresMetal", "Cubemap declares metal", false,
+            "Off (the default) converts Fallout 4 fully dielectric: _s.R clamps into the "
+            "F0 window and metal comes from the correction mask. On admits metal for "
+            "materials naming an explicitly metal cubemap."));
+        spec.params.append(boolParam("normalizeSpec", "Normalize spec", false,
+            "Percentile-stretch each spec map. Off by default: it stretches a continuous "
+            "quantity per material, and the chrome it once prevented is gated elsewhere now."));
         spec.params.append(floatParam("specPercentile", "Spec clamp %", 0.98, 0.5, 1.0, 0.01));
-        spec.params.append(floatParam("metalSpecStart", "Metal spec start", 0.25, 0.0, 1.0, 0.01));
-        spec.params.append(floatParam("metalSpecFull", "Metal spec full", 0.65, 0.0, 1.0, 0.01));
-        spec.params.append(floatParam("metalDarkStart", "Metal dark start", 0.35, 0.0, 1.0, 0.01));
-        spec.params.append(floatParam("metalDarkFull", "Metal dark full", 0.12, 0.0, 1.0, 0.01));
+        spec.params.append(floatParam("metalSpecStart", "Metal spec start", 0.12, 0.0, 1.0, 0.01));
+        spec.params.append(floatParam("metalSpecFull", "Metal spec full", 0.45, 0.0, 1.0, 0.01));
         spec.evaluate = [](const EvalArgs& args, EvalOutput* output) {
             const Bgsm::Material* material = materialInput(args, output);
             if (!material) return;
@@ -721,7 +734,6 @@ void registerAll(Registry& registry)
             sources.diffuse = args.inputs.value(QStringLiteral("diffuse")).image();
             sources.specular = args.inputs.value(QStringLiteral("specular")).image();
             sources.glow = args.inputs.value(QStringLiteral("glow")).image();
-            sources.envMask = args.inputs.value(QStringLiteral("envMask")).image();
             sources.correctionMask = args.inputs.value(QStringLiteral("correctionMask")).image();
             const Value tint = args.inputs.value(QStringLiteral("cubemapTint"));
             if (tint.isValid()) { sources.cubemapTint = tint.color(); sources.hasCubemapTint = true; }
@@ -816,12 +828,13 @@ void registerAll(Registry& registry)
             spec.category = QStringLiteral("Source");
             spec.summary = QStringLiteral("Splits Fallout 4 source textures into single maps: "
                                           "_s.R is specular strength, _s.G is gloss.");
+            // No env-mask port: BGSM v2 has no env-mask texture slot, so it was
+            // an input that could only ever be empty.
             spec.inputs = {imagePort("diffuse", "Diffuse (_d)"), imagePort("specular", "Specular (_s)", true),
-                imagePort("normal", "Normal (_n)", true), imagePort("glow", "Glow (_g)", true),
-                imagePort("envMask", "Env Mask", true)};
+                imagePort("normal", "Normal (_n)", true), imagePort("glow", "Glow (_g)", true)};
             spec.outputs = {imagePort("diffuse", "Diffuse"), imagePort("opacity", "Opacity"),
                 imagePort("specularStrength", "Specular Strength"), imagePort("gloss", "Gloss"),
-                imagePort("normal", "Normal"), imagePort("glow", "Glow"), imagePort("envMask", "Env Mask")};
+                imagePort("normal", "Normal"), imagePort("glow", "Glow")};
             // Everything this node emits is one material taken apart, so the
             // preview offers the untouched original plus each map on its own.
             spec.materialPreview = QStringLiteral("source");
@@ -837,8 +850,6 @@ void registerAll(Registry& registry)
                     Value::fromImage(args.inputs.value(QStringLiteral("normal")).image()));
                 output->outputs.insert(QStringLiteral("glow"),
                     Value::fromImage(args.inputs.value(QStringLiteral("glow")).image()));
-                output->outputs.insert(QStringLiteral("envMask"),
-                    Value::fromImage(args.inputs.value(QStringLiteral("envMask")).image()));
             };
             registry.add(spec);
         }
@@ -2593,46 +2604,87 @@ Graph defaultFo4Graph()
 {
     Builder builder(defaultRegistry());
     const QString material = builder.add("source.material.fo4", 0, 200);
-    const QString tint = builder.add("source.cubemapTint", 260, 590);
-    const QString convert = builder.add("convert.fo4", 480, 200);
-    const QString derive = builder.add("derive.normal", 480, 520);
+    const QString tint = builder.add("source.cubemapTint", 260, 620);
 
-    // Source slots feed the conversion directly, same as FO76. There is no
-    // unpack node here yet because convert.fo4 is still monolithic and wants
-    // the packed _s: it reads specular strength from R and gloss from G itself.
-    // Separate Maps (Fallout 4) is registered and ready for when that node is broken
-    // apart the way the FO76 path was.
+    // Same shape as the FO76 graph: the source owns the filenames, the unpack
+    // node is the only thing that knows how FO4 packs them, and no packed
+    // texture travels past it. _s is BC5 across 99.8% of the vanilla corpus --
+    // two channels, linear, R specular strength and G gloss, with no blue or
+    // alpha to read.
+    const QString unpack = builder.add("unpack.fo4", 300, 260);
     builder.link(material, "material", tint, "material");
-    builder.link(material, "material", convert, "material");
-    builder.link(material, "diffuse", convert, "diffuse");
-    builder.link(material, "smoothSpec", convert, "specular");
-    builder.link(material, "glow", convert, "glow");
-    builder.link(material, "envmapMask", convert, "envMask");
-    builder.link(tint, "tint", convert, "cubemapTint");
-    builder.link(material, "normal", derive, "normal");
+    builder.link(material, "diffuse", unpack, "diffuse");
+    builder.link(material, "smoothSpec", unpack, "specular");
+    builder.link(material, "normal", unpack, "normal");
+    builder.link(material, "glow", unpack, "glow");
 
-    // convert.fo4 hands back a packed RMAOS, so it is split into single maps to
-    // be re-packed alongside the derived detail AO. That looks roundabout, but
-    // it keeps one rule: nothing is packed except in Combine Maps (PBR), and the
-    // AO substitution stays visible on the canvas instead of being an override
-    // hidden inside the terminal.
-    const QString rmaosSplit = builder.add("image.separate", 760, 380);
+    const QString upDiffuse = builder.add("image.upscale", 300, 40);
+    const QString upSpecular = builder.add("image.upscale", 300, 120);
+    const QString upNormal = builder.add("image.upscale", 300, 480);
+    builder.link(unpack, "diffuse", upDiffuse, "image");
+    builder.link(unpack, "specularStrength", upSpecular, "image");
+    builder.link(unpack, "normal", upNormal, "image");
+
+    const QString derive = builder.add("derive.normal", 700, 540);
+    builder.link(upNormal, "image", derive, "normal");
+
+    // ---- FO4 conversion, written out as nodes -------------------------------
+    // Structurally unlike FO76's, because the two titles do not store the same
+    // thing. FO76 states reflectance per texel in _r, so its metal mask is a
+    // measurement. Fallout 4 states metallicity NOWHERE, so there is no metal
+    // branch here at all and the graph reads:
+    //
+    //   roughness = 1 - _s.G     (the .bgsm smoothness where G is flat)
+    //   F0        = clamp(_s.R)  into the dielectric window, off convert.fo4
+    //   metallic  = unwired, which Combine Maps holds at 0
+    //
+    // That is not a shortcut, it is the measurement. Over 6616 vanilla
+    // materials nothing classifies metal better than a coin flip: _s.R alone
+    // separates metal from dielectric by +22 points at ~53% precision, _s.R and
+    // _s.G jointly do WORSE (+19), and inside the envmap gate the two
+    // populations are identical (metal p50 64, dielectric p50 63). The diffuse
+    // gate that carries FO76 runs backwards here. Metal comes from the
+    // correction mask, where it is a decision someone made.
+    const QString roughness = builder.add("image.invert", 700, 260);
+    builder.link(unpack, "gloss", roughness, "image");
+
+    // convert.fo4 is here for the base colour and the F0 axis, not for metal:
+    // with the cubemap declaration off (its default) it recovers nothing and
+    // passes the diffuse through, which is the correct conversion for a
+    // dielectric. Turn the declaration on inside this node for a set where the
+    // artist did name metal cubemaps and you want them converted automatically.
+    const QString convert = builder.add("convert.fo4", 920, 380);
+    builder.link(material, "material", convert, "material");
+    builder.link(upDiffuse, "image", convert, "diffuse");
+    // The packed _s, straight from the source: this node reads both channels
+    // itself, which is why it is the one place a packed texture still travels
+    // past Separate Maps.
+    builder.link(material, "smoothSpec", convert, "specular");
+    builder.link(unpack, "glow", convert, "glow");
+    builder.link(tint, "tint", convert, "cubemapTint");
+
+    // Specular F0 comes off convert.fo4's RMAOS alpha. _s.R is a Blinn-Phong
+    // intensity with no physical anchor, so the mapping is anchored on the
+    // corpus: the measured median maps to the dielectric default 0.04 and the
+    // 0.02-0.08 window clamps the tails.
+    const QString rmaosSplit = builder.add("image.separate", 1140, 420);
     builder.link(convert, "rmaos", rmaosSplit, "image");
 
     // The shipped normal keeps the original's RGB and takes only the derived
     // signed curvature in A. Feeding the whole normal in makes the old "B
     // defaulted to white" class of bug impossible.
-    const QString channels = builder.add("composite.pbrChannels", 980, 300);
+    const QString channels = builder.add("composite.pbrChannels", 1360, 240);
     builder.link(convert, "baseColor", channels, "baseColor");
-    builder.link(material, "normal", channels, "normal");
+    builder.link(upNormal, "image", channels, "normal");
     builder.link(derive, "curvature", channels, "curvature");
-    builder.link(rmaosSplit, "r", channels, "roughness");
-    builder.link(rmaosSplit, "g", channels, "metallic");
+    builder.link(roughness, "image", channels, "roughness");
+    // Metallic deliberately unwired — Combine Maps holds it at 0. Wire a
+    // painted correction mask in for a material that should be metal.
     builder.link(derive, "ao", channels, "ao"); // derived detail AO, not the conversion's B
     builder.link(rmaosSplit, "a", channels, "specular");
     builder.link(convert, "emissive", channels, "emissive");
 
-    const QString pbr = builder.add("output.pbrMaterial", 1200, 300);
+    const QString pbr = builder.add("output.pbrMaterial", 1580, 300);
     builder.link(channels, "baseColor", pbr, "baseColor");
     builder.link(channels, "normal", pbr, "normal");
     builder.link(channels, "rmaos", pbr, "rmaos");

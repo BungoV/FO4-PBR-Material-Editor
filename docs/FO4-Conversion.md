@@ -20,9 +20,16 @@ texture-suffix conventions, channel semantics, and inference math; everything
 downstream of them — the derivations, geometry AO, masks, workspace, and
 `.pbrm` output — is shared:
 
-- **Fallout 4** (BGSM/BGEM version 2): the full pipeline below, including
-  metal albedo recovery and envmap-based metallic inference — FO4's dark
-  metal + cubemap authoring demands it.
+- **Fallout 4** (BGSM/BGEM version 2): a **spec-gloss workflow that never
+  states metallicity**, so conversion is dielectric by default — `_s.G`
+  inverts to roughness (with the `.bgsm` scalar substituted where that channel
+  is flat, which is 13.4% of the corpus and would otherwise ship a mirror
+  finish), and `_s.R` clamps into the physical F0 window anchored on the
+  corpus median. Metal albedo recovery and the cubemap metal declaration still
+  exist and still work, but they are **opt-in**: measured across all 6616
+  vanilla materials, nothing in a `.bgsm` classifies metal better than a coin
+  flip. See *RMAOS ← `_s`* below for the four tests behind that. Metal is the
+  correction mask's job.
 - **Fallout 76** (BGSM/BGEM version 20+): a **true specular workflow** —
   the diffuse is strictly the Lambertian term, so **metals are authored
   with black diffuse** and their color (gold's yellow, steel's grey) lives
@@ -53,7 +60,9 @@ header variants).
 ## Contract
 
 - **Input**: Fallout 4 `.bgsm` / `.bgem` materials (loose or BA2) and the
-  vanilla texture sets they reference (`_d`, `_n`, `_s`, `_g`, env masks).
+  vanilla texture sets they reference (`_d`, `_n`, `_s`, `_g`). BGSM v2 has no
+  env-mask texture slot — the field that looked like one is BGEM's — so there
+  is no env mask in the FO4 path.
 - **Output**: a **same-name sibling `.pbrm`** at the same relative
   `Materials\` path inside a chosen output mod folder, plus converted PBR
   textures at mirrored `Textures\` paths. The `.bgsm`/`.bgem` files are
@@ -66,11 +75,15 @@ header variants).
 
 ### Base Color ← `_d`
 
-Pass-through for dielectrics (sRGB, alpha preserved for opacity), with
-**metal albedo recovery**: vanilla metals are authored dark because the
-engine composites the cubemap on top (gated by environment mapping, the env
-mask, and spec strength). PBR metal base color *is* the reflectance color,
-so recovered texels take **hue from the diffuse, brightness from spec**:
+Pass-through, which for Fallout 4 is the whole story by default: with no metal
+inferred there is nothing to recover, and the diffuse *is* the base colour
+(sRGB, alpha preserved for opacity).
+
+**Metal albedo recovery** below runs only where metallic is non-zero — that is,
+under an opted-in cubemap declaration or a painted correction mask. Vanilla
+metals are authored dark because the engine composites the cubemap on top, and
+PBR metal base color *is* the reflectance color, so recovered texels take **hue
+from the diffuse, brightness from spec**:
 
 ```
 m           = metallic confidence (below)
@@ -191,25 +204,142 @@ Shelf note: the same bake with rays flipped inward is a **thickness bake**
 for SSS alpha; the infrastructure is shared when that becomes worth
 exposing.
 
-### RMAOS ← `_s` (+ env mask + BGSM parameters)
+### RMAOS ← `_s` (measured, not assumed)
 
-FO4 `_s`: R = specular strength, G = glossiness.
+Everything here is calibrated against the vanilla corpus at
+`E:\Tools\Fallout 4\DataUnpacked\Data` — 6616 BGSM, 283 BGEM, 31950 DDS. The
+survey is reproducible from the GUI binary:
 
-- **Roughness** = `1 − gloss`, remapped through an adjustable curve
-  (vanilla gloss is exponent-flavored; default curve tuned visually), then
-  clamped to the preview floor (0.035).
-- **Metallic confidence** `m` from the standard spec-gloss → metal-rough
-  inference: env mapping enabled × env-mask scale × spec R × diffuse
-  darkness, smoothstepped with adjustable thresholds. Written to G.
-- **AO** from the derivation pass → B.
-- **A carries Dielectric F0** by default: dielectric texels get
-  `F0 = clamp(specR × specMult × 0.08, 0.02, 0.08)` (the vanilla spec axis
-  compressed into the physical dielectric window); metal texels' F0 comes
-  from base color, so A can stay at 0.04 there.
-- **Spec clamping**: batch mode applies percentile normalization per texture
-  (blown-out vanilla spec maps otherwise convert to mirror chrome) and the
-  dielectric window clamp above. The single-material import dialog exposes
-  the clamps as live sliders because some materials need manual judgment.
+```bash
+"PBR Material Editor.exe" --survey-fo4 <materials> <report.tsv> --texture-root <data> --limit 99999
+```
+
+Add `--no-textures` for a scalar-only pass, which answers anything about what
+the `.bgsm` declares in seconds rather than ten minutes.
+
+`_s` is **BC5U across 99.8%** of the corpus: two channels, linear, with no blue
+and no alpha to read. R is specular strength, G is glossiness.
+
+#### Which channel is which
+
+Not taken from the field name — `sSmoothSpecTexture` lists them in the opposite
+order, and getting this backwards swaps roughness and F0 in every conversion.
+The `.bgsm` `smoothness` scalar is a fallback (below), so it goes non-default
+only when *its own* channel carries nothing. Isolating each channel:
+
+| maps where… | `smoothness` non-default |
+| --- | --- |
+| only `_s.G` is flat, R still varies | **80.3%** (n=827) |
+| only `_s.R` is flat, G still varies | **5.9%** (n=51) — *below* the 20.9% baseline |
+
+The scalar substitutes for G. **G is gloss, R is specular.**
+
+#### The scalars: one falls back, one multiplies
+
+- **`fSmoothness` is a fallback, not a multiplier** — non-default in 80.9% of
+  flat-G maps against 20.8% of textured ones. `_s.G` is the gloss where it
+  varies; the scalar is the gloss where it does not. Multiplying instead would
+  have made 1055 materials with real gloss maps uniformly rougher.
+- That matters more than it sounds. Where G is flat its stored level is
+  **median 255 — pure white** — while the scalar sits at median 0.50. Vanilla
+  writes the gloss channel white and puts the real value in the scalar. Read
+  the texel literally and gloss = 1.0 → roughness 0 → **a mirror finish on 827
+  materials, 13.4% of the corpus.**
+- **`fSpecularMult` genuinely multiplies.** It runs the other way — non-default
+  in 29.1% of textured-R maps against 19.3% of flat ones — so it scales `_s.R`
+  rather than standing in for it.
+
+#### Roughness
+
+`roughness = 1 − gloss` through the same adjustable curve FO76 has, defaulting
+to a plain inversion, with the `.bgsm` scalar substituted wherever G is flat. No
+per-material normalisation, for the reason under *Smoothness `_l.R`* below:
+roughness is a continuous physical quantity whose absolute value carries meaning
+*between* materials.
+
+#### Dielectric F0
+
+`_s.R` is a Blinn-Phong specular intensity with no physical anchor, so the
+mapping is anchored on the corpus instead: the **measured median (54/255) maps
+to the physical dielectric default 0.04**, and the 0.02–0.08 window clamps the
+tails. The top decile (94/255) reaches ≈0.07.
+
+The old `clamp(specR × specMult × 0.08, …)` put that median texel at 0.017 —
+*under* the floor — so the whole F0 axis pinned flat at 0.02 and carried no
+information at all.
+
+**Percentile spec normalisation is off by default** as of 2026-07-26. It existed
+to stop blown-out spec maps converting to mirror chrome, and chrome no longer
+comes from a bright texel (below). What remained was a per-material stretch of a
+continuous quantity — the thing the roughness rule warns against.
+
+#### Metallic: Fallout 4 does not encode it
+
+This is the finding, and it is a negative one. Four independent tests:
+
+| signal | recall | false-pos | precision | separation |
+| --- | --- | --- | --- | --- |
+| `_s.R` threshold (best) | 45% | 28% | 53% | +22.5 |
+| `_s.G` threshold (best) | 73% | 57% | 47% | +16.2 |
+| both jointly | 50% | 31% | 53% | **+18.7** |
+| `_s.R × _s.G` product (best) | 62% | 38% | 53% | +24.4 |
+| `bEnvironmentMapping` alone | 61% | 19% | 69% | +41.3 |
+
+Scored over ~2750 materials labelled metal or dielectric by vanilla's own asset
+naming. The labels are sound: they *bracket* the corpus base rate rather than
+sitting on it, which is what says they carry signal rather than noise.
+
+In order:
+
+1. **The diffuse gate that carries FO76 runs backwards here.** Across 5350
+   materials the diffuse under top-decile spec is *brighter* — median 95 against
+   76, ratio 0.84, agreeing in 26.3% where FO76's holds in 92.5%. FO4 metals
+   keep their hue in the diffuse; they are not authored black. Keeping that gate
+   removed metal from exactly the texels that carry it.
+2. **`_s.R` and `_s.G` jointly are worse than `_s.R` alone.** FO4 is full of
+   glossy dielectrics — polished wood, painted brick, wet asphalt, plastic — so
+   "reflective and smooth" describes an enormous amount of non-metal. Precision
+   sticks at ~53% either way: a coin flip.
+3. **Inside the envmap gate the two populations are identical** — metal `_s.R`
+   p50 = 64, dielectric p50 = 63 — and separation goes *negative* above 150,
+   because very bright spec is more often a dielectric highlight than metal.
+4. **The cubemap choice adds a little, and only by name.** `metalchrome01cube_e`
+   is 93% metal, but the generic `mipblur_defaultoutside1` carries 1309
+   materials at 68% — and the other 32% are brick walls, hair and bloodbug fur.
+
+So **Fallout 4 converts dielectric.** `_s.R` goes where it belongs, into the F0
+window; metallic stays 0. Metal comes from the **correction mask**, where it is
+a decision someone made rather than one a heuristic guessed. A material with
+`bEnvironmentMapping` set gets a note saying it was reflective in game and
+converted dielectric — a note, deliberately *not* a review flag, because
+dielectric is the design and flagging 2381 materials would bury the queue.
+
+`Options::useCubemapMetalDeclaration` (the **Cubemap declares metal** parameter
+on *FO4 Conversion*) opts in to the cubemap rule for sets where the artist did
+name metal cubemaps. It admits metal only inside an explicitly metal-named cube
+and places it with a Levels window at **0.12 black / 0.45 white** — measured so
+78% of the 522 declared-metal materials stay metal at their median texel and 95%
+at p90, where the old 0.25 cut half of every declared metal in two.
+
+#### Model-space normals
+
+`bModelSpaceNormals` skips the derivations entirely. Curvature, detail AO and
+height all read the normal as a *tangent-space gradient field* — the Poisson
+solve integrates XY as slopes — and a model-space normal stores object axes
+instead, so the chain would produce confident nonsense. Only 3 vanilla materials
+set it (all `CryoHumanMale`), but mods use it more; the normal ships unchanged
+and a note records the skip.
+
+#### Template chains
+
+51.9% of vanilla materials inherit through a root chain, and
+`Template/DefaultTemplate_Wet.bgsm` **names itself as its own root**. A revisited
+template is therefore a completed chain, not a cycle: every pass only fills
+fields the child left *empty*, so a second lap can contribute nothing by
+construction, whether the loop is a deliberate self-reference or a genuine
+A→B→A mistake. Treating it as an error flagged roughly 3400 materials over a
+template that had already resolved correctly. An unresolvable root is still an
+error.
 
 Output BC7 linear, full mip chain, **Toksvig folded from the converted
 normal automatically** — the converter always has the paired normal in hand.

@@ -330,12 +330,26 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         sources.diffuse = diffuse;
         sources.specular = loadSource(material.smoothSpecTexture, options.textureRoot, &result.notes, QStringLiteral("specular (_s)"));
         sources.glow = loadSource(material.glowTexture, options.textureRoot, &result.notes, QStringLiteral("glow"));
-        sources.envMask = loadSource(material.envmapMaskTexture, options.textureRoot, &result.notes, QStringLiteral("env mask"));
         sources.correctionMask = correctionMask;
         sources.hasCubemapTint = cubemapMeanColor(material.envmapTexture, options.textureRoot, &sources.cubemapTint);
         converted = convertFo4(sources, material, options.math);
         if (material.environmentMapping && !material.envmapTexture.trimmed().isEmpty() && !sources.hasCubemapTint)
             result.notes.append(QStringLiteral("cubemap unavailable for tint: ") + material.envmapTexture);
+
+        // A note, deliberately not a flag. Fallout 4 converts dielectric by
+        // design, so a reflective material is the normal case, not a problem --
+        // flagging every one buried the review queue under a third of the
+        // corpus. The note still records which materials the game treated as
+        // reflective, so a --json run can list metal candidates for masking
+        // without the workspace treating them as unfinished work.
+        if (material.environmentMapping && !options.math.useCubemapMetalDeclaration
+            && correctionMask.isNull()) {
+            result.notes.append(QStringLiteral(
+                "reflective in game (cubemap %1): converted dielectric — "
+                "paint a correction mask to make it metal")
+                    .arg(material.envmapTexture.trimmed().isEmpty()
+                             ? QStringLiteral("none") : material.envmapTexture.trimmed()));
+        }
     }
     if (converted.baseColor.isNull()) {
         result.errors.append(QStringLiteral("conversion produced no base color"));
@@ -344,9 +358,21 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     result.metalCoverage = converted.metalCoverage;
 
     // ---- Derivations (curvature always; height/AO per options) ----
+    // Every derivation reads the normal as a TANGENT-space gradient field: the
+    // Poisson solve integrates XY as slopes, the horizon scan walks that height,
+    // and curvature is its Laplacian. A model-space normal stores object axes
+    // instead, so those XY numbers are not slopes and the whole chain would
+    // produce confident nonsense. Rare in vanilla -- 3 materials in 6616, all
+    // CryoHumanMale -- but mods use it more, and silently deriving from it is
+    // worse than not deriving at all.
     NormalDerive::Results derived;
-    if (!normal.isNull() && !options.supplied.active)
+    if (material.modelSpaceNormals && !normal.isNull()) {
+        result.notes.append(QStringLiteral(
+            "model-space normals: derivations skipped (curvature, detail AO and height "
+            "all read a tangent-space gradient field); the normal ships unchanged"));
+    } else if (!normal.isNull() && !options.supplied.active) {
         derived = NormalDerive::derive(normal, options.derive);
+    }
     if (derived.denoised)
         result.notes.append(QStringLiteral("derivation-side denoise engaged (noise metric %1)").arg(derived.noiseMetric, 0, 'f', 3));
 

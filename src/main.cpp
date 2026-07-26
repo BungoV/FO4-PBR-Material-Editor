@@ -32,6 +32,7 @@
 #include <QTimer>
 #include <QTreeWidget>
 
+#include <algorithm>
 #include <array>
 #include <utility>
 
@@ -538,6 +539,282 @@ int main(int argc, char* argv[])
             QFile out(application.arguments().at(modelsIndex + 1));
             if (out.open(QIODevice::WriteOnly | QIODevice::Text)) out.write(text.toUtf8());
         }
+        return 0;
+    }
+
+    // The FO4 counterpart of --survey-r and --survey-gloss, and the reason the
+    // FO4 profile's numbers stop being "tuned on the X01 set". Everything the
+    // FO4 inference rests on is measured here in one pass over the vanilla
+    // corpus: the _s channels it thresholds, the .bgsm scalars it multiplies
+    // by, the envmap flag it gates on, and -- the decisive one -- whether FO4
+    // metals are actually dark in diffuse the way FO76 metals are. FO4 keeps
+    // metal hue in the diffuse, so the dark gate inherited from the FO76 shape
+    // may be measuring nothing at all.
+    const int fo4Index = application.arguments().indexOf(QStringLiteral("--survey-fo4"));
+    if (fo4Index >= 0 && fo4Index + 2 < application.arguments().size()) {
+        const QStringList arguments = application.arguments();
+        const QString root = arguments.at(fo4Index + 1);
+        const QString reportPath = arguments.at(fo4Index + 2);
+        const int rootIndex = arguments.indexOf(QStringLiteral("--texture-root"));
+        const QString textureRoot = rootIndex >= 0 && rootIndex + 1 < arguments.size()
+            ? arguments.at(rootIndex + 1) : QString();
+        const int limitIndex = arguments.indexOf(QStringLiteral("--limit"));
+        const int limit = limitIndex >= 0 && limitIndex + 1 < arguments.size()
+            ? arguments.at(limitIndex + 1).toInt() : 900;
+        // Scalars alone answer any question about what the .bgsm declares, and
+        // that pass runs in seconds where the texel pass takes ten minutes.
+        const bool scalarsOnly = arguments.contains(QStringLiteral("--no-textures"));
+
+        QStringList rows;
+        rows << QStringLiteral("material\tenvMap\tenvScale\tenvCube\tmsn\tspecEnabled\tspecMult"
+                               "\tspecColorLuma\tsmoothness\temit\tcubemap\troot\tsPath\tformat\twidth\theight"
+                               "\tr_p1\tr_p50\tr_p90\tr_p99\tg_p1\tg_p50\tg_p99\trFlat\tgFlat"
+                               "\tdiffOnHighSpec\tdiffOnLowSpec\tratio");
+
+        // Per-material aggregates, kept as vectors so the summary can quote
+        // medians rather than means: one 4x4 flat placeholder skews a mean and
+        // does nothing to a median.
+        QVector<int> rp1All, rp50All, rp90All, rp99All, gp1All, gp50All, gp99All;
+        QVector<int> rp99EnvOn, rp99EnvOff;
+        QVector<double> diffHigh, diffLow, diffRatio;
+        QVector<double> specMults, smoothScalars;
+        int scanned = 0, withSpecMap = 0, withNormal = 0, withGlow = 0, withGrayscale = 0;
+        int envOn = 0, envWithCube = 0, msnCount = 0, specEnabledCount = 0, emitCount = 0;
+        int rFlatCount = 0, gFlatCount = 0, darkerOnMetal = 0, bgemCount = 0, rootChains = 0;
+        int noSpecMap = 0;
+
+        QDirIterator walker(root, {QStringLiteral("*.bgsm"), QStringLiteral("*.bgem")},
+            QDir::Files, QDirIterator::Subdirectories);
+        while (walker.hasNext() && scanned < limit) {
+            const QString path = walker.next();
+            Bgsm::Material material;
+            if (!Bgsm::readFile(path, &material, nullptr)) continue;
+            if (material.isFallout76()) continue;   // FO4 profile is version 2
+            if (material.kind == Bgsm::Kind::Bgem) { ++bgemCount; continue; }
+            ++scanned;
+            if (!material.rootMaterialPath.trimmed().isEmpty()) ++rootChains;
+            if (!material.normalTexture.trimmed().isEmpty()) ++withNormal;
+            if (!material.glowTexture.trimmed().isEmpty()) ++withGlow;
+            if (!material.greyscaleTexture.trimmed().isEmpty()) ++withGrayscale;
+            if (material.environmentMapping) ++envOn;
+            if (material.environmentMapping && !material.envmapTexture.trimmed().isEmpty())
+                ++envWithCube;
+            if (material.modelSpaceNormals) ++msnCount;
+            if (material.specularEnabled) ++specEnabledCount;
+            if (material.emitEnabled) ++emitCount;
+            specMults.append(material.specularMult);
+            smoothScalars.append(material.smoothness);
+
+            const QVector3D specColor = material.specularColor;
+            const double specLuma = 0.2126 * specColor.x() + 0.7152 * specColor.y()
+                + 0.0722 * specColor.z();
+            const auto scalarRow = [&](const QString& tail) {
+                rows << QStringLiteral("%1\t%2\t%3\t%4\t%5\t%6\t%7\t%8\t%9\t%10\t%11\t%12")
+                            .arg(QDir(root).relativeFilePath(path))
+                            .arg(material.environmentMapping ? 1 : 0)
+                            .arg(material.environmentMappingMaskScale, 0, 'f', 2)
+                            .arg(material.envmapTexture.trimmed().isEmpty() ? 0 : 1)
+                            .arg(material.modelSpaceNormals ? 1 : 0)
+                            .arg(material.specularEnabled ? 1 : 0)
+                            .arg(material.specularMult, 0, 'f', 3)
+                            .arg(specLuma, 0, 'f', 3)
+                            .arg(material.smoothness, 0, 'f', 3)
+                            .arg(material.emitEnabled ? 1 : 0)
+                            .arg(material.envmapTexture.trimmed().isEmpty()
+                                     ? QStringLiteral("<none>") : material.envmapTexture.trimmed())
+                            // Vanilla inherits through templates named for the
+                            // material class -- MetalTemplate, WoodTemplate,
+                            // BrickTemplate. That is an artist stating what the
+                            // surface IS, which nothing else in the format does.
+                            .arg(material.rootMaterialPath.trimmed().isEmpty()
+                                     ? QStringLiteral("<none>") : material.rootMaterialPath.trimmed())
+                            .arg(tail);
+            };
+
+            const QString specPath = material.smoothSpecTexture.trimmed();
+            if (scalarsOnly) {
+                scalarRow(specPath.isEmpty() ? QStringLiteral("<none>") : specPath);
+                continue;
+            }
+            if (specPath.isEmpty()) {
+                ++noSpecMap;
+                scalarRow(QStringLiteral("<none>"));
+                continue;
+            }
+            const QImage specMap = TextureImage::load(specPath, textureRoot, nullptr);
+            if (specMap.isNull()) {
+                scalarRow(QStringLiteral("%1\t<unreadable>").arg(specPath));
+                continue;
+            }
+            ++withSpecMap;
+            const TextureImage::Diagnostics info = TextureImage::inspect(specPath, textureRoot);
+            const QImage spec = specMap.convertToFormat(QImage::Format_RGBA8888);
+
+            // Stored values, no transfer applied. _s is BC5U across 99.8% of the
+            // corpus, which is a linear two-channel data format: R is specular
+            // strength, G is glossiness, and there is no blue or alpha to read.
+            std::array<int, 256> rBuckets{}, gBuckets{};
+            for (int y = 0; y < spec.height(); ++y) {
+                const uchar* line = spec.constScanLine(y);
+                for (int x = 0; x < spec.width(); ++x) {
+                    ++rBuckets[line[x * 4]];
+                    ++gBuckets[line[x * 4 + 1]];
+                }
+            }
+            const double texels = double(spec.width()) * spec.height();
+            const auto percentile = [texels](const std::array<int, 256>& buckets, double fraction) {
+                double seen = 0;
+                for (int i = 0; i < 256; ++i) {
+                    seen += buckets[i];
+                    if (seen >= fraction * texels) return i;
+                }
+                return 255;
+            };
+            const int rp1 = percentile(rBuckets, 0.01), rp10 = percentile(rBuckets, 0.10);
+            const int rp50 = percentile(rBuckets, 0.50);
+            const int rp90 = percentile(rBuckets, 0.90), rp99 = percentile(rBuckets, 0.99);
+            const int gp1 = percentile(gBuckets, 0.01), gp50 = percentile(gBuckets, 0.50);
+            const int gp99 = percentile(gBuckets, 0.99);
+            const bool rFlat = (rp99 - rp1) < 8, gFlat = (gp99 - gp1) < 8;
+            if (rFlat) ++rFlatCount;
+            if (gFlat) ++gFlatCount;
+            rp1All.append(rp1); rp50All.append(rp50);
+            rp90All.append(rp90); rp99All.append(rp99);
+            gp1All.append(gp1); gp50All.append(gp50); gp99All.append(gp99);
+            (material.environmentMapping ? rp99EnvOn : rp99EnvOff).append(rp99);
+
+            // The decisive measurement. FO76's metal gate works because metals
+            // there are authored with black diffuse; FO4 metals keep their hue,
+            // so the same gate may be gating on nothing. Split this material's
+            // texels by their own spec strength and compare what the diffuse
+            // does across the two populations. Top decile against bottom decile,
+            // deliberately symmetric: an extreme compared against a percentile
+            // would let each side carry a different amount of the map and turn
+            // any imbalance into a fake correlation. Sampling is at _s
+            // resolution -- the diffuse is usually larger and gets
+            // nearest-sampled, which is fine for a distribution.
+            double highDiff = -1, lowDiff = -1, ratio = -1;
+            const QImage diffuseMap = TextureImage::load(material.diffuseTexture, textureRoot, nullptr);
+            if (!diffuseMap.isNull() && !rFlat) {
+                const QImage diffuse = diffuseMap.convertToFormat(QImage::Format_RGBA8888);
+                std::array<int, 256> highBuckets{}, lowBuckets{};
+                qint64 highCount = 0, lowCount = 0;
+                for (int y = 0; y < spec.height(); ++y) {
+                    const uchar* specLine = spec.constScanLine(y);
+                    const int dy = std::min(diffuse.height() - 1,
+                        int(qint64(y) * diffuse.height() / spec.height()));
+                    const uchar* diffuseLine = diffuse.constScanLine(dy);
+                    for (int x = 0; x < spec.width(); ++x) {
+                        const int strength = specLine[x * 4];
+                        if (strength < rp90 && strength > rp10) continue;
+                        const int dx = std::min(diffuse.width() - 1,
+                            int(qint64(x) * diffuse.width() / spec.width()));
+                        const uchar* texel = diffuseLine + dx * 4;
+                        const int luma = std::clamp(int(0.2126 * texel[0] + 0.7152 * texel[1]
+                            + 0.0722 * texel[2]), 0, 255);
+                        if (strength >= rp90) { ++highBuckets[luma]; ++highCount; }
+                        else { ++lowBuckets[luma]; ++lowCount; }
+                    }
+                }
+                const auto medianOf = [](const std::array<int, 256>& buckets, qint64 count) {
+                    if (count <= 0) return -1.0;
+                    qint64 seen = 0;
+                    for (int i = 0; i < 256; ++i) {
+                        seen += buckets[i];
+                        if (seen >= count / 2) return double(i);
+                    }
+                    return 255.0;
+                };
+                highDiff = medianOf(highBuckets, highCount);
+                lowDiff = medianOf(lowBuckets, lowCount);
+                if (highDiff >= 0 && lowDiff > 0) {
+                    ratio = lowDiff / std::max(highDiff, 1.0);
+                    diffHigh.append(highDiff);
+                    diffLow.append(lowDiff);
+                    diffRatio.append(ratio);
+                    if (highDiff < lowDiff) ++darkerOnMetal;
+                }
+            }
+
+            const QString format = info.compressionLabel().isEmpty() ? QStringLiteral("?")
+                                                                     : info.compressionLabel();
+            scalarRow(QStringLiteral("%1\t%2\t%3\t%4\t%5\t%6\t%7\t%8\t%9\t%10\t%11\t%12\t%13\t%14\t%15\t%16")
+                          .arg(specPath, format).arg(info.width).arg(info.height)
+                          .arg(rp1).arg(rp50).arg(rp90).arg(rp99)
+                          .arg(gp1).arg(gp50).arg(gp99)
+                          .arg(rFlat ? 1 : 0).arg(gFlat ? 1 : 0)
+                          .arg(highDiff, 0, 'f', 1).arg(lowDiff, 0, 'f', 1).arg(ratio, 0, 'f', 2));
+        }
+
+        const auto medianInt = [](QVector<int> values) {
+            if (values.isEmpty()) return -1;
+            std::sort(values.begin(), values.end());
+            return values.at(values.size() / 2);
+        };
+        const auto medianReal = [](QVector<double> values) {
+            if (values.isEmpty()) return -1.0;
+            std::sort(values.begin(), values.end());
+            return values.at(values.size() / 2);
+        };
+        const auto fraction = [scanned](int count) {
+            return scanned ? 100.0 * count / scanned : 0.0;
+        };
+        const auto countAtLeast = [](const QVector<double>& values, double bound) {
+            int hits = 0;
+            for (double value : values) if (value >= bound) ++hits;
+            return hits;
+        };
+
+        rows << QString() << QStringLiteral("== summary ==");
+        rows << QStringLiteral("BGSM scanned\t%1").arg(scanned);
+        rows << QStringLiteral("BGEM skipped\t%1").arg(bgemCount);
+        rows << QStringLiteral("root-material chains\t%1\t%2%").arg(rootChains).arg(fraction(rootChains), 0, 'f', 1);
+        rows << QStringLiteral("has _s\t%1\t%2%").arg(withSpecMap).arg(fraction(withSpecMap), 0, 'f', 1);
+        rows << QStringLiteral("no _s at all\t%1\t%2%").arg(noSpecMap).arg(fraction(noSpecMap), 0, 'f', 1);
+        rows << QStringLiteral("has _n\t%1\t%2%").arg(withNormal).arg(fraction(withNormal), 0, 'f', 1);
+        rows << QStringLiteral("has glow\t%1\t%2%").arg(withGlow).arg(fraction(withGlow), 0, 'f', 1);
+        rows << QStringLiteral("has grayscale\t%1\t%2%").arg(withGrayscale).arg(fraction(withGrayscale), 0, 'f', 1);
+        rows << QStringLiteral("emit enabled\t%1\t%2%").arg(emitCount).arg(fraction(emitCount), 0, 'f', 1);
+        rows << QStringLiteral("model-space normals\t%1\t%2%").arg(msnCount).arg(fraction(msnCount), 0, 'f', 1);
+        rows << QString();
+        rows << QStringLiteral("-- the metal gate inputs --");
+        rows << QStringLiteral("environment mapping on\t%1\t%2%").arg(envOn).arg(fraction(envOn), 0, 'f', 1);
+        rows << QStringLiteral("  ... with a cubemap named\t%1\t%2%").arg(envWithCube).arg(fraction(envWithCube), 0, 'f', 1);
+        rows << QStringLiteral("specular enabled\t%1\t%2%").arg(specEnabledCount).arg(fraction(specEnabledCount), 0, 'f', 1);
+        rows << QStringLiteral("median specularMult\t%1").arg(medianReal(specMults), 0, 'f', 3);
+        rows << QStringLiteral("specularMult != 1\t%1").arg(specMults.size() - std::count(specMults.constBegin(), specMults.constEnd(), 1.0));
+        rows << QStringLiteral("median smoothness scalar\t%1").arg(medianReal(smoothScalars), 0, 'f', 3);
+        rows << QStringLiteral("smoothness != 1\t%1").arg(smoothScalars.size() - std::count(smoothScalars.constBegin(), smoothScalars.constEnd(), 1.0));
+        rows << QString();
+        rows << QStringLiteral("-- _s.R (specular strength) --");
+        rows << QStringLiteral("median p1 / p50 / p90 / p99\t%1\t%2\t%3\t%4")
+                    .arg(medianInt(rp1All)).arg(medianInt(rp50All))
+                    .arg(medianInt(rp90All)).arg(medianInt(rp99All));
+        rows << QStringLiteral("flat (no variation)\t%1\t%2%").arg(rFlatCount)
+                    .arg(withSpecMap ? 100.0 * rFlatCount / withSpecMap : 0.0, 0, 'f', 1);
+        rows << QStringLiteral("median p99, envmap ON\t%1\tn=%2").arg(medianInt(rp99EnvOn)).arg(rp99EnvOn.size());
+        rows << QStringLiteral("median p99, envmap OFF\t%1\tn=%2").arg(medianInt(rp99EnvOff)).arg(rp99EnvOff.size());
+        rows << QString();
+        rows << QStringLiteral("-- _s.G (glossiness) --");
+        rows << QStringLiteral("median p1 / p50 / p99\t%1\t%2\t%3")
+                    .arg(medianInt(gp1All)).arg(medianInt(gp50All)).arg(medianInt(gp99All));
+        rows << QStringLiteral("flat (no variation)\t%1\t%2%").arg(gFlatCount)
+                    .arg(withSpecMap ? 100.0 * gFlatCount / withSpecMap : 0.0, 0, 'f', 1);
+        rows << QString();
+        rows << QStringLiteral("-- does the FO76 dark-diffuse gate transfer? --");
+        rows << QStringLiteral("materials measured\t%1").arg(diffRatio.size());
+        rows << QStringLiteral("median diffuse on top-decile spec\t%1").arg(medianReal(diffHigh), 0, 'f', 1);
+        rows << QStringLiteral("median diffuse on bottom-decile spec\t%1").arg(medianReal(diffLow), 0, 'f', 1);
+        rows << QStringLiteral("median ratio (low spec / high spec)\t%1").arg(medianReal(diffRatio), 0, 'f', 2);
+        rows << QStringLiteral("darker under high spec\t%1\t%2%").arg(darkerOnMetal)
+                    .arg(diffRatio.isEmpty() ? 0.0 : 100.0 * darkerOnMetal / diffRatio.size(), 0, 'f', 1);
+        rows << QStringLiteral("ratio >= 2 (FO76-like separation)\t%1\t%2%")
+                    .arg(countAtLeast(diffRatio, 2.0))
+                    .arg(diffRatio.isEmpty() ? 0.0 : 100.0 * countAtLeast(diffRatio, 2.0) / diffRatio.size(), 0, 'f', 1);
+
+        QFile fo4Report(reportPath);
+        if (fo4Report.open(QIODevice::WriteOnly | QIODevice::Text))
+            fo4Report.write(rows.join(QChar('\n')).toUtf8() + '\n');
         return 0;
     }
 

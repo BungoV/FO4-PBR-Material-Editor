@@ -891,10 +891,24 @@ int main(int argc, char* argv[])
         check(chained.diffuseTexture == QStringLiteral("textures\\armor\\a_d.dds")
             && chained.greyscaleTexture == QStringLiteral("textures\\shared\\root_grey.dds"),
             QStringLiteral("root chain borrows only the textures the child left empty"));
+        // A template that names itself is vanilla, not a fault:
+        // Template/DefaultTemplate_Wet.bgsm does exactly this, and roughly 3400
+        // of the 6616 vanilla materials inherit through it. Revisiting a
+        // template can contribute nothing — every pass only fills fields the
+        // child left EMPTY — so the chain is complete, not broken.
         Bgsm::Material cyclic;
         check(Bgsm::read(v2.data, &cyclic, &bgsmError), QStringLiteral("cycle-test child reparses"));
         const auto cyclicLookup = [&v2](const QString&, QByteArray* data) { *data = v2.data; return true; };
-        check(!Bgsm::resolveRootChain(&cyclic, cyclicLookup), QStringLiteral("root chain cycles are rejected"));
+        check(Bgsm::resolveRootChain(&cyclic, cyclicLookup),
+            QStringLiteral("a self-referencing template resolves instead of erroring"));
+        check(cyclic.diffuseTexture == QStringLiteral("textures\\armor\\a_d.dds"),
+            QStringLiteral("and the borrow that did happen is kept"));
+        // An unresolvable root is still a real failure.
+        Bgsm::Material orphan;
+        check(Bgsm::read(v2.data, &orphan, &bgsmError), QStringLiteral("orphan-test child reparses"));
+        const auto missingLookup = [](const QString&, QByteArray*) { return false; };
+        check(!Bgsm::resolveRootChain(&orphan, missingLookup),
+            QStringLiteral("a root that cannot be resolved at all is still rejected"));
 
         // Real-corpus sweep: parse every material under PBRM_TEST_BGSM_DIR.
         const QString corpusDir = qEnvironmentVariable("PBRM_TEST_BGSM_DIR");
@@ -940,8 +954,14 @@ int main(int argc, char* argv[])
             builder.str(QStringLiteral("armor/conv_d.png"));
             builder.str(QStringLiteral("armor/conv_n.png"));
             builder.str(QStringLiteral("armor/conv_s.png"));
-            builder.str(QString()); builder.str(QString()); builder.str(QString());
-            builder.str(QString()); builder.str(QString()); builder.str(QString());
+            builder.str(QString());                        // greyscale
+            // Slot 5 is the cubemap, and in Fallout 4 the cubemap IS the metal
+            // declaration — nothing else in the format states metallicity. The
+            // file does not exist here on purpose: the name drives the metal
+            // decision, while the tint donor falls back to neutral.
+            builder.str(QStringLiteral("shared/cubemaps/metalchrome01cube_e.dds"));
+            builder.str(QString()); builder.str(QString());
+            builder.str(QString()); builder.str(QString());
             builder.boolean(false);
             builder.boolean(false); builder.f32(2.0f); builder.f32(0.0f);
             builder.boolean(false); builder.f32(.3f);
@@ -972,12 +992,34 @@ int main(int argc, char* argv[])
         jobOptions.outputRoot = convOut.path();
         jobOptions.textureRoot = convRoot.path() + QStringLiteral("/textures");
         jobOptions.derive.derivationSize = 64;
+        // The metal path is opt-in; this fixture turns it on so recovery and
+        // the mask override have something to act on. The default is asserted
+        // separately below.
+        jobOptions.math.useCubemapMetalDeclaration = true;
         Converter::TextureCache textureCache;
         const Converter::JobResult first = Converter::convertMaterial(buildConvMaterial(QStringLiteral("conv.bgsm")), jobOptions, &textureCache);
         check(first.converted && first.errors.isEmpty(),
             QStringLiteral("orchestrator converts the synthetic metal: %1").arg(first.errors.join(QStringLiteral("; "))));
         check(first.metalCoverage > 0.9f,
-            QStringLiteral("dark diffuse + strong spec + envmap infers metal (coverage %1)").arg(first.metalCoverage));
+            QStringLiteral("opted in, a declared metal cubemap infers metal (coverage %1)").arg(first.metalCoverage));
+        {
+            // The shipped default over the very same material: dielectric.
+            // Its own output root, because the texture names come from the
+            // SOURCE textures rather than the material — both runs would write
+            // armor/conv_BC.dds, and a second TextureCache cannot see the first
+            // run's claim, so the dielectric pass would silently overwrite the
+            // metal one that the assertions below go on to read.
+            QTemporaryDir defaultOut;
+            Converter::JobOptions defaults = jobOptions;
+            defaults.math = Converter::Options();
+            defaults.outputRoot = defaultOut.path();
+            Converter::TextureCache defaultCache;
+            const Converter::JobResult plain =
+                Converter::convertMaterial(buildConvMaterial(QStringLiteral("convDefault.bgsm")),
+                    defaults, &defaultCache);
+            check(plain.converted && qFuzzyIsNull(plain.metalCoverage),
+                QStringLiteral("on the defaults the same material converts fully dielectric"));
+        }
         check(QFileInfo::exists(first.pbrmPath) && first.pbrmPath.endsWith(QStringLiteral("Materials/armor/conv.pbrm")),
             QStringLiteral("sibling .pbrm lands on the materials-relative path"));
         for (const QString& suffix : {QStringLiteral("_BC"), QStringLiteral("_RMAOS"), QStringLiteral("_N")})
@@ -1247,16 +1289,40 @@ int main(int argc, char* argv[])
             && qFuzzyCompare(Converter::glossToRoughness(0.0f, options), 1.0f),
             QStringLiteral("gloss 1 -> roughness 0 and gloss 0 -> roughness 1"));
 
-        // FO4 metallic inference: needs env mapping AND bright spec AND dark
-        // diffuse; each missing leg kills it.
-        check(Converter::metallicConfidenceFo4(0.9f, 0.05f, true, 1.0f, 1.0f, options) > 0.9f,
-            QStringLiteral("FO4 inference fires on envmap + bright spec + dark diffuse"));
-        check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.9f, 0.05f, false, 1.0f, 1.0f, options)),
-            QStringLiteral("FO4 inference is dead without environment mapping"));
-        check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.05f, 0.05f, true, 1.0f, 1.0f, options)),
-            QStringLiteral("FO4 inference is dead without spec strength"));
-        check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.9f, 0.6f, true, 1.0f, 1.0f, options)),
-            QStringLiteral("FO4 inference is dead on a bright diffuse"));
+        // FO4 metal declaration: the cubemap name is the ONLY place Fallout 4
+        // ever states metallicity, so these strings are load-bearing.
+        check(Converter::cubemapDeclaresMetal(QStringLiteral("textures\\shared\\cubemaps\\MetalChrome01Cube_e.dds"))
+            && Converter::cubemapDeclaresMetal(QStringLiteral("Textures/Shared/Cubemaps/bronze_e.dds"))
+            && Converter::cubemapDeclaresMetal(QStringLiteral("metalbrushed02cube_e.dds")),
+            QStringLiteral("metal-named cubemaps declare metal, whatever the case or separator"));
+        check(!Converter::cubemapDeclaresMetal(QStringLiteral("textures\\shared\\cubemaps\\mipblur_defaultoutside1.dds"))
+            && !Converter::cubemapDeclaresMetal(QStringLiteral("outsideoldtownreflectcube_e.dds"))
+            && !Converter::cubemapDeclaresMetal(QString()),
+            QStringLiteral("the generic sky cubes declare nothing — they are used on brick"));
+        // Deliberately NOT tempting: mipblur_defaultoutside1 is 68% metal by
+        // asset naming and would be the single biggest win by volume, but the
+        // other 32% are brick walls and hair, and admitting it chromes them.
+        check(!Converter::cubemapDeclaresMetal(QStringLiteral("mipblur_defaultoutside1_dielectric.dds")),
+            QStringLiteral("a cubemap's own _dielectric suffix is not a surface claim either"));
+
+        // FO4 converts DIELECTRIC by default, and this is the assertion that
+        // says so: nothing in a .bgsm states metallicity, so no texel of any
+        // brightness earns metal on its own.
+        check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.9f, true, options))
+            && qFuzzyIsNull(Converter::metallicConfidenceFo4(0.9f, false, options)),
+            QStringLiteral("FO4 infers no metal at all by default, whatever the cubemap says"));
+        {
+            // Opt in and the declaration gates it: bright spec inside a
+            // declared metal converts, the same spec outside one does not.
+            Converter::Options declaring = options;
+            declaring.useCubemapMetalDeclaration = true;
+            check(Converter::metallicConfidenceFo4(0.9f, true, declaring) > 0.9f,
+                QStringLiteral("opted in, a declared metal with bright spec converts metal"));
+            check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.9f, false, declaring)),
+                QStringLiteral("opted in, an undeclared material stays dielectric however bright"));
+            check(qFuzzyIsNull(Converter::metallicConfidenceFo4(0.02f, true, declaring)),
+                QStringLiteral("opted in, dark-spec grime over a declared metal stays dielectric"));
+        }
 
         // FO76 inference: bright reflectance + black diffuse.
         check(Converter::metallicConfidenceFo76({0.7f, 0.6f, 0.45f}, 0.02f, options) > 0.9f,
@@ -1305,12 +1371,19 @@ int main(int argc, char* argv[])
         fo4Material.environmentMapping = true;
         fo4Material.environmentMappingMaskScale = 1.0f;
         fo4Material.specularMult = 1.0f;
+        fo4Material.envmapTexture = QStringLiteral("textures\\shared\\cubemaps\\metalchrome01cube_e.dds");
         Converter::Fo4Sources fo4Sources;
         fo4Sources.diffuse = diffuse;
         fo4Sources.specular = specular;
         fo4Sources.cubemapTint = goldTint;
         fo4Sources.hasCubemapTint = true;
-        const Converter::ConvertedImages fo4Out = Converter::convertFo4(fo4Sources, fo4Material, options);
+        // This block exercises the metal path, which is opt-in: the default
+        // converts dielectric and there would be no metal half to inspect.
+        Converter::Options declaringOptions = options;
+        declaringOptions.useCubemapMetalDeclaration = true;
+        const Converter::ConvertedImages fo4Out = Converter::convertFo4(fo4Sources, fo4Material, declaringOptions);
+        check(qFuzzyIsNull(Converter::convertFo4(fo4Sources, fo4Material, options).metalCoverage),
+            QStringLiteral("the same textures convert fully dielectric on the defaults"));
         check(!fo4Out.baseColor.isNull() && fo4Out.metalCoverage > 0.4f && fo4Out.metalCoverage < 0.6f,
             QStringLiteral("FO4 conversion reports the authored metal coverage"));
         const QColor metalBase = fo4Out.baseColor.pixelColor(6, 4);
@@ -1325,6 +1398,60 @@ int main(int argc, char* argv[])
             QStringLiteral("FO4 metallic channel splits the halves"));
         check(metalRmaos.redF() < plasticRmaos.redF(),
             QStringLiteral("FO4 glossy metal converts smoother than dull plastic"));
+
+        // Even opted in, the generic sky cube declares nothing — this is the
+        // brick-wall-with-a-cubemap case, 2381 materials of vanilla.
+        {
+            Bgsm::Material brick = fo4Material;
+            brick.envmapTexture = QStringLiteral("textures\\shared\\cubemaps\\mipblur_defaultoutside1.dds");
+            const Converter::ConvertedImages out = Converter::convertFo4(fo4Sources, brick, declaringOptions);
+            check(qFuzzyIsNull(out.metalCoverage)
+                && QColor(out.rmaos.pixelColor(6, 4)).greenF() < 0.05,
+                QStringLiteral("reflective without a metal cubemap converts fully dielectric"));
+        }
+
+        // The .bgsm smoothness scalar is the gloss where _s.G says nothing, and
+        // is ignored where it does. Measured: non-default in 80.9% of flat-G
+        // maps against 20.8% of textured ones.
+        {
+            // Flat G is written PURE WHITE in vanilla — measured median 255
+            // across the 827 materials whose gloss channel carries nothing,
+            // against a median scalar of 0.50. Read literally that is gloss 1.0
+            // and a mirror finish on 13.4% of the corpus, so the fallback is
+            // load-bearing, not a nicety.
+            QImage flatGloss(4, 4, QImage::Format_RGBA8888);
+            flatGloss.fill(QColor(120, 255, 0));   // R spec .47, G gloss flat at white
+            Bgsm::Material scalarMaterial;
+            scalarMaterial.smoothness = 0.2f;      // rough, and the only real signal
+            Converter::Fo4Sources scalarSources;
+            scalarSources.diffuse = diffuse;
+            scalarSources.specular = flatGloss;
+            const Converter::ConvertedImages out = Converter::convertFo4(scalarSources, scalarMaterial, options);
+            check(QColor(out.rmaos.pixelColor(1, 1)).redF() > 0.7,
+                QStringLiteral("a white flat _s.G falls back to the scalar instead of shipping a mirror"));
+
+            Bgsm::Material texturedMaterial = scalarMaterial;
+            const Converter::ConvertedImages textured =
+                Converter::convertFo4(fo4Sources, texturedMaterial, options);
+            check(QColor(textured.rmaos.pixelColor(6, 4)).redF() < 0.3,
+                QStringLiteral("a textured _s.G ignores the scalar rather than multiplying by it"));
+        }
+
+        // Dielectric F0 is anchored on the corpus median, not on specR * 0.08 —
+        // which put the median texel of the median material under the 0.02
+        // floor and pinned the whole axis flat.
+        {
+            QImage medianSpec(4, 4, QImage::Format_RGBA8888);
+            medianSpec.fill(QColor(54, 128, 0));   // the measured _s.R median
+            Bgsm::Material plain;
+            Converter::Fo4Sources plainSources;
+            plainSources.diffuse = diffuse;
+            plainSources.specular = medianSpec;
+            const Converter::ConvertedImages out = Converter::convertFo4(plainSources, plain, options);
+            const double f0 = QColor(out.rmaos.pixelColor(1, 1)).alphaF();
+            check(f0 > 0.035 && f0 < 0.045,
+                QStringLiteral("the corpus-median specular maps to the physical dielectric 0.04"));
+        }
 
         // Image-level FO76 conversion: gold over black diffuse with _l data.
         QImage diffuse76(4, 4, QImage::Format_RGBA8888);
@@ -2993,6 +3120,10 @@ int main(int argc, char* argv[])
             material.specularEnabled = true;
             material.specularMult = 1.7f;
             material.smoothness = 0.82f;
+            // The cubemap declaration is what admits metal in FO4; without it
+            // this fixture converts dielectric and the coverage assertion below
+            // has nothing to compare.
+            material.envmapTexture = QStringLiteral("shared/cubemaps/metalbrushed01cube_e.dds");
 
             QImage diffuse(16, 16, QImage::Format_RGBA8888);
             QImage specular(16, 16, QImage::Format_RGBA8888);
@@ -3023,8 +3154,22 @@ int main(int argc, char* argv[])
                     && nodeOutput.outputs.value(QStringLiteral("rmaos")).image() == expected.rmaos,
                 QStringLiteral("convert.fo4 node matches a direct convertFo4 call texel for texel: %1").arg(nodeOutput.error));
             check(qFuzzyCompare(nodeOutput.outputs.value(QStringLiteral("metalCoverage")).scalar() + 1.0f,
-                    expected.metalCoverage + 1.0f) && expected.metalCoverage > 0.0f,
-                QStringLiteral("convert.fo4 node reports the orchestrator's metal coverage"));
+                    expected.metalCoverage + 1.0f) && qFuzzyIsNull(expected.metalCoverage),
+                QStringLiteral("convert.fo4 node agrees with the math, and both convert dielectric"));
+
+            // And the declaration param reaches the math when it is turned on.
+            args.params.insert(QStringLiteral("cubemapDeclaresMetal"), true);
+            NodeGraph::EvalOutput declared;
+            convertSpec->evaluate(args, &declared);
+            Converter::Options declaringOptions;
+            declaringOptions.useCubemapMetalDeclaration = true;
+            const Converter::ConvertedImages declaredExpected =
+                Converter::convertFo4(sources, material, declaringOptions);
+            check(declaredExpected.metalCoverage > 0.9f
+                    && qFuzzyCompare(declared.outputs.value(QStringLiteral("metalCoverage")).scalar() + 1.0f,
+                           declaredExpected.metalCoverage + 1.0f),
+                QStringLiteral("the cubemap-declaration param reaches the math"));
+            args.params.insert(QStringLiteral("cubemapDeclaresMetal"), false);
 
             // Per-parameter fidelity: the node's params reach the math.
             args.params.insert(QStringLiteral("glossCurve"), 2.5);

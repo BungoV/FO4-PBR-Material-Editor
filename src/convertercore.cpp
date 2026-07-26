@@ -71,16 +71,36 @@ float glossToRoughness(float gloss, const Options& options)
     return std::clamp(std::pow(inverted, options.glossCurve), 0.0f, 1.0f);
 }
 
-float metallicConfidenceFo4(float specStrength, float diffuseLinearLuma,
-    bool environmentMapping, float environmentMaskScale, float environmentMask,
+bool cubemapDeclaresMetal(const QString& envmapTexture)
+{
+    QString name = envmapTexture.trimmed().toLower();
+    name.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    name = name.section(QLatin1Char('/'), -1);
+    if (name.isEmpty()) return false;
+    // Explicitly metal-named cubes only. mipblur_defaultoutside1 carries by far
+    // the most volume (1309 materials) and reads 68% metal by asset naming, but
+    // it is the generic sky cube: the other 32% are brick walls and hair, so
+    // admitting it would convert those to chrome. The names below cover 522
+    // vanilla materials scoring 55-100% metal.
+    static const char* const declarations[] = {
+        "metalchrome", "metalbrushed", "metalshine", "chrome_e", "bronze_e",
+        "copper_e", "gold_e", "silver_e", "steel_e",
+    };
+    for (const char* declaration : declarations)
+        if (name.contains(QLatin1String(declaration))) return true;
+    return false;
+}
+
+float metallicConfidenceFo4(float specStrength, bool cubemapDeclaresMetal,
     const Options& options)
 {
-    if (!environmentMapping) return 0.0f;
-    const float envSignal = std::clamp(environmentMaskScale, 0.0f, 1.0f) * std::clamp(environmentMask, 0.0f, 1.0f);
-    const float specSignal = smoothstepf(options.metalSpecStart, options.metalSpecFull, specStrength);
-    // Darker diffuse means the cubemap was meant to carry the appearance.
-    const float darkSignal = smoothstepf(options.metalDarkStart, options.metalDarkFull, diffuseLinearLuma);
-    return std::clamp(envSignal * specSignal * darkSignal, 0.0f, 1.0f);
+    if (!cubemapDeclaresMetal || !options.useCubemapMetalDeclaration) return 0.0f;
+    // One signal, not a joint one. The second opinion FO76 gets from diffuse
+    // darkness does not exist here: measured over 5350 vanilla materials the
+    // diffuse under high spec is BRIGHTER (median 95 against 76), so the FO76
+    // gate transplanted into FO4 removed metal from the texels carrying it.
+    return std::clamp(smoothstepf(options.metalSpecStart, options.metalSpecFull, specStrength),
+        0.0f, 1.0f);
 }
 
 float metallicConfidenceFo76(const QVector3D& reflectanceLinear,
@@ -160,6 +180,22 @@ float channelPercentile(const QImage& image, int channel, float percentile)
     return 1.0f;
 }
 
+bool channelIsFlat(const QImage& image, int channel, int tolerance)
+{
+    const QImage source = toRgba(image);
+    if (source.isNull() || channel < 0 || channel > 3) return true;
+    int lowest = 255, highest = 0;
+    for (int y = 0; y < source.height(); ++y) {
+        const uchar* line = source.constScanLine(y);
+        for (int x = 0; x < source.width(); ++x) {
+            const int value = line[x * 4 + channel];
+            lowest = std::min(lowest, value);
+            highest = std::max(highest, value);
+        }
+    }
+    return highest - lowest < tolerance;
+}
+
 ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& material, const Options& options)
 {
     ConvertedImages result;
@@ -167,17 +203,29 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
     if (diffuse.isNull()) return result;
     const int width = diffuse.width(), height = diffuse.height();
     const ScaledReader specular(sources.specular, width, height);
-    const ScaledReader envMask(sources.envMask, width, height);
     const ScaledReader correction(sources.correctionMask, width, height);
 
-    // Batch-mode spec normalization: blown-out vanilla spec maps otherwise
-    // convert to mirror chrome.
+    // Off by default now; see Options::normalizeSpec for why the chrome it was
+    // added to prevent no longer comes from here.
     float specScale = 1.0f;
     if (options.normalizeSpec && specular.valid()) {
         const float percentile = channelPercentile(sources.specular, 0, options.specNormalizePercentile);
         specScale = 1.0f / std::max(percentile, options.specNormalizeFloor);
     }
     const float specMult = std::clamp(material.specularMult, 0.0f, 4.0f);
+
+    // Metal is a per-material declaration in FO4, made by the cubemap the
+    // artist chose and by nothing else in the file. Resolved once, outside the
+    // loop, because it cannot vary across the surface.
+    const bool declaredMetal = cubemapDeclaresMetal(material.envmapTexture);
+
+    // The .bgsm smoothness scalar is a FALLBACK for a gloss channel that says
+    // nothing, not a multiplier on one that does -- measured non-default in
+    // 80.9% of flat-G maps against 20.8% of textured ones. Multiplying instead
+    // would have made 1055 vanilla materials with real gloss maps uniformly
+    // rougher for no reason.
+    const bool glossFromScalar = !specular.valid() || channelIsFlat(sources.specular, 1);
+    const float scalarGloss = std::clamp(material.smoothness, 0.0f, 1.0f);
 
     result.baseColor = QImage(width, height, QImage::Format_RGBA8888);
     result.rmaos = QImage(width, height, QImage::Format_RGBA8888);
@@ -192,16 +240,14 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
         for (int x = 0; x < width; ++x) {
             const QVector3D diffuseSrgb(diffuseLine[x * 4] / 255.0f, diffuseLine[x * 4 + 1] / 255.0f, diffuseLine[x * 4 + 2] / 255.0f);
             const QVector3D diffuseLinear = srgbToLinear(diffuseSrgb);
-            float specStrength = 0.0f, gloss = material.smoothness;
+            float specStrength = 0.0f, gloss = scalarGloss;
             if (specular.valid()) {
                 const uchar* specTexel = specular.texel(x, y);
                 specStrength = std::clamp(specTexel[0] / 255.0f * specScale, 0.0f, 1.0f);
-                gloss = specTexel[1] / 255.0f;
+                if (!glossFromScalar) gloss = specTexel[1] / 255.0f;
             }
             specStrength = std::clamp(specStrength * specMult, 0.0f, 1.0f);
-            const float mask = envMask.valid() ? envMask.texel(x, y)[0] / 255.0f : 1.0f;
-            float metallic = metallicConfidenceFo4(specStrength, luminance(diffuseLinear),
-                material.environmentMapping, material.environmentMappingMaskScale, mask, options);
+            float metallic = metallicConfidenceFo4(specStrength, declaredMetal, options);
             if (correction.valid())
                 metallic = applyMetallicCorrection(metallic, correction.texel(x, y)[0] / 255.0f);
             if (metallic > 0.5f) ++metalTexels;
@@ -217,7 +263,14 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
             baseLine[x * 4 + 3] = diffuseLine[x * 4 + 3];
 
             const float roughness = glossToRoughness(gloss, options);
-            const float dielectricF0 = std::clamp(specStrength * 0.08f,
+            // _s.R is a Blinn-Phong intensity, not an F0, so it is anchored on
+            // the corpus rather than on a physical table: the measured median
+            // maps to the dielectric default 0.04 and the window clamps the
+            // tails. The old specStrength * 0.08 put the median texel of the
+            // median material at 0.017, under the floor -- so the whole F0 axis
+            // pinned flat at 0.02 and carried no information at all.
+            const float dielectricF0 = std::clamp(
+                specStrength * (0.04f / std::max(options.specMedianReference, 1e-4f)),
                 options.dielectricF0Min, options.dielectricF0Max);
             rmaosLine[x * 4] = uchar(std::lround(roughness * 255.0f));
             rmaosLine[x * 4 + 1] = uchar(std::lround(metallic * 255.0f));

@@ -514,8 +514,20 @@ bool resolveRootChain(Material* material, const MaterialLookup& lookup, QString*
     while (!rootPath.trimmed().isEmpty()) {
         const QString key = normalized(rootPath);
         if (visited.contains(key)) {
-            if (error) *error = QStringLiteral("Root material chain contains a cycle at %1.").arg(rootPath);
-            return false;
+            // Revisiting a template is not a failure, and vanilla Fallout 4
+            // depends on that: Template/DefaultTemplate_Wet.bgsm names ITSELF
+            // as its root, and roughly 3400 of the 6616 vanilla materials
+            // inherit through it. Treating that as an error flagged half the
+            // corpus over a template that had already resolved correctly.
+            //
+            // Stopping here loses nothing either way. Every pass only fills
+            // fields the child left EMPTY, so a template already walked has no
+            // remaining field it could contribute -- a second lap is a no-op by
+            // construction, whether the loop is a deliberate self-reference or
+            // a genuine A->B->A authoring mistake. The chain is complete; the
+            // only real failure is a root that cannot be resolved at all, and
+            // that is still reported below.
+            return true;
         }
         visited.insert(key);
         QByteArray data;

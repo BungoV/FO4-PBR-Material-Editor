@@ -23,16 +23,37 @@ struct Options {
     float metalF0Max = 0.85f;
     float diffuseReliabilityThreshold = 0.09f; // linear luma below which the cubemap tint owns the hue
     float cubemapTintSaturationClamp = 0.35f;  // scene-neutral cubes must not tint metals
-    // FO4 metallic inference thresholds (joint signal, smoothsteps).
-    float metalSpecStart = 0.25f, metalSpecFull = 0.65f;
-    float metalDarkStart = 0.35f, metalDarkFull = 0.12f;  // linear diffuse luma, darker = more metal
+    // FO4 metal window, applied ONLY inside a cubemap metal declaration (see
+    // cubemapDeclaresMetal). Measured over the 522 vanilla materials that name
+    // an explicitly metal cubemap: median _s.R p50 = 62/255, p90 = 106/255. A
+    // black point at 0.12 leaves 78% of those materials metal at their median
+    // and 95% at p90; the old 0.25 cut half of every declared metal in two.
+    float metalSpecStart = 0.12f, metalSpecFull = 0.45f;
+    // Whether the cubemap name may declare metal at all. OFF by default:
+    // nothing in a .bgsm states metallicity, so Fallout 4 converts dielectric
+    // and _s.R goes where it belongs -- clamped into the F0 window below.
+    // Metal comes from the correction mask, where it is a decision someone
+    // made rather than one a heuristic guessed. Turning this on admits metal
+    // for materials naming an explicitly metal cubemap (chrome, brushed,
+    // bronze); that reads 55-100% metal by asset naming across 522 vanilla
+    // materials, which is the best any automatic rule managed, and still not
+    // good enough to be the default.
+    bool useCubemapMetalDeclaration = false;
     // Gloss/smoothness -> roughness response curve (1 = linear invert).
     float glossCurve = 1.0f;
-    // Dielectric F0 window (vanilla spec maps are blown out; clamp into the
-    // physical dielectric range).
+    // Dielectric F0 window (the physical dielectric range).
     float dielectricF0Min = 0.02f, dielectricF0Max = 0.08f;
-    // Spec percentile normalization: batch-mode taming of blown-out spec maps.
-    bool normalizeSpec = true;
+    // _s.R is a Blinn-Phong specular intensity with no physical anchor, so the
+    // F0 mapping is anchored on the corpus instead: the measured median
+    // (54/255 over 6155 materials) maps to the physical dielectric default
+    // 0.04, and the window above clamps the tails.
+    float specMedianReference = 0.212f;
+    // Spec percentile normalization. Default OFF since 2026-07-26: it existed
+    // to stop blown-out spec maps converting to mirror chrome, and chrome now
+    // requires a cubemap declaration instead of a bright texel. What is left is
+    // a per-material stretch of a continuous physical quantity, which is the
+    // thing the roughness rule in docs/FO4-Conversion.md warns against.
+    bool normalizeSpec = false;
     float specNormalizePercentile = 0.98f;
     float specNormalizeFloor = 0.5f;      // never divide by less than this
     // FO76 reconstruction thresholds: reflectance intensity joined with
@@ -52,10 +73,21 @@ float luminance(const QVector3D& linearColor);
 // Roughness from FO4 glossiness / FO76 smoothness.
 float glossToRoughness(float gloss, const Options& options);
 
-// FO4 metallic confidence from the joint signal: env mapping enabled x env
-// mask scale x spec strength x diffuse darkness.
-float metallicConfidenceFo4(float specStrength, float diffuseLinearLuma,
-    bool environmentMapping, float environmentMaskScale, float environmentMask,
+// Does this cubemap path name an explicit metal? Fallout 4 states metallicity
+// nowhere -- not in _s, not in the diffuse, not in bEnvironmentMapping (vanilla
+// puts that on brick) -- so the one place an artist ever wrote "this is metal"
+// is the cubemap they chose. Matches chrome/brushed/bronze/copper/gold/silver/
+// steel cube names; deliberately NOT the general-purpose sky cubes, which carry
+// the volume but are used on everything. See docs/FO4-Conversion.md.
+bool cubemapDeclaresMetal(const QString& envmapTexture);
+
+// FO4 metallic confidence. The cubemap declaration decides WHETHER a material
+// has metal; _s.R decides WHERE on the surface it is, cutting the grime and
+// paint that sit over it. There is no second per-texel opinion: the diffuse
+// darkness that makes FO76's gate reliable runs backwards in FO4 (measured
+// ratio 0.84, agreeing in 26% of materials against FO76's 92.5%), so including
+// it removed metal from exactly the texels that carry it.
+float metallicConfidenceFo4(float specStrength, bool cubemapDeclaresMetal,
     const Options& options);
 
 // FO76 metallic confidence: reflectance intensity joined with diffuse
@@ -78,13 +110,22 @@ QVector3D clampTintSaturation(const QVector3D& linearColor, float maxSaturation)
 // Percentile of a channel across an image (0-1 domain), for spec normalization.
 float channelPercentile(const QImage& image, int channel, float percentile);
 
+// Whether a channel carries no variation worth reading. The FO4 gloss fallback
+// turns on this: _s.G is the glossiness where it varies, and the .bgsm
+// smoothness scalar is the glossiness where it does not. Measured over 6155
+// vanilla materials -- the scalar is non-default in 80.9% of flat-G maps and
+// only 20.8% of textured ones, so it is a fallback, not a multiplier.
+bool channelIsFlat(const QImage& image, int channel, int tolerance = 8);
+
 // ---- Image-level conversion ----
 
 struct Fo4Sources {
     QImage diffuse;        // sRGB, alpha = opacity
     QImage specular;       // linear, R = spec strength, G = gloss
     QImage glow;           // grayscale mask (color lives in the material)
-    QImage envMask;        // optional _m; white when absent
+    // No env mask here on purpose. BGSM v2 has no env-mask texture slot at all
+    // -- the field the orchestrator was reading is BGEM's -- so it was always
+    // an empty image standing in for a signal Fallout 4 never stored.
     QVector3D cubemapTint{0.5f, 0.5f, 0.5f}; // linear mean of the referenced _e
     bool hasCubemapTint = false;
     QImage correctionMask; // optional painted metallic correction (R, 0.5 neutral)
