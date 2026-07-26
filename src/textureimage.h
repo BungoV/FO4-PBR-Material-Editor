@@ -19,6 +19,10 @@ struct Diagnostics {
     QString error;
 
     QString summary() const;
+    // Compression written the way an artist says it: "BC7 sRGB",
+    // "BC5 Linear Signed". BC4/BC5 are data formats and are always linear, so
+    // their label carries signedness where the colour formats carry the space.
+    QString compressionLabel() const;
 };
 
 struct Resource {

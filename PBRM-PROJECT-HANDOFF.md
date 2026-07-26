@@ -82,6 +82,32 @@ mingw32-make -j4
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
+**Incremental builds are only as good as the mtimes.** The generated Makefile
+does list header prerequisites, but `make` compares timestamps, so any source
+restored from git, copied, or bulk-rewritten can end up older than its `.o` and
+never get recompiled. Objects built against a different struct layout then link
+cleanly and write at the wrong offsets. On 2026-07-25 that produced a converter
+crash (`0xC0000374` heap corruption alternating with `0xC0000005`) that survived
+every source-level bisect: the incremental binary crashed 6/6 and 10/10 while a
+`make clean` rebuild of *identical source with identical flags* crashed 0/12.
+After any such restore, `make clean` before trusting a build — and if a crash
+moves when unrelated flags change, suspect the build, not the code.
+
+Two diagnostic configs exist for this:
+
+```powershell
+qmake6 PBRMaterialEditor.pro CONFIG+=symbols  # -g, and drops the release
+                                              # spec's -Wl,-s, which otherwise
+                                              # strips every frame to "?? ()"
+qmake6 PBRMaterialEditor.pro CONFIG+=harden   # symbols + QT_FORCE_ASSERTS +
+                                              # _GLIBCXX_ASSERTIONS
+```
+
+Flag changes alone do not invalidate objects, so follow either with `make clean`.
+Note `harden` changes inlining and stack layout, so it can mask a
+layout-sensitive bug — it is for finding bad indices, not for reproducing.
+Crash rates need N>=10 runs to mean anything; single runs are noise.
+
 Verification workflow that works: `--ui-smoke <png>` exits non-zero unless all
 preview programs link (shader edits only fail at runtime — always run it; set
 `PBRM_SHADER_LOG` for diagnostics); deeper GUI checks drive the live window via

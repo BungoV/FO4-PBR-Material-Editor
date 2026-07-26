@@ -39,6 +39,7 @@
 #include <QSignalBlocker>
 #include <QSplitter>
 #include <QStackedWidget>
+#include <QStandardItemModel>
 #include <QTabWidget>
 #include <QToolButton>
 #include <QTimer>
@@ -264,6 +265,14 @@ PbrPreviewGL::~PbrPreviewGL()
     m_ssaoProgram.reset(); m_ssaoFboA.reset(); m_ssaoFboB.reset();
     for (auto& sourceTexture : m_sourceTextures) sourceTexture.reset();
     m_nodeOutputTexture.reset();
+    // Companion and interior textures are members too, so leaving them to the
+    // implicit member teardown destroyed them after doneCurrent() with no
+    // context bound: QOpenGLTexture then warns and leaks the GL name outright.
+    m_companions.clear();
+    m_interiorTexture.reset();
+    m_tertiaryBaseTexture.reset(); m_tertiaryNormalTexture.reset(); m_tertiaryRmaosTexture.reset();
+    m_tertiaryEmissiveTexture.reset(); m_tertiaryCoverageTexture.reset();
+    m_msaaFbo.reset();
     if (m_sceneDepthTexture) { glDeleteTextures(1, &m_sceneDepthTexture); m_sceneDepthTexture = 0; }
     m_traceProgram.reset(); m_presentProgram.reset(); m_denoiseProgram.reset();
     m_accumFboA.reset(); m_accumFboB.reset(); m_denoiseFboA.reset(); m_denoiseFboB.reset();
@@ -312,8 +321,13 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     if (normal.path.isNull()) normal.enabled = true;
     if (rmaos.path.isNull()) rmaos.enabled = true;
     const int landscapeSlice=document.shaderMode()==Pbr::ShaderMode::LandscapeSurface?m_landscapeLayer:-1;
-    m_baseImage = loadTexture(base, textureRoot, landscapeSlice); m_normalImage = loadTexture(normal, textureRoot, landscapeSlice);
-    m_rmaosImage = loadTexture(rmaos, textureRoot, landscapeSlice); m_emissiveImage = loadTexture(emissive, textureRoot);
+    // A live material comes from the node graph as images, not paths — the
+    // converter previews a result that has not been written to disk yet, so
+    // the document's (empty) slots must not overwrite it.
+    if (!m_liveMaterial) {
+        m_baseImage = loadTexture(base, textureRoot, landscapeSlice); m_normalImage = loadTexture(normal, textureRoot, landscapeSlice);
+        m_rmaosImage = loadTexture(rmaos, textureRoot, landscapeSlice); m_emissiveImage = loadTexture(emissive, textureRoot);
+    }
     m_gradientImage = loadTexture(gradient, textureRoot);
     // Effect materials always composite their layer stack (the particle is the
     // combined result), so overlays stay active in every view mode there.
@@ -1140,13 +1154,54 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
 }
 void PbrPreviewGL::setProjection(Projection value) { if(m_projection==value)return; m_projection = value; update(); emit cameraChanged(); emit projectionChanged(); }
 void PbrPreviewGL::setBackground(Background value) { m_background = value; update(); }
+void PbrPreviewGL::setFlatTiling(int repeats)
+{
+    // Odd counts keep the authored tile centred; even ones would straddle it.
+    const int clamped = std::clamp(repeats, 1, 9) | 1;
+    if (m_flatTiling == clamped) return;
+    m_flatTiling = clamped;
+    update();
+}
 void PbrPreviewGL::setDebugView(DebugView value) { m_debugView = value; update(); }
 void PbrPreviewGL::setDebugViewLeft(DebugView value) { m_debugViewLeft = value; update(); }
 
-void PbrPreviewGL::setSourceComparisonImages(const QImage& diffuse, const QImage& spec, const QImage& normal, const QImage& extra)
+void PbrPreviewGL::setSourceComparisonImages(const QImage& diffuse, const QImage& spec, const QImage& normal,
+    const QImage& extra, const QImage& glow)
 {
-    m_sourceImages[0] = diffuse; m_sourceImages[1] = spec; m_sourceImages[2] = normal; m_sourceImages[3] = extra;
+    m_sourceImages[0] = diffuse; m_sourceImages[1] = spec; m_sourceImages[2] = normal;
+    m_sourceImages[3] = extra;   m_sourceImages[4] = glow;
     m_sourceDirty = true;
+    update();
+}
+
+void PbrPreviewGL::setNativeMaterial(const NativeMaterial& material)
+{
+    m_nativeMaterial = material;
+    update();
+}
+
+void PbrPreviewGL::setLiveMaterialImages(const QImage& base, const QImage& normal,
+    const QImage& rmaos, const QImage& emissive)
+{
+    // Lets the converter shade the graph's assembled result directly, before
+    // anything has been converted to disk.
+    m_liveMaterial = !base.isNull();
+    if (m_liveMaterial) {
+        m_baseImage = base;
+        m_normalImage = normal;
+        m_rmaosImage = rmaos;
+        m_emissiveImage = emissive;
+    }
+    m_texturesDirty = true;
+    update();
+}
+
+void PbrPreviewGL::clearLiveMaterial()
+{
+    if (!m_liveMaterial) return;
+    m_liveMaterial = false;
+    m_baseImage = m_normalImage = m_rmaosImage = m_emissiveImage = QImage();
+    m_texturesDirty = true;
     update();
 }
 
@@ -1159,11 +1214,13 @@ void PbrPreviewGL::setNodeOutputImage(const QImage& image)
 
 void PbrPreviewGL::uploadSourceComparisonTextures()
 {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         QImage image = m_sourceImages[i];
         if (image.isNull()) {
             image = QImage(2, 2, QImage::Format_RGBA8888);
-            image.fill(QColor(40, 40, 44)); // "no such source map"
+            // Absent maps read as black for glow (no emission) and as a neutral
+            // grey elsewhere, so a missing map never lights the surface.
+            image.fill(i == 4 ? QColor(0, 0, 0) : QColor(40, 40, 44));
         }
         m_sourceTextures[i] = std::make_unique<QOpenGLTexture>(image.convertToFormat(QImage::Format_RGBA8888).mirrored(),
             QOpenGLTexture::DontGenerateMipMaps);
@@ -1174,6 +1231,47 @@ void PbrPreviewGL::uploadSourceComparisonTextures()
     m_sourceDirty = false;
 }
 void PbrPreviewGL::setDebugSplit(float fraction) { m_debugSplit = std::clamp(fraction, 0.0f, 0.98f); update(); }
+
+double PbrPreviewGL::splitScreenX(double fraction) const
+{
+    // In flat view the split lives on the TEXTURE, so its screen position has
+    // to be projected like the divider is. Hit-testing and dragging both come
+    // through here: when only the drawing knew, the line moved with the texture
+    // while the grab zone stayed at a screen fraction, and zooming in far
+    // enough put them far enough apart that the divider could not be picked up
+    // at all.
+    if (!m_flatView) return width() * fraction;
+    const QMatrix4x4 mvp = projectionMatrix() * viewMatrix() * objectModelMatrix();
+    const QVector4D clip = mvp * QVector4D(float(fraction) * 2.0f - 1.0f, 0, 0, 1);
+    if (std::abs(clip.w()) < 1e-6f) return width() * fraction;
+    return (clip.x() / clip.w() * 0.5f + 0.5f) * width();
+}
+
+bool PbrPreviewGL::nearDebugSplit(const QPointF& point) const
+{
+    // Only grabbable while a split is actually shown, and only within a few
+    // pixels of the line so it never steals an orbit drag.
+    if (m_debugSplit <= 0.001f) return false;
+    return std::abs(point.x() - splitScreenX(m_debugSplit)) <= 5.0;
+}
+
+void PbrPreviewGL::dragDebugSplit(const QPointF& point)
+{
+    if (width() <= 0) return;
+    double fraction = point.x() / double(width());
+    if (m_flatView) {
+        // Map the cursor back onto the texture's U by projecting its two edges
+        // and interpolating between them, so the divider follows the pointer
+        // at any zoom instead of racing ahead of it.
+        const double left = splitScreenX(0.0), right = splitScreenX(1.0);
+        if (std::abs(right - left) > 1e-3) fraction = (point.x() - left) / (right - left);
+    }
+    fraction = std::clamp(fraction, 0.02, 0.98);
+    if (qFuzzyCompare(float(fraction), m_debugSplit)) return;
+    m_debugSplit = float(fraction);
+    emit debugSplitDragged(m_debugSplit);
+    update();
+}
 void PbrPreviewGL::setTonemapOperator(int op) { m_tonemapOperator = std::clamp(op, 0, 3); update(); }
 
 void PbrPreviewGL::setTurntable(bool enabled, float degreesPerSecond)
@@ -1537,6 +1635,7 @@ void PbrPreviewGL::initializeGL()
         uniform samplerCube uEnvironment,uPrefilteredEnvironment;
         uniform sampler2D uBrdfLut;uniform sampler2DArray uSpecial;
         uniform bool uHasBase,uHasNormal,uHasHeight,uHasEmissive,uUseRoughness,uUseMetallic,uUseAo,uUseF0,uOverrideBaseColor,uOverrideOpacity,uOverrideNormal;
+        uniform bool uFlatSplit;
         uniform bool uOverrideEmissiveColor,uOverrideEmissiveMask,uOverrideHeight,uHeightBlue,uHeightInvert,uParallaxClip,uIsGround,uCompare,uShadowsEnabled,uDerivedEnvironmentShadow;
         uniform bool uHasSecondaryBase,uHasSecondaryNormal,uHasSecondaryEmissive,uHasLayerCoverage,uOverrideLayerCoverage,uInvertLayerCoverage;
         uniform bool uOverrideSecondaryBaseColor,uOverrideSecondaryOpacity,uOverrideSecondaryNormal,uOverrideSecondaryEmissiveColor,uOverrideSecondaryEmissiveMask;
@@ -1572,8 +1671,14 @@ void PbrPreviewGL::initializeGL()
         uniform float uDecalAngleFade,uDecalDistanceFade;
         uniform bool uDynamicInvert,uGlassThinWalled,uWaterShoreFoam,uDecalEnabled;
         uniform bool uMirrorPrimaryUv;
+        // 2D view tiling: 1 shows the single 0-1 tile, higher values repeat it
+        // around itself so a seam shows up where the copies meet.
+        uniform float uFlatTiling;
         uniform int uTonemapOperator;
-        uniform sampler2D uSource0,uSource1,uSource2,uSource3; // converter source maps
+        uniform sampler2D uSource0,uSource1,uSource2,uSource3,uSource4; // converter source maps
+        // Legacy BGSM shading parameters for the native FO4/FO76 views.
+        uniform vec3 uNativeSpecColor,uNativeEmitColor;
+        uniform float uNativeSpecMult,uNativeSmoothness,uNativeEnvScale,uNativeEmitMult;
         uniform sampler2D uNodeOutput;                         // selected graph node's output
         const float PI=3.14159265359;
         vec3 rotateY(vec3 v,float a){float c=cos(a),s=sin(a);return vec3(c*v.x+s*v.z,v.y,-s*v.x+c*v.z);}
@@ -1952,6 +2057,10 @@ void PbrPreviewGL::initializeGL()
                 if(uPolarUvOn[1]==1)meshUv1=polarizeUv(meshUv1);
                 if(uPolarUvOn[2]==1)meshUv2=polarizeUv(meshUv2);
             }
+            // Scaled about the centre, so the authored 0-1 tile keeps its place
+            // and size while its neighbours appear around it. Done before the
+            // UV transform so the material's own tiling still composes.
+            if(uFlatTiling>1.0)meshUv0=(meshUv0-vec2(0.5))*uFlatTiling+vec2(0.5);
             vec2 uv0=transformUv(meshUv0,oscT0,uUvAnimation0,oscRot0,uUvAddress0);
             vec2 uv1=transformUv(meshUv1,oscT1,uUvAnimation1,oscRot1,uUvAddress1);
             vec2 uv2=transformUv(meshUv2,oscT2,uUvAnimation2,oscRot2,uUvAddress2);
@@ -2355,7 +2464,12 @@ void PbrPreviewGL::initializeGL()
             // (default Shaded), the right the inspected map (uDebugSplit 0 =
             // map fills the view). Any A|B channel pairing works.
             int dbgView=uDebugView;
-            if(uDebugSplit>0.001&&gl_FragCoord.x<uViewportWidth*uDebugSplit)dbgView=uDebugViewLeft;
+            // Flat 2D is a texture view, so the divider belongs to the TEXTURE:
+            // it splits at a U coordinate and stays over the same texels while the
+            // view pans and zooms. In 3D there is no such coordinate to anchor to,
+            // so it stays a screen split.
+            float splitAt=uFlatSplit?meshUv0.x:gl_FragCoord.x/max(uViewportWidth,1.0);
+            if(uDebugSplit>0.001&&splitAt<uDebugSplit)dbgView=uDebugViewLeft;
             if(dbgView==1){fragColor=vec4(pow(base,vec3(1.0/2.2)),opacity);return;}
             if(dbgView==2){fragColor=vec4(N*.5+.5,1);return;}
             if(dbgView==3){fragColor=vec4(vec3(rough),1);return;}
@@ -2391,6 +2505,46 @@ void PbrPreviewGL::initializeGL()
             if(dbgView==23){fragColor=vec4(texture(uSource2,uv).rgb,1);return;}
             if(dbgView==24){fragColor=vec4(texture(uSource3,uv).rgb,1);return;}
             if(dbgView==25){fragColor=vec4(texture(uNodeOutput,uv).rgb,1);return;}
+            if(dbgView==26||dbgView==27){
+                // Native FO4 (26) / FO76 (27): the untouched source material in
+                // its own specular-gloss model, lit by the same key and
+                // environment as the PBR view so only the model differs.
+                // Channel meanings match what the converter reads:
+                //   FO4  _s.R = specular strength, _s.G = gloss
+                //   FO76 _r.RGB = reflectance, _l.R = smoothness, _l.G = baked AO
+                bool fo76=dbgView==27;
+                vec3 nAlbedo=pow(max(texture(uSource0,uv).rgb,vec3(0.0)),vec3(2.2));
+                vec3 nTangent=texture(uSource2,uv).rgb*2.0-1.0;
+                nTangent.z=sqrt(max(1.0-dot(nTangent.xy,nTangent.xy),0.0));
+                vec3 nN=normalize(tangentToWorld*nTangent);
+                float nGloss=uNativeSmoothness;
+                vec3 nSpecColor=uNativeSpecColor;
+                float nSpecStrength=uNativeSpecMult;
+                float nAo=1.0;
+                if(fo76){
+                    nSpecColor*=pow(max(texture(uSource1,uv).rgb,vec3(0.0)),vec3(2.2));
+                    vec4 lighting=texture(uSource3,uv);
+                    nGloss=lighting.r;nAo=lighting.g;
+                }else{
+                    vec4 smoothSpec=texture(uSource1,uv);
+                    nSpecStrength*=smoothSpec.r*uNativeEnvScale;
+                    nGloss=smoothSpec.g;
+                }
+                // Bethesda's Blinn-Phong lobe, normalised so gloss changes
+                // redistribute energy instead of adding it.
+                float nPower=exp2(1.0+nGloss*9.0);
+                vec3 nH=normalize(V+L);
+                float nNoL=max(dot(nN,L),0.0),nNoH=max(dot(nN,nH),0.0);
+                float nShadow=shadowVisibility(vWorldPosition,nN);
+                vec3 nSpec=nSpecColor*nSpecStrength*pow(nNoH,nPower)*((nPower+8.0)/25.13274);
+                vec3 nColor=(nAlbedo*0.31830989+nSpec)*uKeyColor*uKeyIntensity*nNoL*nShadow;
+                vec3 nEnvDiffuse=textureLod(uPrefilteredEnvironment,environmentDirection(nN),uPrefilteredEnvironmentMaxLod).rgb*uEnvironmentIntensity;
+                vec3 nEnvSpec=textureLod(uPrefilteredEnvironment,environmentDirection(reflect(-V,nN)),(1.0-nGloss)*uPrefilteredEnvironmentMaxLod).rgb*uEnvironmentIntensity;
+                nColor+=nAlbedo*nEnvDiffuse*nAo;
+                nColor+=nSpecColor*nSpecStrength*nEnvSpec*nAo;
+                nColor+=pow(max(texture(uSource4,uv).rgb,vec3(0.0)),vec3(2.2))*uNativeEmitColor*uNativeEmitMult;
+                fragColor=vec4(tonemap(nColor),1.0);return;
+            }
             if(unlitMaterial){vec3 unlit=base*uUnlitIntensity+particleEdgeGlow;if(uUnlitVertexColor)unlit*=vColor.rgb;fragColor=vec4(uUnlitExposure?tonemap(unlit):pow(max(unlit,vec3(0.0)),vec3(1.0/2.2)),opacity);return;}
             if(uSpecularAa&&!defaults){
                 // Tokuyoshi/Kaplanyan screen-space variance: widen the lobe where
@@ -3611,11 +3765,219 @@ void PbrPreviewGL::drawGrid()
  *  the ClaudeNifskope build and adapted to this viewport's Y-up orbit camera.
  */
 
+void MaterialPreviewWidget::fillViewPicker(QComboBox* picker)
+{
+    // Mirrors the Render mode combo, grouped the way Substance splits it: full
+    // shading versus a single channel viewed raw. Headers go in as disabled
+    // rows so they read as captions rather than choices.
+    const auto addHeader=[picker](const QString& text){
+        picker->addItem(text);
+        if (auto* model=qobject_cast<QStandardItemModel*>(picker->model()))
+            if (QStandardItem* item=model->item(picker->count()-1)) {
+                item->setEnabled(false);
+                QFont font=item->font(); font.setItalic(true); font.setBold(true); item->setFont(font);
+            }
+    };
+    const auto addMode=[picker](const QString& text,PbrPreviewGL::DebugView mode){
+        picker->addItem(text,int(mode));
+    };
+    addHeader(tr("Lighting"));
+    addMode(tr("Material"),PbrPreviewGL::DebugView::Shaded);
+    addMode(tr("Original (FO4)"),PbrPreviewGL::DebugView::NativeFo4);
+    addMode(tr("Original (FO76)"),PbrPreviewGL::DebugView::NativeFo76);
+    addHeader(tr("Single channel"));
+    addMode(tr("Base color"),PbrPreviewGL::DebugView::BaseColor);
+    addMode(tr("Roughness"),PbrPreviewGL::DebugView::Roughness);
+    addMode(tr("Metallic"),PbrPreviewGL::DebugView::Metallic);
+    addMode(tr("Normal"),PbrPreviewGL::DebugView::Normals);
+    addMode(tr("Ambient occlusion"),PbrPreviewGL::DebugView::AmbientOcclusion);
+    addMode(tr("Specular F0"),PbrPreviewGL::DebugView::F0);
+    addMode(tr("Emissive"),PbrPreviewGL::DebugView::Emissive);
+    addMode(tr("Curvature"),PbrPreviewGL::DebugView::Curvature);
+    addMode(tr("Height"),PbrPreviewGL::DebugView::Height);
+    addMode(tr("Opacity"),PbrPreviewGL::DebugView::Opacity);
+    addHeader(tr("Source maps"));
+    addMode(tr("Diffuse"),PbrPreviewGL::DebugView::SourceDiffuse);
+    addMode(tr("Specular / reflectance"),PbrPreviewGL::DebugView::SourceSpec);
+    addMode(tr("Source normal"),PbrPreviewGL::DebugView::SourceNormal);
+    picker->setCurrentIndex(1); // Material
+}
+
+void MaterialPreviewWidget::setSplitPickerVisible(bool visible)
+{
+    if (!m_overlayChannelLeft) return;
+    m_overlayChannelLeft->setVisible(visible);
+    layoutViewportOverlay();
+}
+
+void MaterialPreviewWidget::setSplitPickerCurrentMap(const QString& portId)
+{
+    if (!m_overlayChannelLeft || m_splitPickerMode!=SplitPicker::Maps) return;
+    const int target=m_overlayChannelLeft->findData(portId);
+    if (target<0 || target==m_overlayChannelLeft->currentIndex()) return;
+    QSignalBlocker blocker(m_overlayChannelLeft);
+    m_overlayChannelLeft->setCurrentIndex(target);
+}
+
+void MaterialPreviewWidget::setSplitPickerMode(SplitPicker mode,
+    const QVector<MapEntry>& maps)
+{
+    if (!m_overlayChannelLeft) return;
+    // Re-selecting the same kind of node, or just re-evaluating the graph,
+    // must not rebuild the list: that would snap the picker back to its first
+    // entry and undo the view the user chose.
+    if (m_splitPickerMode==mode && (mode!=SplitPicker::Maps || m_splitPickerMaps==maps)) return;
+    m_splitPickerMode=mode;
+    m_splitPickerMaps=mode==SplitPicker::Maps?maps:QVector<MapEntry>{};
+    QSignalBlocker blocker(m_overlayChannelLeft);
+    m_overlayChannelLeft->clear();
+    switch (mode) {
+    case SplitPicker::Channels:
+        // A single map has channels, not shading modes. RGB first, since that
+        // is what the node already shows before you narrow it down.
+        m_overlayChannelLeft->addItem(tr("RGB"),1|2|4);
+        m_overlayChannelLeft->addItem(tr("Red"),1);
+        m_overlayChannelLeft->addItem(tr("Green"),2);
+        m_overlayChannelLeft->addItem(tr("Blue"),4);
+        m_overlayChannelLeft->addItem(tr("Alpha"),8);
+        m_overlayChannelLeft->setCurrentIndex(0);
+        break;
+    case SplitPicker::Maps:
+        // The whole material first, then the textures it is made of and the
+        // maps packed inside them, so the default is the same shaded view the
+        // graph's two ends have always given.
+        m_overlayChannelLeft->addItem(tr("Material"),QString());
+        for (const MapEntry& map : maps) {
+            m_overlayChannelLeft->addItem(map.label,map.id);
+            if (!map.header) continue;
+            if (auto* model=qobject_cast<QStandardItemModel*>(m_overlayChannelLeft->model()))
+                if (QStandardItem* item=model->item(m_overlayChannelLeft->count()-1)) {
+                    item->setEnabled(false);
+                    QFont font=item->font();font.setItalic(true);font.setBold(true);item->setFont(font);
+                }
+        }
+        m_overlayChannelLeft->setCurrentIndex(0);
+        break;
+    case SplitPicker::Views:
+        fillViewPicker(m_overlayChannelLeft);
+        if (m_debugLeft) {
+            const int target=m_overlayChannelLeft->findData(m_debugLeft->currentData().toInt());
+            if (target>=0) m_overlayChannelLeft->setCurrentIndex(target);
+        }
+        break;
+    }
+    layoutViewportOverlay();
+}
+
+void MaterialPreviewWidget::buildViewportOverlay()
+{
+    // Parented to the GL widget so they float over the render, and they drive
+    // the Display-page controls instead of duplicating their state.
+    m_overlayDimension=new QToolButton(m_materialCanvas);
+    m_overlayDimension->setCheckable(true);
+    m_overlayDimension->setText(tr("3D"));
+    m_overlayDimension->setToolTip(tr("Switch between the 3D mesh and a flat 2D view of the material."));
+    m_overlayDimension->setCursor(Qt::ArrowCursor);
+    connect(m_overlayDimension,&QToolButton::toggled,this,[this](bool flat){
+        m_overlayDimension->setText(flat?tr("2D"):tr("3D"));
+        if (m_flatView && m_flatView->isChecked()!=flat) m_flatView->setChecked(flat);
+    });
+    // Changing it from the Display page has to move the button too.
+    if (m_flatView) connect(m_flatView,&QCheckBox::toggled,this,[this](bool on){
+        if (m_overlayDimension && m_overlayDimension->isChecked()!=on) {
+            QSignalBlocker blocker(m_overlayDimension);
+            m_overlayDimension->setChecked(on);
+            m_overlayDimension->setText(on?tr("2D"):tr("3D"));
+        }
+    });
+
+    // One picker per half of the split. The left one only appears while a node
+    // is selected, since that is the only time there are two surfaces to
+    // compare; the converter drives its visibility.
+    m_overlayChannelLeft=new QComboBox(m_materialCanvas);
+    m_overlayChannelLeft->setCursor(Qt::ArrowCursor);
+    m_overlayChannelLeft->setToolTip(tr("What the LEFT half shows — the node you have selected."));
+    fillViewPicker(m_overlayChannelLeft);
+    m_overlayChannelLeft->hide();
+
+    m_overlayChannel=new QComboBox(m_materialCanvas);
+    m_overlayChannel->setCursor(Qt::ArrowCursor);
+    m_overlayChannel->setToolTip(tr("What the RIGHT half shows — the comparison. "
+                                    "The shaded material, or one channel on its own."));
+    fillViewPicker(m_overlayChannel);
+
+    connect(m_overlayChannelLeft,QOverload<int>::of(&QComboBox::currentIndexChanged),this,[this](int index){
+        const QVariant mode=m_overlayChannelLeft->itemData(index);
+        if (!mode.isValid()) return;
+        // Outside Views mode the value belongs to the selected node — a channel
+        // mask or a map's port id — so it goes to the converter, not m_debugLeft.
+        if (m_splitPickerMode==SplitPicker::Channels) { emit splitChannelsChanged(mode.toInt()); return; }
+        if (m_splitPickerMode==SplitPicker::Maps) { emit splitMapChanged(mode.toString()); return; }
+        if (!m_debugLeft) return;
+        const int target=m_debugLeft->findData(mode.toInt());
+        if (target>=0 && m_debugLeft->currentIndex()!=target) m_debugLeft->setCurrentIndex(target);
+    });
+    if (m_debugLeft) connect(m_debugLeft,QOverload<int>::of(&QComboBox::currentIndexChanged),this,[this](int index){
+        if (!m_overlayChannelLeft || !m_debugLeft || m_splitPickerMode!=SplitPicker::Views) return;
+        const int target=m_overlayChannelLeft->findData(m_debugLeft->itemData(index).toInt());
+        QSignalBlocker blocker(m_overlayChannelLeft);
+        if (target>=0) m_overlayChannelLeft->setCurrentIndex(target);
+    });
+
+    connect(m_overlayChannel,QOverload<int>::of(&QComboBox::currentIndexChanged),this,[this](int index){
+        const QVariant mode=m_overlayChannel->itemData(index);
+        if (!mode.isValid() || !m_debug) return;
+        const int target=m_debug->findData(mode.toInt());
+        if (target>=0 && m_debug->currentIndex()!=target) m_debug->setCurrentIndex(target);
+    });
+    if (m_debug) connect(m_debug,QOverload<int>::of(&QComboBox::currentIndexChanged),this,[this](int index){
+        if (!m_overlayChannel || !m_debug) return;
+        const int target=m_overlayChannel->findData(m_debug->itemData(index).toInt());
+        QSignalBlocker blocker(m_overlayChannel);
+        // A mode with no overlay entry leaves the picker where it was rather
+        // than snapping to something that is not what the viewport shows.
+        if (target>=0) m_overlayChannel->setCurrentIndex(target);
+    });
+
+    m_materialCanvas->installEventFilter(this);
+    layoutViewportOverlay();
+}
+
+void MaterialPreviewWidget::layoutViewportOverlay()
+{
+    if (!m_overlayDimension || !m_overlayChannel || !m_materialCanvas) return;
+    const int margin=10,spacing=6;
+    const QSize dimension=m_overlayDimension->sizeHint();
+    const int dimensionWidth=std::max(dimension.width(),38);
+    const int channelWidth=std::max(m_overlayChannel->sizeHint().width(),150);
+    const int height=std::max(dimension.height(),m_overlayChannel->sizeHint().height());
+    // Each control sits over the half it drives: the selected node's picker top
+    // left, the comparison picker and the 2D/3D switch top right. Putting them
+    // together read as one toolbar and gave no clue which side each affected.
+    if (m_overlayChannelLeft && m_overlayChannelLeft->isVisible()) {
+        m_overlayChannelLeft->setGeometry(margin,margin,channelWidth,height);
+        m_overlayChannelLeft->raise();
+    }
+    const int right=m_materialCanvas->width()-margin;
+    m_overlayChannel->setGeometry(right-channelWidth,margin,channelWidth,height);
+    m_overlayDimension->setGeometry(right-channelWidth-spacing-dimensionWidth,margin,dimensionWidth,height);
+    m_overlayDimension->raise();
+    m_overlayChannel->raise();
+}
+
+bool MaterialPreviewWidget::eventFilter(QObject* watched,QEvent* event)
+{
+    if (watched==m_materialCanvas && (event->type()==QEvent::Resize || event->type()==QEvent::Show))
+        layoutViewportOverlay();
+    return QFrame::eventFilter(watched,event);
+}
+
 void PbrPreviewGL::navGizmoLayout(QPointF& center,float& radius,float& ballRadius) const
 {
     radius=38.0f;
     ballRadius=10.0f;
-    center=QPointF(width()-radius-18.0,radius+18.0);
+    // Bottom right: the top right corner belongs to the view buttons.
+    center=QPointF(width()-radius-18.0,height()-radius-18.0);
 }
 
 void PbrPreviewGL::navGizmoBalls(QPointF positions[6],float depths[6]) const
@@ -3655,10 +4017,43 @@ void PbrPreviewGL::drawNavGizmo(QPainter& painter)
 {
     QPointF center;float radius,ballRadius;
     navGizmoLayout(center,radius,ballRadius);
-    QPointF positions[6];float depths[6];
-    navGizmoBalls(positions,depths);
     painter.setRenderHint(QPainter::Antialiasing,true);
     painter.setRenderHint(QPainter::TextAntialiasing,true);
+
+    // 2D is texture space, so the orbit ball would be meaningless — there is no
+    // camera to orbit and no third axis. Show the UV frame instead.
+    if(m_flatView){
+        // Same ball radius, pen weight, font and label treatment as the 3D
+        // gizmo below — the two are the same control in different spaces, so
+        // they should not look like two different widgets.
+        QFont uvFont=painter.font();
+        uvFont.setPixelSize(int(ballRadius*1.35f));
+        uvFont.setBold(true);
+        painter.setFont(uvFont);
+        // U and V share the axis colours X and Y use, since that is what they
+        // correspond to; the origin sits where the 3D gizmo's centre ball does.
+        const double arm=radius*0.72;
+        struct Axis{QPointF tip;QColor color;const char* label;};
+        const Axis axes[2]={
+            {QPointF(center.x()+arm,center.y()),QColor(226,87,87),"U"},
+            {QPointF(center.x(),center.y()-arm),QColor(140,200,75),"V"}};
+        for(const Axis& axis:axes){
+            QPen pen(axis.color,2.2);
+            pen.setCapStyle(Qt::RoundCap);
+            painter.setPen(pen);
+            painter.drawLine(center,axis.tip);
+            painter.setBrush(axis.color);
+            painter.setPen(Qt::NoPen);
+            painter.drawEllipse(axis.tip,double(ballRadius),double(ballRadius));
+            painter.setPen(QColor(20,20,20));
+            painter.drawText(QRectF(axis.tip.x()-ballRadius,axis.tip.y()-ballRadius,
+                ballRadius*2,ballRadius*2),Qt::AlignCenter,QLatin1String(axis.label));
+        }
+        return;
+    }
+
+    QPointF positions[6];float depths[6];
+    navGizmoBalls(positions,depths);
     if(m_navHover>=0||m_navDrag){
         painter.setPen(Qt::NoPen);
         painter.setBrush(QColor(255,255,255,26));
@@ -3712,10 +4107,34 @@ void PbrPreviewGL::drawViewportOverlays()
     QPainter painter(this);
     drawNavGizmo(painter); // orientation lives in the gizmo; the grid stays label-free
     if((m_debugView!=m_debugViewLeft)&&m_debugView!=DebugView::Wireframe&&m_debugSplit>0.001f){
-        // Divider between the two halves of the split view.
-        const int splitX=int(width()*m_debugSplit);
+        // Divider between the two halves of the split view. In flat view the
+        // shader splits on the texture's U, so the line is projected from the
+        // plane rather than parked at a screen fraction — otherwise the drawn
+        // line and the actual seam drift apart the moment the view moves.
+        int splitX=int(width()*m_debugSplit);
+        int top=0,bottom=height();
+        if(m_flatView){
+            // The XY plane spans -1..1 in object space for u,v = 0..1. Project
+            // the split's top and bottom corners so the line both tracks the
+            // texture AND stops at its edges — running the full viewport height
+            // drew a divider through empty background the split does not touch.
+            const QMatrix4x4 mvp=projectionMatrix()*viewMatrix()*objectModelMatrix();
+            const float u=float(m_debugSplit)*2.0f-1.0f;
+            const auto project=[&](const QVector4D& point){
+                const QVector4D clip=mvp*point;
+                return std::abs(clip.w())>1e-6f
+                    ? QPointF((clip.x()/clip.w()*0.5f+0.5f)*width(),
+                              (0.5f-clip.y()/clip.w()*0.5f)*height())
+                    : QPointF(splitX,0);
+            };
+            const QPointF a=project(QVector4D(u,1,0,1)),b=project(QVector4D(u,-1,0,1));
+            splitX=int(splitScreenX(m_debugSplit)); // same source as the hit test
+            Q_UNUSED(a);
+            top=int(std::min(a.y(),b.y()));
+            bottom=int(std::max(a.y(),b.y()));
+        }
         painter.setPen(QPen(QColor(240,196,80,220),1.0));
-        painter.drawLine(splitX,0,splitX,height());
+        painter.drawLine(splitX,top,splitX,bottom);
     }
     if(m_pathTraced){
         // Convergence readout for the progressive reference render.
@@ -4070,6 +4489,12 @@ void PbrPreviewGL::setFlatView(bool enabled)
         setShape(Shape::Plane);
         setProjection(Projection::Orthographic);
         setAxisView(AxisView::Front);
+        // Square the camera explicitly: AxisView::Front sets the intent, but a
+        // yaw or pitch carried in from the 3D view would leave the plane
+        // skewed, and orbit is locked out from here on so it could never be
+        // corrected by hand.
+        m_yaw = 0.0f;
+        m_pitch = 0.0f;
         frameObject();
     } else {
         setShape(m_shapeBeforeFlat);
@@ -4370,7 +4795,13 @@ void PbrPreviewGL::paintGL()
     }
     glViewport(0,0,pixelWidth,pixelHeight);
     m_environmentTexture->bind(5);m_prefilteredEnvironmentTexture->bind(12);m_brdfLutTexture->bind(13);m_specialTextureArray->bind(14);
-    glDisable(GL_DEPTH_TEST);m_backgroundProgram->bind();m_backgroundProgram->setUniformValue("uEnvironment",5);m_backgroundProgram->setUniformValue("uBackground",int(m_background));applyCommonUniforms(*m_backgroundProgram);m_vao->bind();glDrawArrays(GL_TRIANGLES,0,3);m_vao->release();m_backgroundProgram->release();
+    // 2D is a texture view, so the environment does not belong behind it: an
+    // HDRI tints the eye's judgement of the very values being inspected. Flat
+    // grey instead — but by running the same pass in Gray mode, not by skipping
+    // it. Skipping left the pipeline in a state the shading pass depended on
+    // and everything downstream rendered black.
+    const int backgroundMode=m_flatView?int(Background::Gray):int(m_background);
+    glDisable(GL_DEPTH_TEST);m_backgroundProgram->bind();m_backgroundProgram->setUniformValue("uEnvironment",5);m_backgroundProgram->setUniformValue("uBackground",backgroundMode);applyCommonUniforms(*m_backgroundProgram);m_vao->bind();glDrawArrays(GL_TRIANGLES,0,3);m_vao->release();m_backgroundProgram->release();
     glEnable(GL_DEPTH_TEST);m_program->bind();
     m_baseTexture->bind(0);m_normalTexture->bind(1);m_rmaosTexture->bind(2);m_emissiveTexture->bind(3);m_heightTexture->bind(4);
     m_secondaryBaseTexture->bind(6);m_secondaryNormalTexture->bind(7);m_secondaryRmaosTexture->bind(8);m_secondaryEmissiveTexture->bind(9);m_layerCoverageTexture->bind(10);m_gradientTexture->bind(11);
@@ -4389,9 +4820,15 @@ void PbrPreviewGL::paintGL()
     if(m_nodeOutputTexture){m_nodeOutputTexture->bind(28);m_program->setUniformValue("uNodeOutput",28);}
     if(m_sourceDirty)uploadSourceComparisonTextures();
     if(m_sourceTextures[0]){
-        m_sourceTextures[0]->bind(24);m_sourceTextures[1]->bind(25);m_sourceTextures[2]->bind(26);m_sourceTextures[3]->bind(27);
-        m_program->setUniformValue("uSource0",24);m_program->setUniformValue("uSource1",25);m_program->setUniformValue("uSource2",26);m_program->setUniformValue("uSource3",27);
+        m_sourceTextures[0]->bind(24);m_sourceTextures[1]->bind(25);m_sourceTextures[2]->bind(26);m_sourceTextures[3]->bind(27);m_sourceTextures[4]->bind(29);
+        m_program->setUniformValue("uSource0",24);m_program->setUniformValue("uSource1",25);m_program->setUniformValue("uSource2",26);m_program->setUniformValue("uSource3",27);m_program->setUniformValue("uSource4",29);
     }
+    m_program->setUniformValue("uNativeSpecColor",m_nativeMaterial.specularColor);
+    m_program->setUniformValue("uNativeSpecMult",m_nativeMaterial.specularEnabled?m_nativeMaterial.specularMult:0.0f);
+    m_program->setUniformValue("uNativeSmoothness",m_nativeMaterial.smoothness);
+    m_program->setUniformValue("uNativeEnvScale",m_nativeMaterial.envMapScale);
+    m_program->setUniformValue("uNativeEmitColor",m_nativeMaterial.emittanceColor);
+    m_program->setUniformValue("uNativeEmitMult",m_nativeMaterial.emitEnabled?m_nativeMaterial.emittanceMult:0.0f);
     m_program->setUniformValue("uInteriorEnabled",m_interiorEnabled);m_program->setUniformValue("uInteriorRooms",QVector2D(m_interiorRoomsU,m_interiorRoomsV));m_program->setUniformValue("uInteriorDepth",m_interiorDepth);m_program->setUniformValue("uInteriorBrightness",m_interiorBrightness);m_program->setUniformValue("uInteriorEmissive",m_interiorEmissive);
     m_program->setUniformValue("uBase",0);m_program->setUniformValue("uNormal",1);m_program->setUniformValue("uRmaos",2);m_program->setUniformValue("uEmissive",3);m_program->setUniformValue("uHeight",4);m_program->setUniformValue("uEnvironment",5);
     glActiveTexture(GL_TEXTURE15);glBindTexture(GL_TEXTURE_2D,m_shadowDepthTexture);m_program->setUniformValue("uShadowMap",15);m_program->setUniformValue("uShadowMatrix",m_shadowMatrix);m_program->setUniformValue("uShadowsEnabled",m_shadowsEnabled);m_program->setUniformValue("uShadowIntensity",m_shadowIntensity);m_program->setUniformValue("uDerivedEnvironmentShadow",m_derivedEnvironmentShadow);m_program->setUniformValue("uDerivedEnvironmentShadowWeight",m_derivedEnvironmentShadowWeight);
@@ -4417,21 +4854,38 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uModel",model);m_program->setUniformValue("uModelNormal",model.normalMatrix());
     m_program->setUniformValue("uEnvironmentYaw",m_environmentYaw+m_materialEnvironmentYaw);
     m_program->setUniformValue("uEnvironmentIntensity",m_environmentIntensity*m_materialIblIntensity);
-    m_program->setUniformValue("uHasBase",m_hasBase);m_program->setUniformValue("uHasNormal",m_hasNormal);m_program->setUniformValue("uHasEmissive",m_hasEmissive);
+    // A live material's maps arrive as images with no document slot behind
+    // them, so the has-texture flags have to come from the images themselves —
+    // otherwise the shader falls back to constants and renders flat white.
+    const bool liveBase=m_liveMaterial&&!m_baseImage.isNull();
+    const bool liveNormal=m_liveMaterial&&!m_normalImage.isNull();
+    const bool liveEmissive=m_liveMaterial&&!m_emissiveImage.isNull();
+    m_program->setUniformValue("uHasBase",m_hasBase||liveBase);
+    m_program->setUniformValue("uHasNormal",m_hasNormal||liveNormal);
+    m_program->setUniformValue("uHasEmissive",m_hasEmissive||liveEmissive);
     m_program->setUniformValue("uHasSecondaryBase",m_hasSecondaryBase);m_program->setUniformValue("uHasSecondaryNormal",m_hasSecondaryNormal);m_program->setUniformValue("uHasSecondaryEmissive",m_hasSecondaryEmissive);m_program->setUniformValue("uHasLayerCoverage",m_hasLayerCoverage);
     m_program->setUniformValue("uOverrideLayerCoverage",m_overrideLayerCoverage);m_program->setUniformValue("uInvertLayerCoverage",m_invertLayerCoverage);m_program->setUniformValue("uLayerCoverageFallback",m_layerCoverageFallback);m_program->setUniformValue("uLayerCoverageSlotBias",m_layerCoverageSlotBias);m_program->setUniformValue("uLayerCoverageSlotContrast",m_layerCoverageSlotContrast);
     m_program->setUniformValue("uHasGradient",m_hasGradient);m_program->setUniformValue("uOverrideGradientColor",m_overrideGradientColor);m_program->setUniformValue("uOverrideGradientOpacity",m_overrideGradientOpacity);
     m_program->setUniformValue("uGradientColor",QVector3D(m_gradientColor.redF(),m_gradientColor.greenF(),m_gradientColor.blueF()));m_program->setUniformValue("uGradientOpacity",m_gradientOpacity);m_program->setUniformValue("uGradientIntensity",m_gradientIntensity);m_program->setUniformValue("uGradientConstant",m_gradientConstant);m_program->setUniformValue("uGradientDriver",m_gradientDriver);
     m_program->setUniformValue("uUnlitIntensity",m_unlitIntensity);m_program->setUniformValue("uUnlitVertexColor",m_unlitVertexColor);m_program->setUniformValue("uUnlitExposure",m_unlitExposure);m_program->setUniformValue("uAlphaSource",m_alphaSource);
-    m_program->setUniformValue("uOverrideBaseColor",m_overrideBaseColor);m_program->setUniformValue("uOverrideOpacity",m_overrideOpacity);
-    m_program->setUniformValue("uOverrideNormal",m_overrideNormal);m_program->setUniformValue("uOverrideEmissiveColor",m_overrideEmissiveColor);m_program->setUniformValue("uOverrideEmissiveMask",m_overrideEmissiveMask);
+    // The override flags need the same live-material treatment as uHasBase
+    // above, and not having it was why the converted material shaded white.
+    // Every override DEFAULTS to on when its document slot holds no texture
+    // (see setMaterial), and the converter drives the preview with no document
+    // at all — so base colour was pinned to the white fallback and the normal
+    // to flat, however good the maps bound underneath were. RMAOS escaped only
+    // because its uUse* flags were already written this way.
+    m_program->setUniformValue("uOverrideBaseColor",m_overrideBaseColor&&!liveBase);m_program->setUniformValue("uOverrideOpacity",m_overrideOpacity&&!liveBase);
+    m_program->setUniformValue("uOverrideNormal",m_overrideNormal&&!liveNormal);m_program->setUniformValue("uOverrideEmissiveColor",m_overrideEmissiveColor&&!liveEmissive);m_program->setUniformValue("uOverrideEmissiveMask",m_overrideEmissiveMask&&!liveEmissive);
     m_program->setUniformValue("uOverrideSecondaryBaseColor",m_overrideSecondaryBaseColor);m_program->setUniformValue("uOverrideSecondaryOpacity",m_overrideSecondaryOpacity);m_program->setUniformValue("uOverrideSecondaryNormal",m_overrideSecondaryNormal);
     m_program->setUniformValue("uOverrideSecondaryEmissiveColor",m_overrideSecondaryEmissiveColor);m_program->setUniformValue("uOverrideSecondaryEmissiveMask",m_overrideSecondaryEmissiveMask);
-    m_program->setUniformValue("uUseRoughness",m_useRoughness);m_program->setUniformValue("uUseMetallic",m_useMetallic);m_program->setUniformValue("uUseAo",m_useAo);m_program->setUniformValue("uUseF0",m_useF0);
+    const bool liveRmaos=m_liveMaterial&&!m_rmaosImage.isNull();
+    m_program->setUniformValue("uUseRoughness",m_useRoughness||liveRmaos);m_program->setUniformValue("uUseMetallic",m_useMetallic||liveRmaos);m_program->setUniformValue("uUseAo",m_useAo||liveRmaos);m_program->setUniformValue("uUseF0",m_useF0||liveRmaos);
     m_program->setUniformValue("uUseSecondaryRoughness",m_useSecondaryRoughness);m_program->setUniformValue("uUseSecondaryMetallic",m_useSecondaryMetallic);m_program->setUniformValue("uUseSecondaryAo",m_useSecondaryAo);m_program->setUniformValue("uUseSecondaryF0",m_useSecondaryF0);
     m_program->setUniformValue("uBaseFallback",QVector3D(m_baseColor.redF(),m_baseColor.greenF(),m_baseColor.blueF()));m_program->setUniformValue("uTint",QVector3D(m_tint.redF(),m_tint.greenF(),m_tint.blueF()));m_program->setUniformValue("uNormalFallback",QVector3D(m_normalColor.redF(),m_normalColor.greenF(),m_normalColor.blueF()));m_program->setUniformValue("uEmissiveColor",QVector3D(m_emissiveColor.redF(),m_emissiveColor.greenF(),m_emissiveColor.blueF()));
     m_program->setUniformValue("uSecondaryBaseFallback",QVector3D(m_secondaryBaseColor.redF(),m_secondaryBaseColor.greenF(),m_secondaryBaseColor.blueF()));m_program->setUniformValue("uSecondaryTint",QVector3D(m_secondaryTint.redF(),m_secondaryTint.greenF(),m_secondaryTint.blueF()));m_program->setUniformValue("uSecondaryNormalFallback",QVector3D(m_secondaryNormalColor.redF(),m_secondaryNormalColor.greenF(),m_secondaryNormalColor.blueF()));m_program->setUniformValue("uSecondaryEmissiveColor",QVector3D(m_secondaryEmissiveColor.redF(),m_secondaryEmissiveColor.greenF(),m_secondaryEmissiveColor.blueF()));
     m_program->setUniformValue("uKeyColor",QVector3D(m_keyColor.redF(),m_keyColor.greenF(),m_keyColor.blueF()));m_program->setUniformValue("uKeyDirection",keyDirection());m_program->setUniformValue("uKeyIntensity",effectiveKeyIntensity());
+    m_program->setUniformValue("uFlatTiling",m_flatView?float(m_flatTiling):1.0f);
     m_program->setUniformValue("uOpacity",m_opacity);m_program->setUniformValue("uColorScale",m_colorScale);m_program->setUniformValue("uNormalStrength",m_normalStrength);m_program->setUniformValue("uRoughness",m_roughness);m_program->setUniformValue("uMetallic",m_metallic);m_program->setUniformValue("uAo",m_ao);m_program->setUniformValue("uF0",m_f0);m_program->setUniformValue("uEmissiveMask",m_emissiveMask);m_program->setUniformValue("uEmissiveIntensity",m_emissiveIntensity);
     m_program->setUniformValue("uSecondaryOpacity",m_secondaryOpacity);m_program->setUniformValue("uSecondaryColorScale",m_secondaryColorScale);m_program->setUniformValue("uSecondaryNormalStrength",m_secondaryNormalStrength);
     m_program->setUniformValue("uSecondaryRoughness",m_secondaryRoughness);m_program->setUniformValue("uSecondaryMetallic",m_secondaryMetallic);m_program->setUniformValue("uSecondaryAo",m_secondaryAo);m_program->setUniformValue("uSecondaryF0",m_secondaryF0);
@@ -4465,7 +4919,7 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uParallaxRefinementSteps",m_parallaxRefinementSteps);m_program->setUniformValue("uParallaxShadowSteps",m_parallaxShadowSteps);m_program->setUniformValue("uParallaxClip",m_parallaxClip);
     m_program->setUniformValue("uParallaxDepth",m_parallaxDepth);m_program->setUniformValue("uParallaxGrazingFade",m_parallaxGrazingFade);m_program->setUniformValue("uParallaxShadowStrength",m_parallaxShadowStrength);
     m_program->setUniformValue("uParallaxShadowBias",m_parallaxShadowBias);m_program->setUniformValue("uParallaxShadowSoftness",m_parallaxShadowSoftness);m_program->setUniformValue("uParallaxFadeStart",m_parallaxFadeStart);m_program->setUniformValue("uParallaxFadeEnd",m_parallaxFadeEnd);
-    m_program->setUniformValue("uUvSet",m_uvSet);m_program->setUniformValue("uDebugView",int(m_debugView));m_program->setUniformValue("uDebugViewLeft",int(m_debugViewLeft));m_program->setUniformValue("uDebugSplit",m_debugSplit);m_program->setUniformValue("uCompare",m_comparisonEnabled);m_program->setUniformValue("uViewportWidth",float(width()*devicePixelRatioF()));
+    m_program->setUniformValue("uUvSet",m_uvSet);m_program->setUniformValue("uDebugView",int(m_debugView));m_program->setUniformValue("uDebugViewLeft",int(m_debugViewLeft));m_program->setUniformValue("uDebugSplit",m_debugSplit);m_program->setUniformValue("uFlatSplit",m_flatView);m_program->setUniformValue("uCompare",m_comparisonEnabled);m_program->setUniformValue("uViewportWidth",float(width()*devicePixelRatioF()));
     const int shaderMode=int(m_document.shaderMode());m_program->setUniformValue("uShaderMode",shaderMode);m_program->setUniformValue("uSpecialMask",m_specialMask);
     const int soloSet=m_uvSet<=2?m_uvSet:0;
     const QString activeSet=soloSet==1?QStringLiteral("UV1"):(soloSet==2?QStringLiteral("UV2"):QStringLiteral("UV0")),activePrefix=soloSet==1?QStringLiteral("secondary"):(soloSet==2?QStringLiteral("tertiary"):QStringLiteral("primary"));
@@ -4805,6 +5259,8 @@ void PbrPreviewGL::mousePressEvent(QMouseEvent* event)
             event->accept();return;
         }
         if(hit==6){m_navDrag=true;m_lastMouse=event->position();update();event->accept();return;}
+        // The split divider is a handle: grab it and it follows the cursor.
+        if(nearDebugSplit(event->position())){m_splitDrag=true;event->accept();return;}
     }
     m_lastMouse=event->position();m_dragButton=event->button();event->accept();
 }
@@ -4824,10 +5280,19 @@ void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
         }
         event->accept();return;
     }
+    if(m_splitDrag){dragDebugSplit(event->position());m_lastMouse=event->position();event->accept();return;}
+    // Show the resize cursor whenever the divider is under the pointer, so it
+    // reads as a handle rather than a painted line.
+    if(m_dragButton==Qt::NoButton)
+        setCursor(nearDebugSplit(event->position())?Qt::SplitHCursor:Qt::ArrowCursor);
     const QPointF delta=event->position()-m_lastMouse;m_lastMouse=event->position();
     if(m_navDrag){
-        m_yaw+=float(delta.x())*.5f;m_pitch=std::clamp(m_pitch+float(delta.y())*.5f,-89.9f,89.9f);
-        update();emit cameraChanged();return;
+        // The nav gizmo is another way to orbit, so it is locked out in 2D too.
+        if(!m_flatView){
+            m_yaw+=float(delta.x())*.5f;m_pitch=std::clamp(m_pitch+float(delta.y())*.5f,-89.9f,89.9f);
+            update();emit cameraChanged();
+        }
+        return;
     }
     if(m_dragButton==Qt::NoButton){
         const int hover=navGizmoHitTest(event->position());
@@ -4838,7 +5303,10 @@ void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
     if(m_dragButton==Qt::MiddleButton){
         if(event->modifiers()&Qt::ShiftModifier){const float scale=.0035f*m_distance;m_pan+=QVector2D(float(delta.x())*scale,float(-delta.y())*scale);}
         else if(event->modifiers()&Qt::ControlModifier){m_distance=std::clamp(m_distance+float(delta.x()+delta.y())*.012f,.25f,25.0f);}
-        else{m_yaw+=float(delta.x())*.5f;m_pitch=std::clamp(m_pitch+float(delta.y())*.5f,-89.9f,89.9f);}
+        // 2D is a texture view, so the camera stays square: pan and zoom only.
+        // Orbiting it turned the plane into a skewed parallelogram, which is
+        // not a 2D view of anything. Environment spin is still allowed.
+        else if(!m_flatView){m_yaw+=float(delta.x())*.5f;m_pitch=std::clamp(m_pitch+float(delta.y())*.5f,-89.9f,89.9f);}
         update();emit cameraChanged();
     }
     else if(m_dragButton==Qt::LeftButton&&(event->modifiers()&Qt::ShiftModifier)){m_keyYaw+=float(delta.x())*.5f;m_keyPitch=std::clamp(m_keyPitch-float(delta.y())*.5f,-89.0f,89.0f);update();emit lightAnglesChanged(m_keyYaw,m_keyPitch);}
@@ -4851,6 +5319,7 @@ void PbrPreviewGL::mouseMoveEvent(QMouseEvent* event)
 void PbrPreviewGL::mouseReleaseEvent(QMouseEvent* event)
 {
     if(m_navDrag&&event->button()==Qt::LeftButton){m_navDrag=false;update();}
+    if(m_splitDrag&&event->button()==Qt::LeftButton)m_splitDrag=false;
     if(event->button()==m_dragButton)m_dragButton=Qt::NoButton;
     event->accept();
 }
@@ -4884,6 +5353,13 @@ void PbrPreviewGL::keyPressEvent(QKeyEvent* event)
     const bool shift=event->modifiers()&Qt::ShiftModifier;
     const bool keypad=event->modifiers()&Qt::KeypadModifier;
     if(event->key()==Qt::Key_F){frameObject();event->accept();return;}
+    // Flat 2D is a locked square texture view. Orbit is already blocked on the
+    // mouse, but the whole Blender numpad block was still live — an axis snap
+    // there tilts the plane away and leaves no way back, since the very
+    // controls that would recover it are the ones that are locked out. Framing
+    // and Home stay; everything that moves the camera does not.
+    if(m_flatView&&(keypad||event->key()==Qt::Key_1||event->key()==Qt::Key_3
+        ||event->key()==Qt::Key_5||event->key()==Qt::Key_7)){event->accept();return;}
     if(event->key()==Qt::Key_Home){resetView();event->accept();return;}
     if(event->key()==Qt::Key_5){setProjection(m_projection==Projection::Perspective?Projection::Orthographic:Projection::Perspective);event->accept();return;}
     if(event->key()==Qt::Key_1){setAxisView(ctrl?AxisView::Back:AxisView::Front);event->accept();return;}
@@ -4981,6 +5457,11 @@ MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent, bool converterMode
     auto* settingsLayout=new QVBoxLayout(m_settingsBottom);
     settingsLayout->setContentsMargins(0,0,0,0);settingsLayout->setSpacing(6);
     buildPreviewControls(settingsLayout);
+    // After the Display page exists, not before: the overlay listens to
+    // m_debug, m_debugLeft and m_flatView, and connecting to them while they
+    // were still null silently dropped every settings-to-overlay link. The
+    // overlay could drive the settings but never learned when they changed.
+    buildViewportOverlay();
     m_previewSplitter->addWidget(canvasHost);
     m_previewSplitter->addWidget(m_settingsBottom);
     m_previewSplitter->setStretchFactor(0,1);
@@ -4996,6 +5477,44 @@ MaterialPreviewWidget::MaterialPreviewWidget(QWidget* parent, bool converterMode
     connect(m_previewSplitter,&QSplitter::splitterMoved,this,[this]{
         QSettings().setValue(QStringLiteral("Preview/settingsSplitter"),m_previewSplitter->saveState());
     });
+    {
+        // Both workspaces get the disclosure; only the default differs. In the
+        // converter the viewport IS the verdict on a conversion and Model /
+        // Material layers / Projection are setup touched once a session, so it
+        // starts folded. In the authoring workspace those controls are the
+        // work, so it starts open.
+        // The author-side toggle was pulled in d0db26a because folding left a
+        // pane-sized void — that was the splitter holding the sizes restoreState
+        // gave it, which the setSizes below is what finally fixes.
+        const QString openKey=m_converterMode?QStringLiteral("Preview/convSettingsOpen")
+                                             :QStringLiteral("Preview/authorSettingsOpen");
+        m_controls->setCheckable(true);
+        m_controls->setToolTip(tr("Show or hide the preview's scene, lighting and display settings."));
+        // Visibility and the height caps only. Splitter sizes are deliberately
+        // NOT touched here: at construction the panel may already be open with
+        // the user's own divider position restored, and forcing sizes would
+        // throw that away on every launch.
+        const auto applyFold=[this](bool open){
+            for(QObject* child:m_controls->children())
+                if(auto* widget=qobject_cast<QWidget*>(child))widget->setVisible(open);
+            // A checkable QGroupBox only disables its children, so the height
+            // cap is what actually hands the space back to the viewport.
+            m_controls->setMaximumHeight(open?QWIDGETSIZE_MAX:26);
+            m_settingsBottom->setMaximumHeight(open?QWIDGETSIZE_MAX:30);
+        };
+        connect(m_controls,&QGroupBox::toggled,this,[this,applyFold,openKey](bool open){
+            applyFold(open);
+            QSettings().setValue(openKey,open);
+            // The height cap alone is not enough: the splitter keeps whatever
+            // sizes it was handed, which leaves the folded strip floating at the
+            // top of a pane-sized gap. Tell it outright.
+            m_previewSplitter->setSizes(open?QList<int>{420,460}:QList<int>{10000,30});
+        });
+        const bool open=QSettings().value(openKey,!m_converterMode).toBool();
+        m_controls->setChecked(open);
+        applyFold(open);
+        if(!open)m_previewSplitter->setSizes({10000,30});
+    }
     // The settings tabs live in scroll areas; without the guard, scrolling the
     // panel silently changes any combo under the cursor and savePreviewSettings
     // persists the accident (this is how projection kept flipping to ortho).
@@ -5012,7 +5531,13 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
 {
     // The vertical splitter divider is the one mechanism for sizing the
     // settings; drag it down to give the viewport the room.
-    m_controls=new QGroupBox(tr("Preview Settings"),this);m_controls->setObjectName(QStringLiteral("PreviewSettings"));
+    m_controls=new QGroupBox(tr("Preview Settings"),this);
+    // Named apart from the authoring panel: both live in the same window, so a
+    // findChild for one was reaching whichever was built first — which is how
+    // the converter's folding panel started failing the authoring panel's
+    // "plain heading, not a disclosure" test.
+    m_controls->setObjectName(m_converterMode?QStringLiteral("ConverterPreviewSettings")
+                                             :QStringLiteral("PreviewSettings"));
     auto* box=new QVBoxLayout(m_controls);box->setContentsMargins(6,8,6,6);box->setSpacing(0);
     auto* tabs=new QTabWidget(m_controls);tabs->setObjectName(QStringLiteral("PreviewSettingsTabs"));
     // The tab pages outgrew the fixed panel height; scrolling beats letting
@@ -5169,6 +5694,10 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     addRenderMode(tr("Curvature (Normal.A)"),PbrPreviewGL::DebugView::Curvature);
     addRenderMode(tr("PBR Validation"),PbrPreviewGL::DebugView::Validation);
     if(m_converterMode){
+        // The source material shaded its own way — put this on one half of the
+        // split and Shaded on the other to judge a conversion directly.
+        addRenderMode(tr("Native FO4 (Specular/Gloss)"),PbrPreviewGL::DebugView::NativeFo4);
+        addRenderMode(tr("Native FO76 (Reflectance)"),PbrPreviewGL::DebugView::NativeFo76);
         // Compare the converted channels against the ORIGINAL game maps.
         addRenderMode(tr("Source Diffuse (FO4/76)"),PbrPreviewGL::DebugView::SourceDiffuse);
         addRenderMode(tr("Source Spec / Reflectance"),PbrPreviewGL::DebugView::SourceSpec);
@@ -5198,11 +5727,21 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     ssaoLayout->addWidget(m_ssao);ssaoLayout->addWidget(m_ssaoStrength,1);
     m_antiAliasing=new QComboBox(display);m_antiAliasing->addItem(tr("Off"),1);m_antiAliasing->addItem(tr("MSAA 2x"),2);m_antiAliasing->addItem(tr("MSAA 4x"),4);m_antiAliasing->addItem(tr("MSAA 8x"),8);m_antiAliasing->setCurrentIndex(2);m_antiAliasing->setToolTip(tr("Multisampled viewport rendering. Editor preference only; never stored in the material."));
     auto* traceRow=new QWidget(display);auto* traceLayout=new QHBoxLayout(traceRow);traceLayout->setContentsMargins(0,0,0,0);traceLayout->setSpacing(7);
-    m_flatView=new QCheckBox(tr("Flat 2D view"),display);
-    m_flatView->setToolTip(tr("Show the material on a lit camera-facing plane instead of the 3D mesh, like Substance Painter's 2D view."));
+    auto* flatRow=new QWidget(display);auto* flatLayout=new QHBoxLayout(flatRow);flatLayout->setContentsMargins(0,0,0,0);flatLayout->setSpacing(7);
+    m_flatView=new QCheckBox(tr("Flat 2D view"),flatRow);
+    m_flatView->setToolTip(tr("Show the material on a camera-facing plane instead of the 3D mesh, like Substance Painter's 2D view. The camera is locked square; only pan, zoom and environment spin apply."));
+    m_flatTiling=new QCheckBox(tr("Show repeats"),flatRow);
+    m_flatTiling->setToolTip(tr("Repeat the texture around the authored 0-1 tile so a seam shows up where the copies meet. 2D view only."));
+    m_flatTiling->setEnabled(false);
+    flatLayout->addWidget(m_flatView);flatLayout->addStretch();flatLayout->addWidget(m_flatTiling);
     connect(m_flatView,&QCheckBox::toggled,this,[this](bool on){
         m_materialCanvas->setFlatView(on);
         m_shape->setEnabled(!on);
+        m_flatTiling->setEnabled(on);
+        savePreviewSettings();
+    });
+    connect(m_flatTiling,&QCheckBox::toggled,this,[this](bool on){
+        m_materialCanvas->setFlatTiling(on?3:1);
         savePreviewSettings();
     });
     m_pathTrace=new QCheckBox(tr("Path-traced reference"),traceRow);
@@ -5212,7 +5751,7 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     traceLayout->addWidget(m_pathTrace);traceLayout->addStretch();traceLayout->addWidget(m_traceDenoise);
     m_ground=new QCheckBox(tr("Show ground plane"),display);m_ground->setChecked(true);m_compare=new QCheckBox(tr("Compare with defaults (split view)"),display);m_compare->setToolTip(tr("Split the object between the current material and its default values."));
     m_grid=new QCheckBox(tr("Ground grid with axis directions"),display);m_grid->setChecked(true);m_grid->setToolTip(tr("NifSkope-style grid on the ground: X axis red, Z axis blue, direction labels at the ends."));
-    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Split left mode"),m_debugLeft);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),m_flatView);displayForm->addRow(QString(),traceRow);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
+    displayForm->addRow(tr("Background"),m_background);displayForm->addRow(tr("Render mode"),m_debug);displayForm->addRow(tr("Material | map split"),m_debugSplit);displayForm->addRow(tr("Split left mode"),m_debugLeft);displayForm->addRow(tr("Anti-aliasing"),m_antiAliasing);displayForm->addRow(QString(),flatRow);displayForm->addRow(QString(),traceRow);displayForm->addRow(QString(),bloomRow);displayForm->addRow(QString(),ssaoRow);displayForm->addRow(QString(),m_ground);displayForm->addRow(QString(),m_grid);displayForm->addRow(QString(),m_compare);
     auto* referenceRow=new QWidget(display);auto* referenceLayout=new QHBoxLayout(referenceRow);referenceLayout->setContentsMargins(0,0,0,0);referenceLayout->setSpacing(5);
     auto* referenceLoad=new QPushButton(tr("Load…"),referenceRow);referenceLoad->setToolTip(tr("Show a second read-only material beside this one with a synchronized camera. Lighting and environment are snapshotted when the reference loads."));
     auto* referenceClear=new QPushButton(tr("Clear"),referenceRow);referenceClear->setEnabled(false);
@@ -5343,6 +5882,13 @@ void MaterialPreviewWidget::buildPreviewControls(QVBoxLayout* layout)
     connect(m_ground,&QCheckBox::toggled,this,[this](bool v){m_materialCanvas->setGroundEnabled(v);savePreviewSettings();});connect(m_compare,&QCheckBox::toggled,this,[this](bool v){m_materialCanvas->setComparisonEnabled(v);savePreviewSettings();});
     connect(m_grid,&QCheckBox::toggled,this,[this](bool v){m_materialCanvas->setGridEnabled(v);m_referenceCanvas->setGridEnabled(v);savePreviewSettings();});
     connect(m_debugSplit,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this](double v){m_materialCanvas->setDebugSplit(float(v)/100.0f);savePreviewSettings();});
+    // Dragging the divider in the viewport is the same setting; keep the field
+    // in step without letting it echo back and fight the drag.
+    connect(m_materialCanvas,&PbrPreviewGL::debugSplitDragged,this,[this](float fraction){
+        QSignalBlocker blocker(m_debugSplit);
+        m_debugSplit->setValue(double(fraction)*100.0);
+        savePreviewSettings();
+    });
     connect(m_debugLeft,qOverload<int>(&QComboBox::currentIndexChanged),this,[this](int i){m_materialCanvas->setDebugViewLeft(static_cast<PbrPreviewGL::DebugView>(m_debugLeft->itemData(i).toInt()));savePreviewSettings();});
     const auto applyBloom=[this]{
         m_bloomStrength->setEnabled(m_bloom->isChecked());
@@ -5518,7 +6064,8 @@ void MaterialPreviewWidget::applyLightingPreset(int index)
 void MaterialPreviewWidget::setDerivedLightingControls(bool derived)
 {
     m_keyIntensity->setEnabled(!derived);m_temperature->setEnabled(!derived);m_keyColor->setEnabled(!derived);m_keyYaw->setEnabled(!derived);m_keyPitch->setEnabled(!derived);
-    const QString explanation=derived?tr("The EXR provides all illumination; this analytic key-light control is disabled while only its shadow direction is derived."):QString();
+    const QString explanation=derived?tr("The EXR environment is providing all the light, so the key is off and only its "
+                                         "direction is taken from the map. Uncheck \"Derive lighting from EXR\" to use this instead."):QString();
     for(QWidget* control:{static_cast<QWidget*>(m_keyIntensity),static_cast<QWidget*>(m_temperature),static_cast<QWidget*>(m_keyColor),static_cast<QWidget*>(m_keyYaw),static_cast<QWidget*>(m_keyPitch)})control->setToolTip(explanation);
 }
 
@@ -5530,12 +6077,28 @@ void MaterialPreviewWidget::captureManualLight()
 
 void MaterialPreviewWidget::restoreManualLight()
 {
-    if(!m_manualLightStored)return;
+    // Leaving derived mode has to happen whether or not there is a captured
+    // rig to go back to. Bailing early when there was nothing stored — the case
+    // for any session that opened straight into an EXR — left the key controls
+    // disabled and the key still forced to zero, so turning derivation off
+    // looked like it did nothing.
     m_applyingDerivedLight=true;
     {
         QSignalBlocker intensityBlocker(m_keyIntensity),yawBlocker(m_keyYaw),pitchBlocker(m_keyPitch),colorBlocker(m_keyColor),temperatureBlocker(m_temperature),shadowBlocker(m_shadows);
-        m_keyIntensity->setValue(m_manualKeyIntensity);m_keyYaw->setValue(m_manualKeyYaw);m_keyPitch->setValue(m_manualKeyPitch);m_keyColor->setColor(m_manualKeyColor);m_shadows->setChecked(m_manualShadows);
-        const int temperatureIndex=m_temperature->findData(m_manualTemperature);m_temperature->setCurrentIndex(temperatureIndex);
+        if(m_manualLightStored){
+            m_keyIntensity->setValue(m_manualKeyIntensity);m_keyYaw->setValue(m_manualKeyYaw);m_keyPitch->setValue(m_manualKeyPitch);m_keyColor->setColor(m_manualKeyColor);m_shadows->setChecked(m_manualShadows);
+            const int temperatureIndex=m_temperature->findData(m_manualTemperature);m_temperature->setCurrentIndex(temperatureIndex);
+        }
+        // Derived mode parks the key at zero. Handing that back would make the
+        // scene no brighter than it was, which reads as the toggle being dead.
+        if(m_keyIntensity->value()<=0.0){
+            m_keyIntensity->setValue(4);
+            if(m_temperature->currentIndex()<0){
+                const int neutral=m_temperature->findData(5500);
+                if(neutral>=0)m_temperature->setCurrentIndex(neutral);
+                m_keyColor->setColor(temperatureColor(5500));
+            }
+        }
     }
     m_manualLightStored=false;m_applyingDerivedLight=false;setDerivedLightingControls(false);m_materialCanvas->setDerivedEnvironmentShadow(false,0);
     m_materialCanvas->setLighting(float(m_keyIntensity->value()),m_keyColor->color(),float(m_keyYaw->value()),float(m_keyPitch->value()),float(m_environmentIntensity->value()),float(m_environmentYaw->value()),float(m_exposure->value()));m_materialCanvas->setShadows(m_shadows->isChecked(),float(m_shadowIntensity->value()));
@@ -5545,17 +6108,32 @@ void MaterialPreviewWidget::refreshDerivedEnvironmentLight(bool enableShadows)
 {
     const bool wasActive=m_deriveExrLighting->isChecked();
     const PbrPreviewGL::EnvironmentLight light=m_materialCanvas->derivedEnvironmentLight(float(m_environmentYaw->value()));
-    // An EXR environment is authoritative: while one is loaded, the lights
-    // ALWAYS derive from it (the checkbox is a status indicator, not a
-    // choice). Manual lighting applies only to non-HDR cubemaps.
-    const bool active=light.valid;
+    // An EXR carries its own lighting, so deriving from it is the DEFAULT while
+    // one is loaded — adding an analytic key on top would double-count the sun
+    // that is already in the map. It is not, however, a life sentence: this
+    // used to force itself on and hold the checkbox permanently disabled, so
+    // with an EXR loaded every key control was dead and nothing the user could
+    // reach brought them back. The stored preference was written on every save
+    // and then never read. Offer the choice whenever there is something to
+    // derive FROM, and honour what was chosen.
+    const bool active=light.valid&&m_deriveExrLightingPreferred;
     m_applyingDerivedLight=true;
     {
-        QSignalBlocker deriveBlocker(m_deriveExrLighting);m_deriveExrLighting->setEnabled(false);m_deriveExrLighting->setChecked(active);
+        QSignalBlocker deriveBlocker(m_deriveExrLighting);m_deriveExrLighting->setEnabled(light.valid);m_deriveExrLighting->setChecked(active);
+        m_deriveExrLighting->setToolTip(light.valid
+            ? tr("The EXR environment lights the scene by itself. Turn this off to light it with the "
+                 "key light instead — the HDRI still provides ambient, so expect the sun to count twice.")
+            : tr("Only an .exr environment carries lighting to derive. The current cubemap has none, "
+                 "so the key light below is in charge."));
     }
     if(active){
         captureManualLight();
-        QSignalBlocker intensityBlocker(m_keyIntensity),yawBlocker(m_keyYaw),pitchBlocker(m_keyPitch),colorBlocker(m_keyColor),temperatureBlocker(m_temperature),presetBlocker(m_lightingPreset),shadowBlocker(m_shadows);
+        QSignalBlocker intensityBlocker(m_keyIntensity),yawBlocker(m_keyYaw),pitchBlocker(m_keyPitch),colorBlocker(m_keyColor),temperatureBlocker(m_temperature),presetBlocker(m_lightingPreset),shadowBlocker(m_shadows),environmentBlocker(m_environmentIntensity);
+        // The EXR is about to become the only light in the scene. If its
+        // intensity is off, zeroing the key below leaves nothing lighting the
+        // material — and the key control is disabled from here, so there is no
+        // way back. Lift it to full rather than go dark.
+        if(m_environmentIntensity->value()<=0.0)m_environmentIntensity->setValue(1);
         m_keyIntensity->setValue(0);m_keyYaw->setValue(light.yaw);m_keyPitch->setValue(light.pitch);m_keyColor->setColor(light.color);m_temperature->setCurrentIndex(-1);m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);if(enableShadows)m_shadows->setChecked(true);
         const float directionalWeight=std::clamp((light.intensity-1.0f)/7.0f,.2f,.85f);setDerivedLightingControls(true);m_materialCanvas->setDerivedEnvironmentShadow(true,directionalWeight);
         m_materialCanvas->setLighting(0,m_keyColor->color(),float(m_keyYaw->value()),float(m_keyPitch->value()),float(m_environmentIntensity->value()),float(m_environmentYaw->value()),float(m_exposure->value()));m_materialCanvas->setShadows(m_shadows->isChecked(),float(m_shadowIntensity->value()));
@@ -5581,7 +6159,8 @@ void MaterialPreviewWidget::loadPreviewSettings()
     QSignalBlocker l(m_keyIntensity),m(m_keyYaw),n(m_keyPitch),o(m_environmentIntensity),p(m_environmentYaw),q(m_exposure),r(m_temperature),shadowBlocker(m_shadows),shadowIntensityBlocker(m_shadowIntensity),deriveBlocker(m_deriveExrLighting),presetBlocker(m_lightingPreset);
     m_shape->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/shape"),0).toInt(),0,3));
     m_planeOrientation->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/planeOrientation"),0).toInt(),0,2));m_twoSided->setChecked(s.value(QStringLiteral("Preview/twoSided"),true).toBool());
-    m_projection->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(m_converterMode?QStringLiteral("Preview/convDebug"):QStringLiteral("Preview/debug"),0).toInt(),0,24));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
+    m_projection->setCurrentIndex(std::clamp(s.value(m_converterMode?QStringLiteral("Preview/convProjection")
+        :QStringLiteral("Preview/projection"),0).toInt(),0,1));m_background->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/background"),0).toInt(),0,4));const int debugIndex=m_debug->findData(std::clamp(s.value(m_converterMode?QStringLiteral("Preview/convDebug"):QStringLiteral("Preview/debug"),0).toInt(),0,24));m_debug->setCurrentIndex(debugIndex>=0?debugIndex:0);
     m_ground->setChecked(s.value(QStringLiteral("Preview/ground"),true).toBool());m_grid->setChecked(s.value(QStringLiteral("Preview/grid"),true).toBool());m_materialCanvas->setGridEnabled(m_grid->isChecked());m_referenceCanvas->setGridEnabled(m_grid->isChecked());{QSignalBlocker splitBlocker(m_debugSplit);m_debugSplit->setValue(m_converterMode?50.0:s.value(QStringLiteral("Preview/debugSplit"),0.0).toDouble());}m_materialCanvas->setDebugSplit(float(m_debugSplit->value())/100.0f);{QSignalBlocker leftBlocker(m_debugLeft);const int leftIndex=m_debugLeft->findData(std::clamp(s.value(m_converterMode?QStringLiteral("Preview/convDebugLeft"):QStringLiteral("Preview/debugLeft"),0).toInt(),0,24));m_debugLeft->setCurrentIndex(leftIndex>=0?leftIndex:0);}m_materialCanvas->setDebugViewLeft(static_cast<PbrPreviewGL::DebugView>(m_debugLeft->currentData().toInt()));{QSignalBlocker bloomBlocker(m_bloom),bloomStrengthBlocker(m_bloomStrength);m_bloom->setChecked(s.value(QStringLiteral("Preview/bloom"),true).toBool());m_bloomStrength->setValue(s.value(QStringLiteral("Preview/bloomStrength"),0.4).toDouble());}m_bloomStrength->setEnabled(m_bloom->isChecked());m_materialCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));m_referenceCanvas->setBloom(m_bloom->isChecked(),float(m_bloomStrength->value()));{QSignalBlocker tonemapBlocker(m_tonemap);m_tonemap->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/tonemap"),2).toInt(),0,3));}m_materialCanvas->setTonemapOperator(m_tonemap->currentIndex());m_referenceCanvas->setTonemapOperator(m_tonemap->currentIndex());{QSignalBlocker ssaoBlocker(m_ssao),ssaoStrengthBlocker(m_ssaoStrength);m_ssao->setChecked(s.value(QStringLiteral("Preview/ssao"),true).toBool());m_ssaoStrength->setValue(s.value(QStringLiteral("Preview/ssaoStrength"),0.5).toDouble());}m_ssaoStrength->setEnabled(m_ssao->isChecked());m_materialCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));m_referenceCanvas->setSsao(m_ssao->isChecked(),float(m_ssaoStrength->value()));{QSignalBlocker pathTraceBlocker(m_pathTrace),traceDenoiseBlocker(m_traceDenoise);m_pathTrace->setChecked(s.value(QStringLiteral("Preview/pathTraced"),false).toBool());m_traceDenoise->setChecked(s.value(QStringLiteral("Preview/traceDenoise"),true).toBool());}m_materialCanvas->setPathTraced(m_pathTrace->isChecked());m_materialCanvas->setTraceDenoise(m_traceDenoise->isChecked());m_traceDenoise->setEnabled(m_pathTrace->isChecked());m_compare->setChecked(s.value(QStringLiteral("Preview/compare"),false).toBool());m_allSubmeshes->setChecked(s.value(QStringLiteral("Preview/allSubmeshes"),true).toBool());m_uvSet->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/layers"),0).toInt(),0,3));m_landscapeLayer->setCurrentIndex(std::clamp(s.value(QStringLiteral("Preview/landscapeLayer"),0).toInt(),0,15));m_materialCanvas->setLandscapeLayer(m_landscapeLayer->currentIndex());
     const int aaIndex=m_antiAliasing->findData(s.value(QStringLiteral("Preview/antiAliasing"),4).toInt());m_antiAliasing->setCurrentIndex(aaIndex>=0?aaIndex:2);m_materialCanvas->setMsaaSamples(m_antiAliasing->currentData().toInt());
     {
@@ -5594,11 +6173,30 @@ void MaterialPreviewWidget::loadPreviewSettings()
     }
     m_keyIntensity->setValue(s.value(QStringLiteral("Preview/keyIntensity"),4).toDouble());m_keyYaw->setValue(s.value(QStringLiteral("Preview/keyYaw"),-35).toDouble());m_keyPitch->setValue(s.value(QStringLiteral("Preview/keyPitch"),45).toDouble());m_environmentIntensity->setValue(s.value(QStringLiteral("Preview/environmentIntensity"),1).toDouble());m_environmentYaw->setValue(s.value(QStringLiteral("Preview/environmentYaw"),0).toDouble());m_exposure->setValue(s.value(QStringLiteral("Preview/exposure"),0).toDouble());
     m_shadows->setChecked(s.value(QStringLiteral("Preview/shadows"),true).toBool());m_shadowIntensity->setValue(s.value(QStringLiteral("Preview/shadowIntensity"),.75).toDouble());m_shadowIntensity->setEnabled(m_shadows->isChecked());m_deriveExrLightingPreferred=s.value(QStringLiteral("Preview/deriveExrLighting"),true).toBool();m_lightingPreset->setCurrentIndex(m_lightingPreset->count()-1);
+    // A rig with no light in it renders pure black and gives no hint why, and
+    // once EXR lighting is derived the key control is disabled — so the state
+    // cannot be undone from the panel it came from, and every later save
+    // writes the darkness back. Treat a lightless restore as corrupt and take
+    // the stock rig instead. Derived lighting counts as no key, because
+    // refreshDerivedEnvironmentLight is about to zero it.
+    if(m_environmentIntensity->value()<=0.0&&(m_deriveExrLightingPreferred||m_keyIntensity->value()<=0.0)){
+        qWarning("Preview lighting: stored rig has neither key nor environment light; restoring defaults");
+        m_keyIntensity->setValue(4);m_keyYaw->setValue(-35);m_keyPitch->setValue(45);m_environmentIntensity->setValue(1);
+    }
     const int temperature=m_temperature->findData(s.value(QStringLiteral("Preview/temperature"),5500).toInt());if(temperature>=0)m_temperature->setCurrentIndex(temperature);
     m_keyColor->setColor(QColor(s.value(QStringLiteral("Preview/keyColor"),temperatureColor(m_temperature->currentData().toInt()).name()).toString()));
     m_materialCanvas->setPlaneOptions(static_cast<PreviewMeshes::PlaneOrientation>(m_planeOrientation->currentIndex()),m_twoSided->isChecked());
     if(m_shape->currentIndex()==3){const QString path=s.value(QStringLiteral("Preview/customMesh"),s.value(QStringLiteral("Preview/customFbx"))).toString();QString error;if(!m_materialCanvas->loadCustomMesh(path,&error)){m_shape->setCurrentIndex(0);m_materialCanvas->setShape(PbrPreviewGL::Shape::Plane);}}
     else m_materialCanvas->setShape(static_cast<PbrPreviewGL::Shape>(m_shape->currentIndex()));
+    // After the shape restore, never before: flat view switches the shape to a
+    // plane, and the line above would put the mesh straight back.
+    // The converter opens flat — conversion work is judging maps against each
+    // other, which is a 2D job. The author workspace still starts on the mesh.
+    // Stored per mode, so choosing otherwise sticks.
+    m_flatView->setChecked(s.value(m_converterMode?QStringLiteral("Preview/convFlatView")
+                                                 :QStringLiteral("Preview/flatView"),
+        m_converterMode).toBool());
+    m_flatTiling->setChecked(s.value(QStringLiteral("Preview/flatTiling"),false).toBool());
     m_materialCanvas->setProjection(static_cast<PbrPreviewGL::Projection>(m_projection->currentIndex()));m_materialCanvas->setBackground(static_cast<PbrPreviewGL::Background>(m_background->currentIndex()));m_materialCanvas->setDebugView(static_cast<PbrPreviewGL::DebugView>(m_debug->currentData().toInt()));m_materialCanvas->setGroundEnabled(m_ground->isChecked());m_materialCanvas->setComparisonEnabled(m_compare->isChecked());m_materialCanvas->setUvSet(m_uvSet->currentIndex());
     m_materialCanvas->setLighting(float(m_keyIntensity->value()),m_keyColor->color(),float(m_keyYaw->value()),float(m_keyPitch->value()),float(m_environmentIntensity->value()),float(m_environmentYaw->value()),float(m_exposure->value()));m_materialCanvas->setShadows(m_shadows->isChecked(),float(m_shadowIntensity->value()));reloadPreviewCubemaps();refreshMeshControls();savePreviewSettings();
 }
@@ -5606,7 +6204,8 @@ void MaterialPreviewWidget::loadPreviewSettings()
 void MaterialPreviewWidget::savePreviewSettings() const
 {
     const bool preserveManual=m_manualLightStored&&m_deriveExrLighting->isChecked();
-    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(m_converterMode?QStringLiteral("Preview/convDebug"):QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());if(!m_converterMode)s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(m_converterMode?QStringLiteral("Preview/convDebugLeft"):QStringLiteral("Preview/debugLeft"),m_debugLeft->currentData());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/pathTraced"),m_pathTrace->isChecked());s.setValue(QStringLiteral("Preview/traceDenoise"),m_traceDenoise->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
+    QSettings s;s.setValue(QStringLiteral("Preview/settingsVersion"),1);s.setValue(QStringLiteral("Preview/shape"),m_shape->currentIndex());s.setValue(QStringLiteral("Preview/planeOrientation"),m_planeOrientation->currentIndex());s.setValue(QStringLiteral("Preview/twoSided"),m_twoSided->isChecked());s.setValue(m_converterMode?QStringLiteral("Preview/convProjection")
+        :QStringLiteral("Preview/projection"),m_projection->currentIndex());s.setValue(QStringLiteral("Preview/background"),m_background->currentIndex());s.setValue(m_converterMode?QStringLiteral("Preview/convDebug"):QStringLiteral("Preview/debug"),m_debug->currentData());s.setValue(QStringLiteral("Preview/ground"),m_ground->isChecked());s.setValue(QStringLiteral("Preview/grid"),m_grid->isChecked());if(!m_converterMode)s.setValue(QStringLiteral("Preview/debugSplit"),m_debugSplit->value());s.setValue(m_converterMode?QStringLiteral("Preview/convDebugLeft"):QStringLiteral("Preview/debugLeft"),m_debugLeft->currentData());s.setValue(QStringLiteral("Preview/bloom"),m_bloom->isChecked());s.setValue(QStringLiteral("Preview/bloomStrength"),m_bloomStrength->value());s.setValue(QStringLiteral("Preview/tonemap"),m_tonemap->currentIndex());s.setValue(QStringLiteral("Preview/ssao"),m_ssao->isChecked());s.setValue(QStringLiteral("Preview/ssaoStrength"),m_ssaoStrength->value());s.setValue(QStringLiteral("Preview/pathTraced"),m_pathTrace->isChecked());s.setValue(QStringLiteral("Preview/traceDenoise"),m_traceDenoise->isChecked());s.setValue(QStringLiteral("Preview/compare"),m_compare->isChecked());s.setValue(QStringLiteral("Preview/allSubmeshes"),m_allSubmeshes->isChecked());s.setValue(QStringLiteral("Preview/layers"),m_uvSet->currentIndex());s.setValue(QStringLiteral("Preview/landscapeLayer"),m_landscapeLayer->currentIndex());s.setValue(QStringLiteral("Preview/antiAliasing"),m_antiAliasing->currentData());s.setValue(m_converterMode?QStringLiteral("Preview/convFlatView"):QStringLiteral("Preview/flatView"),m_flatView->isChecked());s.setValue(QStringLiteral("Preview/flatTiling"),m_flatTiling->isChecked());s.setValue(QStringLiteral("Preview/objectRotationX"),m_objectRotationX->value());s.setValue(QStringLiteral("Preview/objectRotationY"),m_objectRotationY->value());s.setValue(QStringLiteral("Preview/objectRotationZ"),m_objectRotationZ->value());s.setValue(QStringLiteral("Preview/objectPositionX"),m_objectPositionX->value());s.setValue(QStringLiteral("Preview/objectPositionY"),m_objectPositionY->value());s.setValue(QStringLiteral("Preview/objectPositionZ"),m_objectPositionZ->value());s.setValue(QStringLiteral("Preview/keyIntensity"),preserveManual?m_manualKeyIntensity:m_keyIntensity->value());s.setValue(QStringLiteral("Preview/keyYaw"),preserveManual?m_manualKeyYaw:m_keyYaw->value());s.setValue(QStringLiteral("Preview/keyPitch"),preserveManual?m_manualKeyPitch:m_keyPitch->value());s.setValue(QStringLiteral("Preview/temperature"),preserveManual?m_manualTemperature:m_temperature->currentData());s.setValue(QStringLiteral("Preview/keyColor"),(preserveManual?m_manualKeyColor:m_keyColor->color()).name());s.setValue(QStringLiteral("Preview/shadows"),preserveManual?m_manualShadows:m_shadows->isChecked());s.setValue(QStringLiteral("Preview/shadowIntensity"),m_shadowIntensity->value());s.setValue(QStringLiteral("Preview/environmentIntensity"),m_environmentIntensity->value());s.setValue(QStringLiteral("Preview/environmentYaw"),m_environmentYaw->value());s.setValue(QStringLiteral("Preview/exposure"),m_exposure->value());s.setValue(QStringLiteral("Preview/deriveExrLighting"),m_deriveExrLightingPreferred);
 }
 
 void MaterialPreviewWidget::reloadPreviewCubemaps()
@@ -5625,6 +6224,15 @@ void MaterialPreviewWidget::setRenderMode(PbrPreviewGL::DebugView view)
     QSignalBlocker blocker(m_debug);
     m_debug->setCurrentIndex(index);
     m_materialCanvas->setDebugView(view);
+}
+
+void MaterialPreviewWidget::setRenderModeLeft(PbrPreviewGL::DebugView view)
+{
+    const int index=m_debugLeft->findData(int(view));
+    if(index<0){m_materialCanvas->setDebugViewLeft(view);return;}
+    QSignalBlocker blocker(m_debugLeft);
+    m_debugLeft->setCurrentIndex(index);
+    m_materialCanvas->setDebugViewLeft(view);
 }
 
 void MaterialPreviewWidget::setTextureRoot(const QString& root){m_textureRoot=root;m_materialCanvas->setMaterial(m_document,m_textureRoot);reloadPreviewCubemaps();}

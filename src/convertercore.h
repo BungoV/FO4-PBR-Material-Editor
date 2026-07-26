@@ -96,11 +96,14 @@ struct Fo4Sources {
 //       reads warm 0.73/0.66/0.48 over a near-black diffuse), BC4 grayscale
 //       ~0.04 on dielectrics.
 //   _l (lightingTexture slot)  = R smoothness (chrome 0.61 > skin 0.44),
-//       G baked AO (mean ~0.9 with cavity dips), B unused.
+//       G baked AO (mean ~0.9 with cavity dips), B subsurface mask,
+//       A glow mask. B and A were read as unused until 2026-07-24; FO76
+//       materials that scatter or emit without a dedicated _g map carry
+//       those masks here and nowhere else.
 struct Fo76Sources {
     QImage diffuse;        // sRGB albedo (metals near-black), alpha = opacity
     QImage reflectance;    // _r: F0 color (treated linear; see options)
-    QImage lighting;       // _l: R smoothness, G baked AO
+    QImage lighting;       // _l: R smoothness, G baked AO, B subsurface mask, A glow mask
     QImage glow;
     QImage correctionMask;
 };
@@ -109,6 +112,7 @@ struct ConvertedImages {
     QImage baseColor;      // sRGB + opacity alpha
     QImage rmaos;          // linear: R rough, G metal, B AO (1.0 until derivations), A dielectric F0
     QImage emissive;       // sRGB tinted emission + A mask; null when the material does not emit
+    QImage subsurface;     // FO76 _l.B scatter mask; null unless the material scatters
     QImage metallic;       // grayscale metallic confidence (diagnostics / masking UI)
     float metalCoverage = 0; // fraction of texels with metallic > 0.5 (report)
 };

@@ -19,6 +19,15 @@ QLabel#PreviewSubheading {
     border-bottom: 1px solid #484b50;
 }
 QLabel#Muted { color: #aeb3ba; }
+/* Floats over the node canvas, so it needs its own plate to stay readable. */
+QWidget#CanvasTools {
+    background: rgba(39, 41, 45, 216);
+    border: 1px solid #1b1c1f;
+    border-radius: 3px;
+}
+QWidget#CanvasTools QToolButton { color: #d9dce1; padding: 2px 7px; border-radius: 2px; }
+QWidget#CanvasTools QToolButton:hover { background: #3a3d43; }
+QWidget#CanvasTools QToolButton:pressed { background: #2f3237; }
 QLabel#GroupTitle { color: #f0a54a; font-weight: 600; padding-top: 5px; }
 QLabel#StateBadge { font-size: 10pt; font-weight: 600; padding: 0 2px; background:transparent; color:#777c84; }
 QLabel#StateBadge[stateKind="override"] { color:#68b7f0; }
@@ -81,11 +90,38 @@ QScrollBar::handle:vertical { background: #62666c; min-height: 30px; border-radi
 QScrollBar::handle:vertical:hover { background: #777c83; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QSplitter::handle { background: #1d1f22; width: 2px; }
+/* One checkbox everywhere a checkbox appears. Qt does not inherit ::indicator
+   across widget types, so the selectors are listed out rather than shared:
+   standalone boxes (the UV Textures toggles), the converter queue's material
+   and folder rows, and the checkable group headers (Corrections, Preview
+   Settings). Anything that reads as a tick must look like the same tick. */
 QCheckBox { spacing: 7px; }
-QCheckBox::indicator { width: 14px; height: 14px; }
-QCheckBox::indicator:unchecked { background: #202226; border: 1px solid #696d73; }
-QCheckBox::indicator:checked { background: #3d78ae; border: 1px solid #77a7d3; image: url(:/check.xpm); }
-QCheckBox:disabled { color: #777c84; }
+QCheckBox::indicator, QGroupBox::indicator,
+QTreeView::indicator, QTreeWidget::indicator { width: 14px; height: 14px; }
+QCheckBox::indicator:unchecked, QGroupBox::indicator:unchecked,
+QTreeView::indicator:unchecked, QTreeWidget::indicator:unchecked {
+    background: #202226;
+    border: 1px solid #696d73;
+}
+QCheckBox::indicator:checked, QGroupBox::indicator:checked,
+QTreeView::indicator:checked, QTreeWidget::indicator:checked {
+    background: #3d78ae;
+    border: 1px solid #77a7d3;
+    image: url(:/check.xpm);
+}
+/* Folder rows go partial when only some of the materials under them are
+   ticked: the same blue dimmed, and no tick. "Some of these" has to read
+   differently from "all of these" without inventing a second icon. */
+QTreeView::indicator:indeterminate, QTreeWidget::indicator:indeterminate {
+    background: #2f5476;
+    border: 1px solid #5c86b3;
+}
+QCheckBox::indicator:disabled, QGroupBox::indicator:disabled,
+QTreeView::indicator:disabled, QTreeWidget::indicator:disabled {
+    background: #232529;
+    border: 1px solid #4a4d53;
+}
+QCheckBox:disabled, QGroupBox:disabled { color: #777c84; }
 QGroupBox {
     border: 1px solid #55585e;
     border-radius: 2px;

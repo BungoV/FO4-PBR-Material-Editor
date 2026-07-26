@@ -23,10 +23,11 @@ SOURCES += main_cli.cpp \
     ../src/texturearchive.cpp \
     ../src/texturecache.cpp \
     ../src/textureimage.cpp \
+    ../src/upscaler.cpp \
     ../src/texturewriter.cpp \
     ../src/tinyexr_impl.cpp
 HEADERS += ../src/clicommands.h ../src/materialdocument.h ../src/texturearchive.h \
-    ../src/texturecache.h ../src/textureimage.h ../src/texturewriter.h
+    ../src/texturecache.h ../src/textureimage.h ../src/upscaler.h ../src/texturewriter.h
 
 LIBS += -lz
 INCLUDEPATH += ../third_party/tinyexr

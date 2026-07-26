@@ -67,7 +67,23 @@ public:
         LayerCoverage = 17, EmissiveColor = 18, Curvature = 19, Validation = 20,
         // Converter comparison views: the ORIGINAL FO4/FO76 source maps.
         SourceDiffuse = 21, SourceSpec = 22, SourceNormal = 23, SourceExtra = 24,
-        NodeOutput = 25 // whatever the selected graph node produced
+        NodeOutput = 25, // whatever the selected graph node produced
+        // The untouched source material shaded the way its own game shades it,
+        // so the conversion can be judged against what it came from.
+        NativeFo4 = 26, NativeFo76 = 27
+    };
+    // Legacy (specular/gloss) shading parameters read straight off the BGSM.
+    struct NativeMaterial {
+        bool valid = false;
+        bool fallout76 = false;
+        QVector3D specularColor{1, 1, 1};
+        float specularMult = 1.0f;
+        float smoothness = 1.0f;   // used where the source has no gloss map
+        float envMapScale = 1.0f;
+        bool specularEnabled = true;
+        bool emitEnabled = false;
+        QVector3D emittanceColor{1, 1, 1};
+        float emittanceMult = 1.0f;
     };
     enum class AxisView { Front, Back, Left, Right, Top, Bottom };
     struct EnvironmentLight {
@@ -115,9 +131,16 @@ public:
     void setDebugSplit(float fraction);
     // Converter comparison: the pre-conversion source maps (diffuse, spec or
     // reflectance, normal, lighting/greyscale) shown by the Source* views.
-    void setSourceComparisonImages(const QImage& diffuse, const QImage& spec, const QImage& normal, const QImage& extra);
+    void setSourceComparisonImages(const QImage& diffuse, const QImage& spec, const QImage& normal,
+        const QImage& extra, const QImage& glow = QImage());
+    void setNativeMaterial(const NativeMaterial& material);
     // Shows one graph node's output on the preview surface; a null image
     // returns the viewport to the material.
+    // Shades the node graph's assembled maps directly, so the converted result
+    // can be previewed before it exists on disk.
+    void setLiveMaterialImages(const QImage& base, const QImage& normal,
+        const QImage& rmaos, const QImage& emissive);
+    void clearLiveMaterial();
     void setNodeOutputImage(const QImage& image);
     bool hasNodeOutput() const { return !m_nodeOutputImage.isNull(); }
     void setBloom(bool enabled, float strength);
@@ -131,6 +154,9 @@ public:
     // plane, orthographic and framed, instead of on the 3D mesh.
     void setFlatView(bool enabled);
     bool flatView() const { return m_flatView; }
+    // Repeat count for the 2D view; 1 shows the single authored tile.
+    void setFlatTiling(int repeats);
+    int flatTiling() const { return m_flatTiling; }
     void setTraceDenoise(bool enabled);
     void setGroundEnabled(bool enabled);
     void setGridEnabled(bool enabled);
@@ -153,6 +179,8 @@ public:
 signals:
     void cameraChanged();
     void projectionChanged();
+    // The divider was dragged in the viewport; the settings field follows it.
+    void debugSplitDragged(float fraction);
     void lightAnglesChanged(float yawDegrees, float pitchDegrees);
     void environmentYawDragged(float deltaDegrees);
     void shaderErrorsChanged(const QString& log);
@@ -253,6 +281,7 @@ private:
     bool m_bvhDirty = true;
     bool m_pathTraced = false;
     bool m_flatView = false;
+    int m_flatTiling = 1;
     Shape m_shapeBeforeFlat = Shape::Sphere; // restored when leaving the flat view
     int m_accumSamples = 0;
     int m_traceFrame = 0;
@@ -403,13 +432,23 @@ private:
     Background m_background = Background::Cubemap;
     DebugView m_debugView = DebugView::Shaded;
     DebugView m_debugViewLeft = DebugView::Shaded; // left half of the split view
-    std::unique_ptr<QOpenGLTexture> m_sourceTextures[4]; // converter source maps (diffuse/spec/normal/extra)
-    QImage m_sourceImages[4];
+    // Converter source maps: diffuse, spec/reflectance, normal, lighting, glow.
+    std::unique_ptr<QOpenGLTexture> m_sourceTextures[5];
+    QImage m_sourceImages[5];
+    NativeMaterial m_nativeMaterial;
     bool m_sourceDirty = false;
     std::unique_ptr<QOpenGLTexture> m_nodeOutputTexture;
     QImage m_nodeOutputImage;
     bool m_nodeOutputDirty = false;
     float m_debugSplit = 0.0f; // 0 = the map fills the view; else shaded left of the divider
+    bool m_splitDrag = false;  // the divider is being dragged
+    bool m_liveMaterial = false; // primary maps come from the graph, not paths
+    // Screen X of a split fraction. Flat view anchors the split to the
+    // texture, so drawing, hit-testing and dragging must all ask here
+    // rather than each computing a screen fraction of their own.
+    double splitScreenX(double fraction) const;
+    bool nearDebugSplit(const QPointF& point) const;
+    void dragDebugSplit(const QPointF& point);
     bool m_bloomEnabled = true;
     float m_bloomStrength = 0.4f;
     int m_tonemapOperator = 2; // 0 ACES, 1 AgX, 2 Reinhard (legacy default), 3 None
@@ -500,15 +539,68 @@ public:
     // Drives the render-mode combo from outside (the converter selects a graph
     // node and wants its output on the surface).
     void setRenderMode(PbrPreviewGL::DebugView view);
+    // The left half of the split; the converter pins the PBR result there.
+    void setRenderModeLeft(PbrPreviewGL::DebugView view);
     void setMaterial(const Pbr::MaterialDocument& document);
     void reloadPreviewCubemaps();
     PbrPreviewGL* canvas() const { return m_materialCanvas; }
+    // The left-half picker only means anything while the split is showing a
+    // selected node against the material, so the converter hides it otherwise.
+    void setSplitPickerVisible(bool visible);
+    // It also offers only what the selected node can actually show:
+    //   Views    — the full render-mode list, for anything unclassified.
+    //   Channels — R/G/B/A, for a node that outputs one image. "Original
+    //              (FO76)" means nothing when you are looking at a single map.
+    //   Maps     — the shaded material plus one entry per map the node carries,
+    //              for a node that stands for a whole material.
+    enum class SplitPicker { Views, Channels, Maps };
+    // One row of the map list. A header carries no id and goes in as a disabled
+    // caption, the way the render-mode list already groups itself.
+    struct MapEntry {
+        QString id;            // port id, or "port#mask" for one map inside it
+        QString label;
+        bool header = false;
+        bool operator==(const MapEntry& other) const
+        {
+            return id == other.id && label == other.label && header == other.header;
+        }
+    };
+    // maps is read only in Maps mode. Re-sending the same mode and list is a
+    // no-op, so a re-evaluation cannot reset the choice out from under the user.
+    void setSplitPickerMode(SplitPicker mode, const QVector<MapEntry>& maps = {});
+    // Points the picker at a map without emitting. Two different nodes can
+    // carry the same map list — Combine and the terminal do — so an unchanged
+    // list is not proof the shown entry still matches the node.
+    void setSplitPickerCurrentMap(const QString& portId);
+
+signals:
+    // Emitted when the left picker is in channel mode. The value is a mask of
+    // 1=R 2=G 4=B 8=A, matching NodeGraph's ChannelBit without needing the
+    // graph headers here.
+    void splitChannelsChanged(int channelMask);
+    // Emitted in map mode. Empty means the "Material" entry: shade the whole
+    // thing rather than isolate one of its maps.
+    void splitMapChanged(const QString& portId);
+
+public:
 public slots:
     void inspectTexture(const QString& name, const QString& path, const QStringList& channels, const QColor& color);
     void showFullMaterial();
 private:
     void rebuildChannelButtons(const QStringList& channels);
     void buildPreviewControls(QVBoxLayout* layout);
+    // Floating controls in the viewport's top-right corner: a 3D/2D switch and
+    // the display-channel picker. They drive the Display-page controls rather
+    // than holding their own state, so the two can never disagree.
+    void buildViewportOverlay();
+    void layoutViewportOverlay();
+    bool eventFilter(QObject* watched, QEvent* event) override; // keeps the overlay in the corner
+    QToolButton* m_overlayDimension = nullptr;
+    QComboBox* m_overlayChannel = nullptr;
+    QComboBox* m_overlayChannelLeft = nullptr;
+    SplitPicker m_splitPickerMode = SplitPicker::Views;
+    QVector<MapEntry> m_splitPickerMaps;
+    void fillViewPicker(QComboBox* picker);
     void refreshMeshControls();
     void showSubmeshMaterialsDialog();
     void loadSubmeshAssignments();
@@ -593,6 +685,7 @@ private:
     QCheckBox* m_pathTrace = nullptr;
     QCheckBox* m_traceDenoise = nullptr;
     QCheckBox* m_flatView = nullptr;
+    QCheckBox* m_flatTiling = nullptr;
     QCheckBox* m_compare = nullptr;
     QLabel* m_importStatus = nullptr;
     // Dynamic surface-state simulation controls (States tab): one slider per

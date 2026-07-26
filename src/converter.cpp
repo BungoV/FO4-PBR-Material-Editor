@@ -295,8 +295,10 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
 
     // Painted 0.5-neutral metallic correction (the workspace's mesh fills or
     // an explicit --correction-mask).
+    // A graph run applies its own mask through the correction-mask node; the
+    // orchestrator only loads one when it is doing the conversion itself.
     QImage correctionMask;
-    if (!options.correctionMaskPath.trimmed().isEmpty()) {
+    if (!options.supplied.active && !options.correctionMaskPath.trimmed().isEmpty()) {
         correctionMask = QImage(options.correctionMaskPath);
         if (correctionMask.isNull())
             correctionMask = loadSource(options.correctionMaskPath, options.textureRoot, &result.notes, QStringLiteral("correction mask"));
@@ -312,6 +314,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         converted.baseColor = options.supplied.baseColor;
         converted.rmaos = options.supplied.rmaos;
         converted.emissive = options.supplied.emissive;
+        converted.subsurface = options.supplied.subsurface;
         converted.metalCoverage = options.supplied.metalCoverage;
         result.notes.append(options.supplied.notes);
     } else if (fallout76) {
@@ -449,6 +452,14 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
             cache->emissiveBySignature, &result.notes, &result.errors);
         recordTexture(emissivePortable);
     }
+    QString subsurfacePortable;
+    if (!converted.subsurface.isNull()) {
+        // Single-channel scatter mask: BC4 is the right home for it.
+        subsurfacePortable = writeConverted(converted.subsurface, pairSignature + QStringLiteral("#sss"),
+            portableDirectory, baseName, QStringLiteral("_SSS.dds"), TextureWriter::DdsFormat::Bc4,
+            QImage(), options, cache, cache->emissiveBySignature, &result.notes, &result.errors);
+        recordTexture(subsurfacePortable);
+    }
     if (options.writeMetallicDiagnostic && !converted.metallic.isNull())
         recordTexture(writeConverted(converted.metallic, pairSignature + QStringLiteral("#m"), portableDirectory, baseName,
             QStringLiteral("_MetalMask.dds"), TextureWriter::DdsFormat::Bc4, QImage(), options, cache,
@@ -476,6 +487,17 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     if (!emissivePortable.isEmpty())
         wireSlot(&document, QStringLiteral("primaryEmissive"), emissivePortable,
             QJsonObject{{QStringLiteral("intensity"), double(std::max(material.emittanceMult, 0.0f))}});
+    if (!subsurfacePortable.isEmpty()) {
+        // The scatter tint is the material's own subsurface colour; the map
+        // says where it applies. mapParameters already set the profile.
+        const QVector3D scatter = material.translucencySubsurfaceColor;
+        wireSlot(&document, QStringLiteral("primarySubsurface"), subsurfacePortable,
+            QJsonObject{{QStringLiteral("scatterTint"),
+                             QColor::fromRgbF(std::clamp(scatter.x(), 0.0f, 1.0f),
+                                 std::clamp(scatter.y(), 0.0f, 1.0f),
+                                 std::clamp(scatter.z(), 0.0f, 1.0f)).name()},
+                {QStringLiteral("weight"), 1.0}});
+    }
 
     // Review flags for the workspace queue.
     if (!fallout76 && converted.metalCoverage > 0.02f && converted.metalCoverage < 0.98f

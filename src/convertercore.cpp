@@ -281,7 +281,16 @@ ConvertedImages convertFo76(const Fo76Sources& sources, const Bgsm::Material& ma
             QVector3D reflectanceLinear(0.04f, 0.04f, 0.04f);
             if (reflectance.valid()) {
                 const uchar* reflTexel = reflectance.texel(x, y);
-                reflectanceLinear = QVector3D(reflTexel[0] / 255.0f, reflTexel[1] / 255.0f, reflTexel[2] / 255.0f);
+                // FO76 authors _r as BC1_UNORM_SRGB and nothing in the load path
+                // acts on the declared colour space, so these texels arrive
+                // encoded. Every consumer below is linear maths -- the metal
+                // smoothstep edges bracket the linear dielectric/metal gap, the
+                // mix runs against diffuseLinear, and the F0 clamp is the linear
+                // 0.02-0.08 band -- and the 0.04 fallback above is itself linear.
+                // Read as-is, a 0.04 dielectric measured ~0.22: inside the metal
+                // ramp, and over the F0 ceiling.
+                reflectanceLinear = srgbToLinear(QVector3D(reflTexel[0] / 255.0f,
+                    reflTexel[1] / 255.0f, reflTexel[2] / 255.0f));
             }
             float smoothness = material.smoothness, bakedAo = 1.0f;
             if (lighting.valid()) {
@@ -319,8 +328,46 @@ ConvertedImages convertFo76(const Fo76Sources& sources, const Bgsm::Material& ma
     }
     result.metalCoverage = float(double(metalTexels) / (double(width) * height));
 
-    if ((material.emitEnabled || material.glowmap) && !sources.glow.isNull()) {
-        const QImage glow = toRgba(sources.glow);
+    // FO76 packs two more masks into _l that FO4 has no equivalent for: B is
+    // the subsurface mask and A is the glow mask. A dedicated _g map still
+    // wins where one is authored, so this only fills in what was being lost.
+    const QImage lightingRgba = toRgba(sources.lighting);
+
+    // _l.A only carries a glow mask when the file actually has an alpha
+    // channel. Plenty of vanilla _l maps are BC1, which decodes to a constant
+    // opaque alpha — reading that as a mask would make the whole surface emit.
+    const auto alphaCarriesData = [](const QImage& image) {
+        if (image.isNull()) return false;
+        uchar low = 255, high = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            const uchar* line = image.constScanLine(y);
+            for (int x = 0; x < image.width(); ++x) {
+                const uchar value = line[x * 4 + 3];
+                low = std::min(low, value);
+                high = std::max(high, value);
+                if (high - low > 2) return true;
+            }
+        }
+        return false;
+    };
+
+    QImage glowMask = toRgba(sources.glow);
+    if (glowMask.isNull() && !lightingRgba.isNull() && (material.emitEnabled || material.glowmap)
+        && alphaCarriesData(lightingRgba)) {
+        glowMask = QImage(lightingRgba.width(), lightingRgba.height(), QImage::Format_RGBA8888);
+        for (int y = 0; y < lightingRgba.height(); ++y) {
+            const uchar* lightLine = lightingRgba.constScanLine(y);
+            uchar* maskLine = glowMask.scanLine(y);
+            for (int x = 0; x < lightingRgba.width(); ++x) {
+                const uchar value = lightLine[x * 4 + 3]; // _l.A
+                maskLine[x * 4] = maskLine[x * 4 + 1] = maskLine[x * 4 + 2] = value;
+                maskLine[x * 4 + 3] = 255;
+            }
+        }
+    }
+
+    if ((material.emitEnabled || material.glowmap) && !glowMask.isNull()) {
+        const QImage& glow = glowMask;
         result.emissive = QImage(glow.width(), glow.height(), QImage::Format_RGBA8888);
         const QVector3D tint = material.emittanceColor;
         for (int y = 0; y < glow.height(); ++y) {
@@ -332,6 +379,20 @@ ConvertedImages convertFo76(const Fo76Sources& sources, const Bgsm::Material& ma
                 emissiveLine[x * 4 + 1] = uchar(std::lround(std::clamp(mask * tint.y(), 0.0f, 1.0f) * 255.0f));
                 emissiveLine[x * 4 + 2] = uchar(std::lround(std::clamp(mask * tint.z(), 0.0f, 1.0f) * 255.0f));
                 emissiveLine[x * 4 + 3] = uchar(std::lround(mask * 255.0f));
+            }
+        }
+    }
+    // Only materials that actually scatter get a subsurface map; every other
+    // FO76 material would otherwise gain a meaningless extra texture.
+    if ((material.translucency || material.subsurfaceLighting) && !lightingRgba.isNull()) {
+        result.subsurface = QImage(lightingRgba.width(), lightingRgba.height(), QImage::Format_RGBA8888);
+        for (int y = 0; y < lightingRgba.height(); ++y) {
+            const uchar* lightLine = lightingRgba.constScanLine(y);
+            uchar* sssLine = result.subsurface.scanLine(y);
+            for (int x = 0; x < lightingRgba.width(); ++x) {
+                const uchar value = lightLine[x * 4 + 2]; // _l.B
+                sssLine[x * 4] = sssLine[x * 4 + 1] = sssLine[x * 4 + 2] = value;
+                sssLine[x * 4 + 3] = 255;
             }
         }
     }
@@ -355,6 +416,46 @@ void mapParameters(const Bgsm::Material& material, Pbr::MaterialDocument* docume
         document->setShaderMode(Pbr::ShaderMode::AdvancedSubsurface);
     } else {
         document->setShaderMode(Pbr::ShaderMode::StandardSurface);
+    }
+
+    // Subsurface. FO76 authors a translucency block (v>=8), FO4 the simpler
+    // subsurface-lighting pair. Both used to only pick the shader family above,
+    // which selected a subsurface material and then shipped it with default
+    // scattering — every authored value was dropped.
+    if (material.translucency || material.subsurfaceLighting) {
+        const QString subsurface = QStringLiteral("Shading/Subsurface");
+        if (material.translucency) {
+            // Thick objects scatter through a volume, thin ones transmit
+            // through a sheet; the transmissive scale is authored either way.
+            document->setSetting(subsurface, QStringLiteral("mode"),
+                material.translucencyThickObject ? QStringLiteral("Combined")
+                                                 : QStringLiteral("Thin Transmission"));
+            document->setSetting(subsurface, QStringLiteral("transmission"),
+                double(std::clamp(material.translucencyTransmissiveScale, 0.0f, 4.0f)));
+            // The authored subsurface colour is a wavelength tint, which is
+            // exactly what a Custom diffusion profile expresses. A default
+            // white one carries no information, so the stock profile stays.
+            const QVector3D scatter = material.translucencySubsurfaceColor;
+            if (!qFuzzyCompare(scatter, QVector3D(1, 1, 1))) {
+                document->setSetting(subsurface, QStringLiteral("profile"), QStringLiteral("Custom"));
+                document->setSetting(subsurface, QStringLiteral("customScatterColor"),
+                    QColor::fromRgbF(std::clamp(scatter.x(), 0.0f, 1.0f),
+                        std::clamp(scatter.y(), 0.0f, 1.0f),
+                        std::clamp(scatter.z(), 0.0f, 1.0f)).name());
+            }
+            if (material.translucencyMixAlbedo)
+                flag(QStringLiteral("bTranslucencyMixAlbedo: runtime blends the scatter colour with albedo; no editor equivalent"));
+            if (material.translucencyTurbulence > 0.0f)
+                flag(QStringLiteral("fTranslucencyTurbulence %1: no editor equivalent")
+                        .arg(material.translucencyTurbulence, 0, 'f', 3));
+        } else {
+            // FO4's rolloff is normalised against its own default, so a
+            // material that left it alone lands on the editor's neutral weight
+            // and one that raised it scatters further.
+            document->setSetting(subsurface, QStringLiteral("mode"), QStringLiteral("Diffusion Profile"));
+            document->setSetting(subsurface, QStringLiteral("weight"),
+                double(std::clamp(material.subsurfaceLightingRolloff / 0.3f, 0.0f, 4.0f)));
+        }
     }
 
     // Transparency composition.

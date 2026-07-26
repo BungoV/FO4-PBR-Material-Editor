@@ -36,6 +36,15 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     bool openFile(const QString& fileName);
     void restoreLastSession();
+    // Opens straight into the converter. Used by --converter so UI changes
+    // there can be captured without driving the workspace combo by hand.
+    void showConverter() { setWorkspaceMode(true); }
+    void scanConverterSources();
+    // One trained model per map role, chosen once instead of guessed per node.
+    void showUpscaleModelsDialog();
+    // Picks the first queued material, so a capture shows the graph rather
+    // than the "pick a material" placeholder.
+    void selectFirstConvertMaterial();
     const Pbr::MaterialDocument& document() const { return m_document; }
 
 protected:

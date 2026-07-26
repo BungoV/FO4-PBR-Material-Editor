@@ -24,7 +24,31 @@ const NodeGraph::Registry& sharedRegistry();
 // output.texture nodes by role, ready to hand to Converter::JobOptions so the
 // orchestrator writes them exactly as it writes a batch conversion.
 Converter::SuppliedImages runGraph(const NodeGraph::Graph& graph, const QString& materialPath,
-    const QString& textureRoot, const QString& referenceMesh, QStringList* errors = nullptr);
+    const QString& textureRoot, const QString& referenceMesh, const QString& correctionMaskPath = QString(),
+    QStringList* errors = nullptr);
+
+// Largest authored texture dimension across the material's slots. This is the
+// bar every map in the material is measured against: anything below it is
+// flagged on the canvas as under-resolution.
+int materialMaxResolution(const Bgsm::Material& material, const QString& textureRoot);
+
+// Fallout 76 authors _r under two conventions and the DDS format is what tells
+// them apart, so the same stored number means two different reflectances:
+//
+//   BC1 sRGB (36% of a 900-material survey) — dielectric floor 0.22, metals to
+//     0.70 at the median map's p99.
+//   BC4 linear (64%, and 84% of those are a 4x4 flat holding one constant) —
+//     dielectric 0.035, textured maps reaching 0.208 at p99.
+//
+// This maps a linear BC4 map onto the BC1 scale: the sRGB transfer, then a
+// stretch that lands 0.035 on the 0.22 dielectric floor and 0.208 on the 0.70
+// metal top. Both conventions then span the same range, so ONE pair of Levels
+// thresholds gives a full-spectrum metal mask on either — without the graph
+// having to branch on compression, which is the whole point.
+//
+// A no-op on an already-sRGB map. Exposed because it is a rule about the game's
+// data rather than an implementation detail, and because it is worth testing.
+QImage normaliseReflectanceToSrgbScale(const QImage& image, bool sourceIsSrgb);
 
 // Loads a .pbrgraph; returns an empty graph and sets error when unreadable.
 NodeGraph::Graph loadGraphFile(const QString& path, QString* error = nullptr);

@@ -625,6 +625,19 @@ QImage isolateChannel(const QImage& source, const QString& channel)
     return result;
 }
 
+QString Diagnostics::compressionLabel() const
+{
+    if (!valid || format.isEmpty()) return {};
+    const bool signedData = format.contains(QStringLiteral("SNORM"));
+    const QString base = format.section(QLatin1Char(' '), 0, 0);
+    // BC4/BC5 store data, never colour: signedness is what matters about them.
+    if (base == QLatin1String("BC4") || base == QLatin1String("BC5"))
+        return QStringLiteral("%1 Linear %2").arg(base, signedData ? QStringLiteral("Signed") : QStringLiteral("Unsigned"));
+    const QString space = colorSpace == QLatin1String("sRGB") ? QStringLiteral("sRGB") : QStringLiteral("Linear");
+    if (base == QLatin1String("RGBA32")) return QStringLiteral("RGBA8 %1").arg(space);
+    return QStringLiteral("%1 %2").arg(base, space);
+}
+
 QString Diagnostics::summary() const
 {
     if (!valid) return error;

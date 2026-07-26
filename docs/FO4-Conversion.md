@@ -1,9 +1,17 @@
 # Fallout 4 / Fallout 76 → PBR asset conversion
 
-Status: spec, agreed 2026-07-22. The converter is an editor-integrated module:
-the editor already owns BA2 reading, BC1–7 decode, game-ready DDS encode with
-mip discipline and Toksvig, the channel compositor, batch-operation framing,
+Status: spec agreed 2026-07-22, and largely **shipped** — the reader, math core,
+derivations, orchestrator, CLI verbs, BA2-direct reads, correction masking,
+geometry AO, the Convert workspace and the node graph are all live. What remains
+is noted per section. The converter is an editor-integrated module: the editor
+already owns BA2 reading, BC1–7 decode, game-ready DDS encode with mip
+discipline and Toksvig, the channel compositor, batch-operation framing,
 validation, and the live preview that makes manual review practical.
+
+Where this document states a number — a threshold, a floor, a ceiling — it is
+**measured against the real corpus at `E:\Projects\F76\Data`** and the survey
+that produced it is named, so it can be re-run rather than trusted. Physical
+reflectance tables do not describe this data and are not used as a source.
 
 ## Source profiles
 
@@ -21,12 +29,16 @@ downstream of them — the derivations, geometry AO, masks, workspace, and
   in the RGB `_r` reflectance map. Conversion is the textbook
   specular→metalness reconstruction:
   `metallic` inferred from reflectance intensity joined with diffuse
-  near-blackness (a very reliable pair);
+  near-blackness (a very reliable pair — the diffuse under metal measures
+  3.2× darker across 200 materials, holding in 185 of them);
   `baseColor = mix(diffuse, reflectance.rgb, metallic)` — the diffuse fix,
   mirror image of FO4's recovery (FO4 keeps hue and loses brightness to
   the cubemap; FO76 moves hue *and* brightness into `_r`);
   dielectric F0 from reflectance clamped to the physical window;
-  smoothness inverts to roughness through a profile curve. Dielectric
+  smoothness inverts to roughness as a **plain `1 − _l.R`, with no clamp
+  and no normalisation** — see *FO76 metallic + roughness* below for the
+  900-material survey behind that, and why the treatment `_r` needs is
+  exactly the treatment `_l.R` must not get. Dielectric
   albedo passes through untouched. Packed-map channel semantics are
   confirmed against the Material Editor reference source
   (`E:\Projects\ClaudeMaterialEditor`, ousnius fork parses both versions)
@@ -202,6 +214,108 @@ FO4 `_s`: R = specular strength, G = glossiness.
 Output BC7 linear, full mip chain, **Toksvig folded from the converted
 normal automatically** — the converter always has the paired normal in hand.
 
+### FO76 metallic + roughness ← `_r` and `_l` (measured, not assumed)
+
+Everything in this section is calibrated against the real corpus at
+`E:\Projects\F76\Data`, not against physical reflectance tables — which do not
+describe this data (steel reads 0.09 linear in `_r` where real steel F0 is
+0.56). Both surveys are reproducible from the GUI binary:
+
+```bash
+"PBR Material Editor.exe" --survey-r <materials> <report.tsv> --texture-root <data> --limit 900
+```
+
+`--survey-gloss` takes the same arguments and measures `_l.R`.
+
+#### Reflectance `_r` → metallic: two conventions, one channel
+
+`_r` ships under **two incompatible authoring conventions**, and which one a
+material uses is readable from its compression. Measured over 900 materials:
+
+| Convention | Count | Dielectric floor (median p1) | Metal ceiling (median p99, textured maps) |
+| --- | --- | --- | --- |
+| BC4, linear | 573 (64%) | 9/255 = 0.035 linear = **0.207** encoded | 53/255 = 0.208 linear = **0.493** encoded |
+| BC1, sRGB | 326 (36%) | **56/255 = 0.22**, in 273 of 326 (**84%**) | **179/255 = 0.70** |
+
+0.22 sRGB is not arbitrary: it is dielectric F0 0.04 linear, encoded. BC4 is a
+*data* format and stores the same physical floor without the transfer, which is
+why the two sets of numbers look nothing alike while meaning the same thing.
+`normaliseReflectanceToSrgbScale()` in the source node applies the transfer and
+stretch to BC4 maps up front, so one downstream window serves both.
+
+The ceilings are quoted over **textured** maps for a reason: **481 of the 573
+BC4 maps (84%) are flat** — a constant dielectric value with no metal in them at
+all. BC4 is not merely a second encoding, it is largely the format chosen when a
+material has no metal to describe. Only 92 materials in 900 use BC4 with real
+metal variation, so a ceiling averaged over all BC4 maps reads 9/255 and means
+nothing. BC1 is the opposite: only 2 of 326 are flat.
+
+The Levels black point sits at **0.25**, not on the 0.22 floor. BC1 is 4bpp and
+quantises hard: a median **10.2%** of every map's texels smear into 57–64. A
+black point *on* the floor lets that smear through as low-level metal — the
+"everything is slightly grey" failure. The 0.03 of headroom is what clamps it.
+The white point is **0.70** because the median map's p99 lands there, so its
+brightest metal reaches *full* metal; at 0.75 it stalls near 90%, inside the
+band a PBR validator flags as ambiguous.
+
+Auto levels (on by default) re-derives this window per material and snaps to a
+**0.05 ladder** — deliberately coarse, so two near-identical maps cannot resolve
+to 0.70 and 0.71 and convert differently.
+
+#### The diffuse gate
+
+Metal is confirmed by a second, independent signal: metals are authored with
+near-black diffuse. Across 200 materials containing both populations, diffuse
+under metal is **3.2× darker** (median 17.8 vs 64.3 of 255), holding in 185 of
+the 200. The window is inverted and sits in the gap — 0.20 black, 0.11 white —
+deliberately generous toward metal, because this gate can only ever *remove*
+metal: a false negative destroys a real metal surface outright, while a false
+positive still has to survive the reflectance signal it is multiplied with.
+
+#### Smoothness `_l.R` → roughness: **plain inversion, no normalisation**
+
+Surveyed 2026-07-25 over 900 FO76 materials. `_l.R` does **not** use its full
+range — only **0.8%** reach both black and white; median p1 = 32/255, median
+p99 = 197/255. That looks like the `_r` problem, and it is not.
+
+The distribution settles it. `_r`'s floor is a **spike**: 83% of BC1 maps at
+exactly 56. `_l.R`'s ceiling is a **broad bell**, mode 180–199, tailing smoothly
+down to 60. A spike is an encoding convention; a bell is a thousand authoring
+decisions. Nothing here is being lost in encoding.
+
+**Rule: `roughness = 1 − _l.R`, with no clamp and no per-material stretch.** Two
+reasons, and the second is decisive:
+
+1. A compressed range is a legitimate answer. A map peaking at 197 says "the
+   shiniest part of this material is roughness 0.23" — glossy, entirely
+   plausible for painted metal or leather. Where `_r`'s compression broke
+   something concrete (a metal *mask* that never saturated, so nothing was ever
+   fully metal), roughness is continuous and 0.23 is a value, not a failure.
+2. **Per-material normalisation would destroy cross-material contrast.** Auto
+   levels stretches each material independently. Applied to roughness, a matte
+   cloth and a polished helmet would both be stretched to full range and end up
+   with equally sharp highlights. Roughness's absolute value carries meaning
+   *between* materials in a way a metal mask does not.
+
+That asymmetry is the general rule worth carrying forward: **normalise
+classifications, never continuous physical quantities.** Reflectance feeds a
+mask that must saturate; roughness is a measurement.
+
+The stock graph is therefore an Invert and nothing else. A gloss-curve node used
+to sit after it at `pow(x, 1.0)` — the identity — as somewhere to dial a curve
+in, but a node that computes nothing is clutter, and the curve already has three
+homes that do something: the `convert.fo76` node's `glossCurve` param,
+`pbrm convert --gloss-curve`, and `convertercore::glossToRoughness`. "No curve"
+is best expressed by there being no node.
+
+**Known open point.** The `.bgsm` `smoothness` scalar is *discarded* whenever an
+`_l` texture exists — `convertercore.cpp` sets it then overwrites it with the
+texel, and the graph does the same. 94.3% of materials have it at exactly 1.000
+so it is nearly always moot, but **51 of 900 do not**, including 8 sitting at
+0.100. Bethesda scalars are usually fallbacks rather than multipliers, so the
+current behaviour is probably right, but this has not been confirmed against the
+FO76 shader or an in-game A/B.
+
 ### Emissive ← `_g` + BGSM emittance color/multiplier
 
 The FO4 `_g` glow map is a **grayscale mask only** — the emissive color
@@ -218,6 +332,30 @@ reuses the base texture's path in the Emissive slot (no duplicate file),
 color = BGEM tint, intensity = the scale; for materials landing in the
 Unlit Effect family the scale maps to `Shading/Unlit` intensity instead,
 since unlit base color already is the radiance.
+
+### Subsurface
+
+FO76 authors a translucency block (v≥8) and FO4 a simpler subsurface-lighting
+pair. Both select the Advanced Subsurface family, and both carry values that
+must reach `Shading/Subsurface` — selecting the family alone converts skin as a
+subsurface material with *default* scattering, which is what the pipeline used
+to do.
+
+| Source field | `.pbrm` | Note |
+| --- | --- | --- |
+| `bTranslucency` + `bTranslucencyThickObject` | `mode` | thick → `Combined`, thin → `Thin Transmission` |
+| `fTranslucencyTransmissiveScale` | `transmission` | clamped 0–4 |
+| `translucencySubsurfaceColor` | `profile` = `Custom` + `customScatterColor` | the authored colour *is* a wavelength tint; a default white one carries no information, so the stock profile stays |
+| `bSubsurfaceLighting` (FO4) | `mode` = `Diffusion Profile` | |
+| `fSubsurfaceLightingRolloff` (FO4) | `weight` | normalised against its own 0.3 default, so an untouched material lands on neutral weight |
+| `bTranslucencyMixAlbedo` | — | flagged: runtime blends scatter colour with albedo |
+| `fTranslucencyTurbulence` | — | flagged: no editor equivalent |
+
+Vanilla `BaseHumanFemaleSkin.bgsm` converts to `Combined` / `Custom` /
+`#ff0000` / `0.7` — red scattering furthest through flesh, as expected.
+
+Source Material exposes **Subsurface Colour** and **Transmission** ports, which
+report exactly what the conversion will write.
 
 ## Material parameter mapping
 
@@ -286,12 +424,11 @@ Layout (same visual language as Author):
   `.bgsm`/`.bgem` list as a work queue with per-material status
   (*pending / flagged / masked / converted*), filterable to walk just the
   flagged set.
-- **Center** — conversion options (recovery strength, gloss curve, clamps,
-  AO radius/intensity, height on/off; output mod folder), the selected
-  material's dry-run detail (textures found/missing, inferred metal
-  coverage, clamp outliers), and its post-conversion validation results.
+- **Center** — the **node graph** (below), which replaced the flat options
+  form: every conversion setting now lives on the node it belongs to.
 - **Right** — the shared preview viewport showing the *converted* result
-  live; hosts the reference NIF and the mask paint/fill tools.
+  live; hosts the reference NIF and the mask paint/fill tools. It also
+  renders the **native** source material (see *Native views*).
 - **Footer** — Dry Run, Convert Selected, Convert All, and **Open in
   Author**: the bridge into the normal authoring workspace for hand-polish
   beyond what conversion options express.
@@ -335,6 +472,167 @@ pre-flagged.
     spec clamping is the intended next tenant).
 - Converted materials run normal validation; the report includes its
   errors/warnings per file.
+
+### The conversion node graph
+
+The pipeline above is exposed as a node graph (`nodegraph.h` core,
+`converternodes.h` library) rather than a fixed sequence of options. The
+stock FO4/FO76 graphs reproduce the orchestrator's writes byte for byte;
+users rewire copies of them. `pbrm convert --graph <file.pbrgraph>` runs
+the same graph headlessly.
+
+Nodes follow Blender's body layout, top to bottom: **header → preview →
+outputs → settings → status → inputs**. Consequences worth knowing:
+
+- **Settings are edited in the node**, not only in the side inspector.
+  Drag a number to scrub it, click it to type, click a checkbox to toggle,
+  click an enum for its menu. A drag re-evaluates once on release, not per
+  mouse move.
+- **Box geometry lives in `NodeGraph::Metrics` / `nodeSize()`**, and
+  `layoutGraph()` reflows a graph into dependency columns from those
+  sizes. Anything that positions nodes must go through them — hard-coded
+  spacing is how stock graphs previously drew on top of each other. *Arrange
+  Nodes* in the canvas context menu re-runs the layout by hand.
+- **Every node reports its resolution**, and texture sources report the
+  compression too (`2048×2048 · BC7_UNORM_SRGB`), read from the DDS header
+  so it stays truthful while the preview evaluates downsampled.
+- **Under-resolution is flagged.** `EvalContext::materialMaxResolution` is
+  the largest authored texture in the material; any node whose *native*
+  resolution falls below it draws its status line red plus an amber warning.
+  Native resolution propagates from sources downstream and is independent of
+  the preview downsample, so previewing at 1024 does not flag the world.
+- **Upscale** (`image.upscale`) raises an under-sized map. Its target is
+  expressed against the *material's own* highest-resolution map — *Match
+  highest*, *2×*, *4×* — so one rule set once holds for a whole batch whatever
+  size each material is; *Fixed size* and *Off* override it, and the project
+  setting on the canvas toolbar drives every node left on *Project setting*.
+  Two engines behind one call (`upscaler.h`): **Real-ESRGAN** (ncnn/Vulkan) when
+  a binary is configured under `Upscaler/binaryPath`, and **Lanczos-3**
+  otherwise. It never fails — a missing binary or unusable model degrades to
+  Lanczos and says why in its status. Which model runs comes from the map's
+  **role** (below); *Auto* reads the role off the upstream port's label, which
+  is how a graph states what a map is without a second declaration, and the
+  node's Model setting overrides the standard for one map without changing it.
+
+#### Standard models per map role
+
+`Settings ▸ Upscaling ▸ Standard Models…` pins one model per role. Roles are
+deliberately finer than the handling classes behind them: **handling** decides
+whether blue is zeroed and rebuilt, **role** decides which network runs, and two
+roles sharing a handling class can still want different models.
+
+| Role | Handling | Why it is its own row |
+| --- | --- | --- |
+| Base Colour / Diffuse, Glow | picture | Photographic content; a photo-trained model is appropriate. |
+| **Reflectance (`_r`)** | picture | **The metal window is derived from this histogram.** A model that invents detail here changes what converts as *metal*, not merely how it looks — so it never inherits base colour's choice. |
+| Normal | RG0 in, Z rebuilt | Blue is dropped going in (the normal models are trained on RG0) and rebuilt from RG coming out. With no normal-trained model installed it declines outright and resamples: a photo model bends the vectors in ways `reconstructBlue` cannot undo. |
+
+**Normals do not come back as unit vectors, and must be made into them.**
+`4x-Normal-RG0-BC7` states it plainly — *"do not rely on this network producing
+unit vectors"* — and it is not alone. `reconstructBlue()` therefore does two
+things, not one: where XY is over-long it **rescales XY onto the unit circle**
+before solving for Z, rather than clamping Z to zero and shipping a normal
+longer than 1. Clamping alone looks like it works (no NaN, plausible image) and
+is a real shading error at every affected texel.
+
+Getting that model in is a **format** problem, not an architecture one. It is
+ESRGAN/RRDBNet, which is exactly what `realesrgan-ncnn-vulkan` runs — but
+OpenModelDB publishes `.pth`, and ncnn loads `.param`/`.bin`, so it needs
+converting (`.pth` → ONNX → ncnn) or a runner that reads PyTorch weights
+directly. Keep the file named with `normal`/`rg0` and its `4x`: the suggestion
+matcher and `modelNativeScale()` both read the name. One mismatch worth knowing:
+it is trained on **BC7** normals while FO76 ships **BC5**, so its artifact model
+is off-distribution — BC5 carries no blue at all, which suits RG0 input, but the
+compression it learned to undo is not the compression in front of it.
+| Specular/Gloss, Smoothness, AO, Subsurface, Other | data | Not pictures. They default to a *general-purpose* model, never a photographic or anime one. |
+
+Unpinned roles fall back to `suggestedModelForSlot()`, which matches by name
+against whatever is installed. That matching is pure string work and it has
+already been wrong once in a way that looked right — a "conservative" hint meant
+to steer data maps away from photographic models matched `Photo-Conservative-x4`
+and sent every data role to a photo model. `chooseModel()` is therefore exposed
+separately from the installed set so the ordering is tested against a fixture on
+machines with no upscaler at all.
+
+A pinned model that is missing from the current install falls back to the
+suggestion rather than invoking a network that is not there. Pinning *Lanczos*
+is a real choice and is stored as one, distinct from never having chosen.
+- **Levels** (`image.levels`) is the remap the FO76 inference is built on, and
+  the only node that draws the input distribution under its own handles — which
+  is the point, since these thresholds decide what counts as metal and picking
+  them blind against invisible data is how everything ended up grey. It takes a
+  **signed span**, so a descending signal needs no Invert. **Auto levels** is on
+  by default: it classifies the histogram and snaps the result to a 0.05 ladder,
+  deliberately coarse so two near-identical maps cannot resolve to 0.70 and 0.71
+  and convert differently. It preserves an inverted direction rather than
+  "correcting" it — the diffuse gate is deliberately inverted, and auto-levels
+  reasoning ascending once silently flipped it and converted steel at 0% metal.
+  See the calibration section above for where the numbers come from.
+- **Separate Channels** (`image.separate`) splits a texture into R/G/B/A in
+  one node; **Combine Channels** (`image.channelPack`) is its inverse.
+- **The graph runs between two whole-material nodes.** *Source Material
+  (Fallout 4)* / *Input Material (Fallout 76)* open a game material up;
+  **Output Material (PBR)** closes a converted one. There is one node of each per graph.
+  (*Source Material (Any Profile)* also exists, so graphs saved before the split
+  still load.)
+- **Source Material exposes the whole material**: one path output per texture
+  slot *that its own title uses*, plus emittance/specular colour and the
+  emittance/specular/smoothness scalars. Each refuses the other title's
+  material rather than handing downstream nodes textures that mean something
+  else. Drag a path onto a **Texture** node's Path input to load that slot, or a
+  colour onto **Solid Colour** for the slots a material states as a value rather
+  than a map (glow colour on an emissive with no glow map). Outputs that
+  evaluate empty — unauthored slots — draw dimmed.
+- **Output Material (PBR)** is the sink: everything ends there. Channels can arrive
+  packed (`RMAOS` straight from a conversion node) or individually
+  (`Roughness`/`Metallic`/`Ambient Occlusion`/`Specular F0`), and an individual
+  input always overrides the packed channel it belongs to — which is how the
+  derived detail AO lands in RMAOS.B and the derived curvature in Normal.A
+  without disturbing anything else. Feeding the whole source normal in makes
+  the old "normal B defaulted to white" class of bug structurally impossible,
+  and collapsed ten Extract/Combine nodes out of both stock graphs.
+- **Selecting either end shades a whole material**: a Source Material node
+  gives the untouched original in its native view, Output Material (PBR) gives the
+  converted result. Before and after, one click apart.
+- **Resolution levelling**: a Texture node's Resolution setting defaults to
+  *Material max*, so every map works at the material's largest size; *Native*
+  and *Custom* override it. **This changes conversion output** for materials
+  with mixed source resolutions — the batch orchestrator path does not level.
+
+Canvas navigation, since a stock graph is past twenty nodes and none of these
+are discoverable by looking:
+
+- **`K`** arms the knife; drag across wires to sever them, `Esc` or `K` to exit.
+  Wires go red before they are cut, so a stroke can be corrected mid-drag.
+- **`Ctrl+F`** finds a node by name — every match rings, `Enter` walks them.
+  **`F`** fits the graph, **`Shift+F`** frames just the selection.
+- **The minimap** in the bottom-right corner is clickable and draggable to jump.
+- Below the detail zoom threshold node bodies stop drawing their settings, and
+  titles switch to a **fixed screen size** so the overview stays readable
+  instead of becoming a wall of grey boxes. The zoom is reported bottom-left.
+- Selecting a node golds **both ends** of every wire touching it.
+- **Maths**: `math.op` (add/subtract/multiply/divide/power/min/max/abs/sqrt/
+  floor/ceil/round/modulo/greater/less, against a second texture or a
+  constant), `image.mix` (optionally mask-driven), `image.mapRange`.
+- **Colour space**: `color.srgbToLinear` / `color.linearToSrgb` use the exact
+  piecewise sRGB transfer from `convertercore`, not a 2.2 gamma approximation,
+  so they agree with the conversion math.
+- **Image File** loads your own DDS/PNG/TGA/JPG/BMP/TIFF.
+
+### Native views
+
+The preview can shade the **untouched source material in its own model**,
+selectable as render modes *Native FO4 (Specular/Gloss)* and *Native FO76
+(Reflectance)*. Put one on each half of the split view to judge a conversion
+directly against what it came from. Channel meanings match what the
+converter reads — FO4 `_s.R` specular strength / `_s.G` gloss; FO76 `_r.RGB`
+reflectance, `_l.R` smoothness, `_l.G` baked AO — and both are lit by the
+same key and environment as the PBR view, so only the material model differs.
+
+`--graph-shot <png> [--fo76]` and `--native-shot <material> <png>
+[--texture-root <dir>]` render the stock graph and the native views to a file
+without driving the workspace; they exist so layout and shading changes can be
+checked directly.
 
 ## Output naming, dedup, and the manifest
 

@@ -4,6 +4,7 @@
 #include "converternodes.h"
 #include "nodegraph.h"
 #include "normalderive.h"
+#include "upscaler.h"
 #include "geometryao.h"
 #include "maskpaint.h"
 #include "materialdocument.h"
@@ -229,9 +230,30 @@ int main(int argc, char* argv[])
                 QStringLiteral("disabling preview shadows disables their intensity field"));
             previewShadows->setChecked(true);
         }
+        // Both preview panels fold, from one code path. The defaults differ
+        // because the panels mean different things: in the author workspace
+        // these controls are the work, in the converter they are setup and the
+        // viewport is the verdict.
         auto* previewSettings = window.findChild<QGroupBox*>(QStringLiteral("PreviewSettings"));
-        check(previewSettings && !previewSettings->isCheckable(),
-            QStringLiteral("preview settings use a plain section heading instead of a checkbox-like disclosure"));
+        check(previewSettings && previewSettings->isCheckable() && previewSettings->isChecked(),
+            QStringLiteral("the author's preview settings fold away but start open"));
+        auto* converterSettings = window.findChild<QGroupBox*>(QStringLiteral("ConverterPreviewSettings"));
+        check(converterSettings && converterSettings->isCheckable() && !converterSettings->isChecked(),
+            QStringLiteral("the converter's preview settings fold away and start folded"));
+        check(converterSettings && converterSettings->maximumHeight() <= 26,
+            QStringLiteral("folding the converter's preview settings hands the height back to the viewport"));
+        // Folding one must not fold the other: they are separate widgets with
+        // separate persisted state, and a shared key would tie them together.
+        if (previewSettings && converterSettings) {
+            previewSettings->setChecked(false);
+            check(previewSettings->maximumHeight() <= 26 && !converterSettings->isChecked(),
+                QStringLiteral("folding the author panel leaves the converter panel alone"));
+            converterSettings->setChecked(true);
+            check(converterSettings->maximumHeight() > 26 && !previewSettings->isChecked(),
+                QStringLiteral("and unfolding the converter panel leaves the author panel alone"));
+            previewSettings->setChecked(true);
+            converterSettings->setChecked(false);
+        }
         auto* previewTabs = window.findChild<QTabWidget*>(QStringLiteral("PreviewSettingsTabs"));
         check(previewTabs && previewTabs->count() == 4
                 && previewTabs->tabText(0) == QStringLiteral("Scene")
@@ -1330,6 +1352,41 @@ int main(int argc, char* argv[])
             && std::abs(goldRmaos.redF() - (1.0 - 160.0 / 255.0)) < 0.02,
             QStringLiteral("FO76 RMAOS carries metallic, the shipped AO, and inverted smoothness"));
 
+        // Encoding: FO76 authors _r as BC1_UNORM_SRGB, so a dielectric sitting at
+        // linear F0 0.04 arrives as byte 56 (sRGB 0.22). Measured without
+        // decoding it reads 0.22 -- inside the 0.12-0.40 metal ramp and above the
+        // 0.08 F0 ceiling -- which is grey metalness on painted surfaces and a
+        // maxed-out F0 everywhere. Decoded it lands back at 0.04: fully
+        // dielectric, F0 mid-band. The diffuse here is near-black so the
+        // dark-diffuse gate passes and metallic is decided by reflectance alone.
+        QImage darkDiffuse(4, 4, QImage::Format_RGBA8888);
+        darkDiffuse.fill(QColor(3, 3, 3));
+        QImage dielectricRefl(4, 4, QImage::Format_RGBA8888);
+        dielectricRefl.fill(QColor(56, 56, 56)); // sRGB encoding of linear 0.04
+        Converter::Fo76Sources dielectricSources;
+        dielectricSources.diffuse = darkDiffuse;
+        dielectricSources.reflectance = dielectricRefl;
+        const Converter::ConvertedImages dielectricOut =
+            Converter::convertFo76(dielectricSources, fo76Material, options);
+        const QColor dielectricRmaos = dielectricOut.rmaos.pixelColor(2, 2);
+        check(dielectricRmaos.greenF() < 0.02,
+            QStringLiteral("FO76 a dielectric _r reads as non-metal, not grey (metallic %1)")
+                .arg(dielectricRmaos.greenF()));
+        check(std::abs(dielectricRmaos.alphaF() - 0.04) < 0.015,
+            QStringLiteral("FO76 dielectric F0 lands mid-band, not pinned at the 0.08 ceiling (%1)")
+                .arg(dielectricRmaos.alphaF()));
+
+        QImage metalRefl(4, 4, QImage::Format_RGBA8888);
+        metalRefl.fill(QColor(243, 243, 243)); // sRGB encoding of linear 0.90
+        Converter::Fo76Sources metalSources;
+        metalSources.diffuse = darkDiffuse;
+        metalSources.reflectance = metalRefl;
+        const Converter::ConvertedImages metalOut =
+            Converter::convertFo76(metalSources, fo76Material, options);
+        check(metalOut.rmaos.pixelColor(2, 2).greenF() > 0.98,
+            QStringLiteral("FO76 a bright _r still reads as fully metal once decoded (metallic %1)")
+                .arg(metalOut.rmaos.pixelColor(2, 2).greenF()));
+
         // Emissive rule: grayscale glow x material color, mask in alpha.
         QImage glow(2, 2, QImage::Format_RGBA8888);
         glow.fill(QColor(128, 128, 128));
@@ -1380,6 +1437,123 @@ int main(int argc, char* argv[])
         check(effectConverted.shaderMode() == Pbr::ShaderMode::UnlitEffect
             && std::abs(effectConverted.setting(QStringLiteral("Shading/Unlit"), QStringLiteral("intensity")).toDouble() - 6.0) < 1e-6,
             QStringLiteral("unlit BGEM maps its diffuse-as-emission scale to Unlit intensity"));
+
+        // FO76 translucency. Selecting the subsurface shader family is not
+        // enough: the authored scatter colour and transmissive scale have to
+        // land in the document, or the conversion picks a subsurface material
+        // and then ships it with default scattering.
+        const QString subsurfaceGroup = QStringLiteral("Shading/Subsurface");
+        Bgsm::Material thin;
+        thin.version = 20;
+        thin.translucency = true;
+        thin.translucencyThickObject = false;
+        thin.translucencyTransmissiveScale = 1.75f;
+        thin.translucencySubsurfaceColor = QVector3D(0.9f, 0.35f, 0.28f);
+        thin.translucencyTurbulence = 0.4f;
+        Pbr::MaterialDocument thinConverted;
+        QStringList thinUnhonored;
+        Converter::mapParameters(thin, &thinConverted, &thinUnhonored);
+        check(thinConverted.shaderMode() == Pbr::ShaderMode::AdvancedSubsurface
+                && thinConverted.setting(subsurfaceGroup, QStringLiteral("mode")).toString()
+                    == QStringLiteral("Thin Transmission"),
+            QStringLiteral("a thin FO76 translucency maps to Thin Transmission"));
+        check(std::abs(thinConverted.setting(subsurfaceGroup, QStringLiteral("transmission")).toDouble() - 1.75) < 1e-6,
+            QStringLiteral("the authored transmissive scale reaches the document"));
+        check(thinConverted.setting(subsurfaceGroup, QStringLiteral("profile")).toString() == QStringLiteral("Custom")
+                && QColor(thinConverted.setting(subsurfaceGroup, QStringLiteral("customScatterColor")).toString()).isValid(),
+            QStringLiteral("an authored subsurface colour becomes a Custom diffusion profile"));
+        check(thinUnhonored.join(QStringLiteral(";")).contains(QStringLiteral("Turbulence")),
+            QStringLiteral("turbulence has no equivalent and is recorded as unhonored"));
+
+        Bgsm::Material thick;
+        thick.version = 20;
+        thick.translucency = true;
+        thick.translucencyThickObject = true;
+        Pbr::MaterialDocument thickConverted;
+        Converter::mapParameters(thick, &thickConverted, nullptr);
+        check(thickConverted.setting(subsurfaceGroup, QStringLiteral("mode")).toString() == QStringLiteral("Combined"),
+            QStringLiteral("a thick FO76 translucency scatters through the volume too"));
+        check(thickConverted.setting(subsurfaceGroup, QStringLiteral("profile"), QStringLiteral("Skin")).toString()
+                == QStringLiteral("Skin"),
+            QStringLiteral("a default white subsurface colour leaves the stock profile alone"));
+
+        // FO4's rolloff normalises against its own default, so an untouched
+        // material lands on the editor's neutral weight.
+        Bgsm::Material fo4Sss;
+        fo4Sss.version = 2;
+        fo4Sss.subsurfaceLighting = true;
+        fo4Sss.subsurfaceLightingRolloff = 0.3f;
+        Pbr::MaterialDocument fo4SssConverted;
+        Converter::mapParameters(fo4Sss, &fo4SssConverted, nullptr);
+        check(fo4SssConverted.setting(subsurfaceGroup, QStringLiteral("mode")).toString()
+                    == QStringLiteral("Diffusion Profile")
+                && std::abs(fo4SssConverted.setting(subsurfaceGroup, QStringLiteral("weight")).toDouble() - 1.0) < 1e-6,
+            QStringLiteral("FO4 subsurface lighting maps to a diffusion profile at neutral weight"));
+
+        // FO76 packs a subsurface mask into _l.B and a glow mask into _l.A.
+        // The alpha half is only usable when the file really has alpha: many
+        // vanilla _l maps are BC1, whose alpha decodes to a constant 1.0, and
+        // reading that as a mask would make the entire surface emit.
+        {
+            const int size = 8;
+            QImage lighting(size, size, QImage::Format_RGBA8888);
+            for (int y = 0; y < size; ++y) {
+                uchar* line = lighting.scanLine(y);
+                for (int x = 0; x < size; ++x) {
+                    line[x * 4 + 0] = 160;                    // smoothness
+                    line[x * 4 + 1] = 220;                    // baked AO
+                    line[x * 4 + 2] = uchar(x * 255 / (size - 1)); // subsurface mask
+                    line[x * 4 + 3] = 255;                    // BC1-style constant alpha
+                }
+            }
+            QImage diffuse(size, size, QImage::Format_RGBA8888);
+            diffuse.fill(QColor(120, 100, 90, 255));
+
+            Converter::Fo76Sources sources;
+            sources.diffuse = diffuse;
+            sources.lighting = lighting;
+            Bgsm::Material scattering;
+            scattering.version = 20;
+            scattering.translucency = true;
+            scattering.emitEnabled = true; // emits, but the _l alpha is degenerate
+            const Converter::ConvertedImages scattered =
+                Converter::convertFo76(sources, scattering, Converter::Options{});
+            check(!scattered.subsurface.isNull()
+                    && qGray(scattered.subsurface.pixel(0, 0)) == 0
+                    && qGray(scattered.subsurface.pixel(size - 1, 0)) == 255,
+                QStringLiteral("_l.B becomes the subsurface mask"));
+            check(scattered.emissive.isNull(),
+                QStringLiteral("a constant _l alpha is not mistaken for a glow mask"));
+
+            // Give the alpha real variation and it becomes the glow mask.
+            for (int y = 0; y < size; ++y) {
+                uchar* line = lighting.scanLine(y);
+                for (int x = 0; x < size; ++x) line[x * 4 + 3] = uchar(x * 255 / (size - 1));
+            }
+            sources.lighting = lighting;
+            const Converter::ConvertedImages glowing =
+                Converter::convertFo76(sources, scattering, Converter::Options{});
+            check(!glowing.emissive.isNull()
+                    && qAlpha(glowing.emissive.pixel(0, 0)) == 0
+                    && qAlpha(glowing.emissive.pixel(size - 1, 0)) == 255,
+                QStringLiteral("a varying _l.A becomes the glow mask when no _g is authored"));
+
+            // A material that does not scatter gets no subsurface map at all.
+            Bgsm::Material plainFo76;
+            plainFo76.version = 20;
+            const Converter::ConvertedImages plainScatter =
+                Converter::convertFo76(sources, plainFo76, Converter::Options{});
+            check(plainScatter.subsurface.isNull(),
+                QStringLiteral("a non-scattering material gets no subsurface map"));
+        }
+
+        // A material with no subsurface data must not gain the group at all.
+        Bgsm::Material plain;
+        plain.version = 20;
+        Pbr::MaterialDocument plainConverted;
+        Converter::mapParameters(plain, &plainConverted, nullptr);
+        check(plainConverted.setting(subsurfaceGroup, QStringLiteral("mode"), QString()).toString().isEmpty(),
+            QStringLiteral("a material without subsurface data gets no subsurface settings"));
     }
 
     {
@@ -2000,35 +2174,795 @@ int main(int argc, char* argv[])
                 && restored.node(first) && restored.node(first)->typeId == QStringLiteral("image.invert"),
             QStringLiteral("graphs round-trip through JSON"));
 
+        // validate() ASSIGNS the error list, and check()'s two arguments are
+        // evaluated in an unspecified order — inlining the call meant the
+        // message was built from an empty list and a failure said nothing.
         QStringList graphErrors;
-        check(ConverterNodes::defaultFo4Graph().validate(registry, &graphErrors),
-            QStringLiteral("default FO4 graph validates: %1").arg(graphErrors.join(QStringLiteral("; "))));
-        check(ConverterNodes::defaultFo76Graph().validate(registry, &graphErrors),
-            QStringLiteral("default FO76 graph validates: %1").arg(graphErrors.join(QStringLiteral("; "))));
+        const bool fo4Valid = ConverterNodes::defaultFo4Graph().validate(registry, &graphErrors);
+        check(fo4Valid, QStringLiteral("default FO4 graph validates: %1").arg(graphErrors.join(QStringLiteral("; "))));
+        const bool fo76Valid = ConverterNodes::defaultFo76Graph().validate(registry, &graphErrors);
+        check(fo76Valid, QStringLiteral("default FO76 graph validates: %1").arg(graphErrors.join(QStringLiteral("; "))));
+
+        // Node boxes are sized from the spec plus the node's own fold state, and
+        // the stock layouts are built on that size. Hard-coded spacing is what
+        // previously let stock graphs draw on top of themselves.
+        {
+            const NodeGraph::NodeTypeSpec* texture = registry.find(QStringLiteral("source.texture"));
+            const NodeGraph::NodeTypeSpec* pack = registry.find(QStringLiteral("image.channelPack"));
+            check(texture && pack, QStringLiteral("sizing needs the stock node types"));
+            NodeGraph::Graph sizing;
+            const QString texId = sizing.addNode(QStringLiteral("source.texture"), *texture, QPointF(0, 0));
+            const QString packId = sizing.addNode(QStringLiteral("image.channelPack"), *pack, QPointF(400, 0));
+            const QSizeF textureSize = NodeGraph::nodeSize(*texture, *sizing.node(texId), sizing);
+            check(textureSize.height() > NodeGraph::Metrics::kThumbSize,
+                QStringLiteral("a node with a preview is taller than the preview itself"));
+            check(NodeGraph::nodeSize(*pack, *sizing.node(packId), sizing).height() > textureSize.height(),
+                QStringLiteral("more ports and settings make a taller node"));
+
+            for (const NodeGraph::Graph& stock :
+                    {ConverterNodes::defaultFo4Graph(), ConverterNodes::defaultFo76Graph()}) {
+                QVector<QRectF> boxes;
+                for (const NodeGraph::Node& node : stock.nodes) {
+                    const NodeGraph::NodeTypeSpec* spec = registry.find(node.typeId);
+                    if (spec) boxes.append(QRectF(node.position, NodeGraph::nodeSize(*spec, node, stock)));
+                }
+                bool overlaps = false;
+                for (int a = 0; a < boxes.size() && !overlaps; ++a)
+                    for (int b = a + 1; b < boxes.size() && !overlaps; ++b)
+                        overlaps = boxes[a].intersects(boxes[b]);
+                check(!overlaps && boxes.size() == stock.nodes.size(),
+                    QStringLiteral("no two nodes in a stock graph overlap"));
+            }
+
+            // Re-laying out a graph must not disturb what it computes.
+            NodeGraph::Graph scrambled = ConverterNodes::defaultFo4Graph();
+            const int connections = scrambled.connections.size();
+            for (NodeGraph::Node& node : scrambled.nodes) node.position = QPointF(0, 0);
+            NodeGraph::layoutGraph(scrambled, registry);
+            check(scrambled.connections.size() == connections,
+                QStringLiteral("arranging a graph preserves its wiring"));
+            QSet<QString> places;
+            for (const NodeGraph::Node& node : scrambled.nodes)
+                places.insert(QStringLiteral("%1/%2").arg(node.position.x()).arg(node.position.y()));
+            check(places.size() == scrambled.nodes.size(),
+                QStringLiteral("arranging separates nodes that shared a position"));
+        }
+
+        // Splitting channels and the placeholder upscaler.
+        {
+            const NodeGraph::NodeTypeSpec* separate = registry.find(QStringLiteral("image.separate"));
+            check(separate && separate->outputs.size() == 4,
+                QStringLiteral("Separate Channels exposes R, G, B and A"));
+            QImage source(4, 4, QImage::Format_RGBA8888);
+            source.fill(QColor(200, 120, 40, 90));
+            NodeGraph::EvalArgs args;
+            args.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(source));
+            NodeGraph::EvalOutput separated;
+            separate->evaluate(args, &separated);
+            check(qGray(separated.outputs.value(QStringLiteral("r")).image().pixel(0, 0)) == 200
+                    && qGray(separated.outputs.value(QStringLiteral("a")).image().pixel(0, 0)) == 90,
+                QStringLiteral("Separate Channels routes each channel to its own output"));
+
+            const NodeGraph::NodeTypeSpec* upscale = registry.find(QStringLiteral("image.upscale"));
+            check(upscale, QStringLiteral("the upscaler is registered"));
+            // Its own image at a real size: the node measures what it is handed,
+            // because the resolution carried down a wire is the material's
+            // largest map rather than this one's.
+            QImage halfRes(256, 256, QImage::Format_RGBA8888);
+            halfRes.fill(QColor(70, 90, 110, 255));
+            NodeGraph::EvalArgs up;
+            up.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(halfRes));
+            up.params = upscale->defaultParams();
+            // Mode 2 = Match highest. The default is now "Project setting",
+            // which defers to a policy that ships off, so an explicit mode is
+            // needed to ask for the raise this test is about.
+            up.params.insert(QStringLiteral("mode"), 2);
+            up.context.materialMaxResolution = 512;
+            up.context.previewMode = false;
+            NodeGraph::EvalOutput raised;
+            upscale->evaluate(up, &raised);
+            check(raised.nativeResolution == 512 && raised.error.isEmpty(),
+                QStringLiteral("the upscaler reports the material's resolution as its own"));
+            check(raised.outputs.value(QStringLiteral("image")).image().width() == 512,
+                QStringLiteral("the upscaler resamples by the resolution ratio"));
+
+            // Already at the ceiling: nothing to do, and it says so.
+            NodeGraph::EvalArgs same = up;
+            same.context.materialMaxResolution = 256;
+            NodeGraph::EvalOutput untouched;
+            upscale->evaluate(same, &untouched);
+            check(untouched.outputs.value(QStringLiteral("image")).image().size() == halfRes.size()
+                    && untouched.nativeResolution == 256,
+                QStringLiteral("an at-target image passes through the upscaler untouched"));
+        }
+
+        // Under-resolution is flagged against the material's own ceiling.
+        {
+            const NodeGraph::NodeTypeSpec* constant = registry.find(QStringLiteral("image.constant"));
+            check(constant, QStringLiteral("the constant node backs the resolution test"));
+            NodeGraph::Graph flagged;
+            const QString small = flagged.addNode(QStringLiteral("image.constant"), *constant, QPointF());
+            NodeGraph::EvalContext context;
+            context.materialMaxResolution = 4096;
+            NodeGraph::Evaluator resolutionEval(registry);
+            const NodeGraph::NodeResult result = resolutionEval.evaluate(flagged, context).value(small);
+            check(!result.warning.isEmpty() && result.warning.contains(QStringLiteral("4096")),
+                QStringLiteral("a node below the material's resolution is warned about: %1").arg(result.warning));
+            check(!result.status.isEmpty(),
+                QStringLiteral("every image node reports its size: %1").arg(result.status));
+
+            context.materialMaxResolution = 0; // unknown ceiling: nothing to flag
+            NodeGraph::Evaluator quietEval(registry);
+            check(quietEval.evaluate(flagged, context).value(small).warning.isEmpty(),
+                QStringLiteral("no ceiling means no under-resolution warning"));
+        }
 
         // The stock graphs must reproduce the orchestrator's writes, so every
-        // shipped channel needs an explicit route to an output node. The normal
-        // is the one that bit: leaving B unconnected let channelPack default it
-        // to white, and the written DDS stopped matching a batch run.
-        for (const NodeGraph::Graph& stock : {ConverterNodes::defaultFo4Graph(), ConverterNodes::defaultFo76Graph()}) {
-            QHash<int, QString> outputsByRole;
+        // shipped channel needs an explicit route into the terminal node. The
+        // normal is the one that bit historically: when the graph packed it
+        // channel by channel, leaving B unconnected defaulted it to white and
+        // the written DDS stopped matching a batch run. Feeding the whole
+        // source normal in makes that structurally impossible — this checks it
+        // stays that way, and that each title still routes its own AO.
+        const struct { const char* title; NodeGraph::Graph graph; bool derivesAo; } stockGraphs[] = {
+            {"FO4", ConverterNodes::defaultFo4Graph(), true},
+            {"FO76", ConverterNodes::defaultFo76Graph(), false}};
+        for (const auto& stock : stockGraphs) {
+            QStringList terminals;
+            for (const NodeGraph::Node& node : stock.graph.nodes)
+                if (node.typeId == QStringLiteral("output.pbrMaterial")) terminals.append(node.id);
+            check(terminals.size() == 1,
+                QStringLiteral("%1 stock graph ends in exactly one Output Material (PBR) node").arg(stock.title));
+
+            // The terminal now takes finished textures only; packing happens in
+            // Combine Maps (PBR), so the per-map guarantees are checked there and
+            // the terminal is checked for receiving the packed results.
+            QHash<QString, QString> intoTerminal;
+            for (const NodeGraph::Connection& connection : stock.graph.connectionsTo(terminals.value(0)))
+                intoTerminal.insert(connection.toPort, connection.fromNode);
+            check(intoTerminal.contains(QStringLiteral("baseColor"))
+                    && intoTerminal.contains(QStringLiteral("normal"))
+                    && intoTerminal.contains(QStringLiteral("rmaos"))
+                    && intoTerminal.contains(QStringLiteral("emissive")),
+                QStringLiteral("%1 routes every shipped texture into the terminal: %2")
+                    .arg(stock.title, intoTerminal.keys().join(QStringLiteral(","))));
+
+            QStringList combiners;
+            for (const NodeGraph::Node& node : stock.graph.nodes)
+                if (node.typeId == QStringLiteral("composite.pbrChannels")) combiners.append(node.id);
+            check(combiners.size() == 1,
+                QStringLiteral("%1 packs its channels in exactly one place").arg(stock.title));
+            // Everything the terminal receives must come from that one node —
+            // no side route that skips the packing rules.
+            check(std::all_of(intoTerminal.constBegin(), intoTerminal.constEnd(),
+                    [&combiners](const QString& from) { return from == combiners.value(0); }),
+                QStringLiteral("%1 feeds the terminal only from the combiner").arg(stock.title));
+
+            QHash<QString, QString> wiredFrom; // combiner input -> source node
+            for (const NodeGraph::Connection& connection : stock.graph.connectionsTo(combiners.value(0)))
+                wiredFrom.insert(connection.toPort, connection.fromNode);
+            check(wiredFrom.contains(QStringLiteral("baseColor"))
+                    && wiredFrom.contains(QStringLiteral("normal"))
+                    && wiredFrom.contains(QStringLiteral("curvature"))
+                    && wiredFrom.contains(QStringLiteral("emissive")),
+                QStringLiteral("%1 routes every shipped map into the combiner: %2")
+                    .arg(stock.title, wiredFrom.keys().join(QStringLiteral(","))));
+
+            // Where a graph has an unpack node, it must be the ONLY reader of
+            // the source textures. Anything else reaching past it would be
+            // working on packed data while claiming to work on single maps,
+            // which is the confusion these nodes exist to remove.
+            QStringList unpackers;
+            for (const NodeGraph::Node& node : stock.graph.nodes)
+                if (node.typeId.startsWith(QStringLiteral("unpack."))) unpackers.append(node.id);
+            if (!unpackers.isEmpty()) {
+                bool onlyUnpackReadsTextures = true;
+                for (const NodeGraph::Connection& connection : stock.graph.connections) {
+                    const NodeGraph::Node* from = stock.graph.node(connection.fromNode);
+                    if (!from || from->typeId != QStringLiteral("source.texture")) continue;
+                    if (!unpackers.contains(connection.toNode)) onlyUnpackReadsTextures = false;
+                }
+                check(onlyUnpackReadsTextures,
+                    QStringLiteral("%1 routes every source texture through the unpack node first")
+                        .arg(stock.title));
+
+                // And the normal still arrives WHOLE rather than reassembled
+                // from channels. It may pass through nodes that preserve it
+                // intact — resolution levelling sits on this path — so walk
+                // back through those and check where the map originates.
+                QString normalOrigin = wiredFrom.value(QStringLiteral("normal"));
+                for (int hop = 0; hop < 4; ++hop) {
+                    const NodeGraph::Node* at = stock.graph.node(normalOrigin);
+                    if (!at || at->typeId != QStringLiteral("image.upscale")) break;
+                    QString feeding;
+                    for (const NodeGraph::Connection& link : stock.graph.connections)
+                        if (link.toNode == normalOrigin) feeding = link.fromNode;
+                    if (feeding.isEmpty()) break;
+                    normalOrigin = feeding;
+                }
+                const NodeGraph::Node* normalSource = stock.graph.node(normalOrigin);
+                check(normalSource && normalSource->typeId.startsWith(QStringLiteral("unpack.")),
+                    QStringLiteral("%1 takes the shipped normal from the unpack node, whole")
+                        .arg(stock.title));
+            } else {
+                // No unpack node yet: the normal must come straight off the
+                // source material, which loads it, never from a reassembly.
+                const NodeGraph::Node* normalSource = stock.graph.node(wiredFrom.value(QStringLiteral("normal")));
+                check(normalSource && normalSource->typeId.startsWith(QStringLiteral("source.material")),
+                    QStringLiteral("%1 feeds the shipped normal straight from the source material").arg(stock.title));
+            }
+
+            // FO4 substitutes derived detail AO; FO76 keeps its baked _l.G. Both
+            // now wire the AO port — what differs is where it comes from.
+            const NodeGraph::Node* aoSource = stock.graph.node(wiredFrom.value(QStringLiteral("ao")));
+            check(aoSource && (aoSource->typeId == QStringLiteral("derive.normal")) == stock.derivesAo,
+                QStringLiteral("%1 takes AO from %2")
+                    .arg(stock.title, stock.derivesAo ? QStringLiteral("the derivation")
+                                                      : QStringLiteral("the shipped _l.G")));
+        }
+
+        // Emittance off: the source node must hand downstream nothing to build
+        // an emissive from — not the colour, and not the glow map either.
+        // Suppressing only the colour is not enough, because Solid Color falls
+        // back to its own param and would emit the glow at full strength.
+        {
+            const NodeGraph::NodeTypeSpec* fo76Source = registry.find(QStringLiteral("source.material.fo76"));
+            check(fo76Source && fo76Source->output(QStringLiteral("emitColor")),
+                QStringLiteral("the source node still declares an emittance colour port"));
+            // The port has to stay declared even when it emits nothing, or a
+            // saved graph wired to it would fail to load rather than go dark.
+            check(fo76Source->output(QStringLiteral("glow")),
+                QStringLiteral("the source node still declares a glow port"));
+        }
+
+        // Each title's source node refuses the other title's material rather
+        // than handing downstream nodes textures that mean something else.
+        {
+            const NodeGraph::NodeTypeSpec* fo4Source = registry.find(QStringLiteral("source.material.fo4"));
+            const NodeGraph::NodeTypeSpec* fo76Source = registry.find(QStringLiteral("source.material.fo76"));
+            check(fo4Source && fo76Source, QStringLiteral("both profile source nodes are registered"));
+            check(fo4Source->name == QStringLiteral("Input Material (Fallout 4)")
+                    && fo76Source->name == QStringLiteral("Input Material (Fallout 76)"),
+                QStringLiteral("the profile source nodes are named per title"));
+            // FO4 has no reflectance/lighting ports; FO76 has no smooth/spec.
+            check(!fo4Source->output(QStringLiteral("reflectance"))
+                    && !fo4Source->output(QStringLiteral("lighting"))
+                    && fo4Source->output(QStringLiteral("smoothSpec")),
+                QStringLiteral("the FO4 source exposes only Fallout 4 slots"));
+            check(fo76Source->output(QStringLiteral("reflectance"))
+                    && fo76Source->output(QStringLiteral("lighting"))
+                    && !fo76Source->output(QStringLiteral("smoothSpec")),
+                QStringLiteral("the FO76 source exposes only Fallout 76 slots"));
+        }
+
+        // Combine Maps (PBR) is the only place channels get packed, and each named
+        // input has to land in its own slot and nowhere else.
+        {
+            const NodeGraph::NodeTypeSpec* terminal = registry.find(QStringLiteral("output.pbrMaterial"));
+            const NodeGraph::NodeTypeSpec* combiner = registry.find(QStringLiteral("composite.pbrChannels"));
+            check(terminal && combiner,
+                QStringLiteral("the Output Material (PBR) and Combine Maps (PBR) nodes are registered"));
+            // The terminal must not offer a second way in for any channel.
+            check(!terminal->input(QStringLiteral("roughness")) && !terminal->input(QStringLiteral("metallic"))
+                    && !terminal->input(QStringLiteral("ao")) && !terminal->input(QStringLiteral("specular"))
+                    && !terminal->input(QStringLiteral("curvature")) && !terminal->input(QStringLiteral("height"))
+                    && !terminal->input(QStringLiteral("opacity")),
+                QStringLiteral("the terminal takes finished textures only"));
+
+            QImage sourceNormal(4, 4, QImage::Format_RGBA8888);
+            sourceNormal.fill(QColor(128, 128, 255, 255));
+            const auto flat = [](int value) {
+                QImage image(4, 4, QImage::Format_RGBA8888);
+                image.fill(QColor(value, value, value, 255));
+                return image;
+            };
+
+            NodeGraph::EvalArgs args;
+            args.inputs.insert(QStringLiteral("baseColor"), NodeGraph::Value::fromImage(flat(10)));
+            args.inputs.insert(QStringLiteral("roughness"), NodeGraph::Value::fromImage(flat(40)));
+            args.inputs.insert(QStringLiteral("metallic"), NodeGraph::Value::fromImage(flat(50)));
+            args.inputs.insert(QStringLiteral("ao"), NodeGraph::Value::fromImage(flat(200)));
+            args.inputs.insert(QStringLiteral("specular"), NodeGraph::Value::fromImage(flat(70)));
+            args.inputs.insert(QStringLiteral("normal"), NodeGraph::Value::fromImage(sourceNormal));
+            args.inputs.insert(QStringLiteral("curvature"), NodeGraph::Value::fromImage(flat(200)));
+            args.params = combiner->defaultParams();
+            NodeGraph::EvalOutput assembled;
+            combiner->evaluate(args, &assembled);
+
+            const QColor rmaos = assembled.outputs.value(QStringLiteral("rmaos")).image().pixelColor(0, 0);
+            check(rmaos.red() == 40 && rmaos.green() == 50 && rmaos.blue() == 200 && rmaos.alpha() == 70,
+                QStringLiteral("each named map lands in its own RMAOS slot: %1,%2,%3,%4")
+                    .arg(rmaos.red()).arg(rmaos.green()).arg(rmaos.blue()).arg(rmaos.alpha()));
+            const QColor shipped = assembled.outputs.value(QStringLiteral("normal")).image().pixelColor(0, 0);
+            check(shipped.red() == 128 && shipped.green() == 128 && shipped.blue() == 255 && shipped.alpha() == 200,
+                QStringLiteral("curvature lands in Normal.A and leaves RGB alone: %1,%2,%3,%4")
+                    .arg(shipped.red()).arg(shipped.green()).arg(shipped.blue()).arg(shipped.alpha()));
+        }
+
+        // Auto levels. The property that matters is CONSISTENCY: two maps that
+        // look alike must get the same clamps, or the same physical surface
+        // converts differently in two materials and the whole inference stops
+        // meaning anything. So it classifies and snaps rather than fitting.
+        {
+            const NodeGraph::NodeTypeSpec* levels = registry.find(QStringLiteral("image.levels"));
+            const auto autoLevels = [&](int low, int high) {
+                // A two-population map: a floor, and a brighter tail above it.
+                QImage image(64, 64, QImage::Format_RGBA8888);
+                image.fill(QColor(low, low, low, 255));
+                for (int y = 0; y < 12; ++y)
+                    for (int x = 0; x < 64; ++x) image.setPixelColor(x, y, QColor(high, high, high, 255));
+                NodeGraph::EvalArgs args;
+                args.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(image));
+                args.params = levels->defaultParams();
+                args.params.insert(QStringLiteral("autoLevels"), true);
+                NodeGraph::EvalOutput out;
+                levels->evaluate(args, &out);
+                return out;
+            };
+
+            const NodeGraph::EvalOutput fitted = autoLevels(56, 180);
+            check(fitted.resolvedLevels.size() == 2,
+                QStringLiteral("auto levels publishes what it resolved, so the handles can draw it"));
+            // Snapped to the 0.05 ladder, not to the raw percentiles.
+            const auto onLadder = [](float value) {
+                return std::abs(value / 0.05f - std::round(value / 0.05f)) < 1e-4f;
+            };
+            check(fitted.resolvedLevels.size() == 2 && onLadder(fitted.resolvedLevels.at(0))
+                    && onLadder(fitted.resolvedLevels.at(1)),
+                QStringLiteral("and lands both points on the ladder: %1 / %2")
+                    .arg(fitted.resolvedLevels.value(0)).arg(fitted.resolvedLevels.value(1)));
+
+            // The consistency guarantee: a map whose distribution differs only
+            // slightly — one texel brighter, a hair more tail — must not get a
+            // different window, or a 512 and a 1024 copy of one surface diverge.
+            const NodeGraph::EvalOutput nudged = autoLevels(57, 178);
+            check(fitted.resolvedLevels == nudged.resolvedLevels,
+                QStringLiteral("two near-identical maps snap to the SAME clamps: %1/%2 vs %3/%4")
+                    .arg(fitted.resolvedLevels.value(0)).arg(fitted.resolvedLevels.value(1))
+                    .arg(nudged.resolvedLevels.value(0)).arg(nudged.resolvedLevels.value(1)));
+
+            // A flat map has no metal population to separate, so every one of
+            // them gets the same fixed answer rather than a fitted window.
+            QImage flat(32, 32, QImage::Format_RGBA8888);
+            flat.fill(QColor(56, 56, 56, 255));
+            NodeGraph::EvalArgs flatArgs;
+            flatArgs.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(flat));
+            flatArgs.params = levels->defaultParams();
+            flatArgs.params.insert(QStringLiteral("autoLevels"), true);
+            NodeGraph::EvalOutput flatOut;
+            levels->evaluate(flatArgs, &flatOut);
+            check(flatOut.resolvedLevels.size() == 2
+                    && qFuzzyCompare(flatOut.resolvedLevels.at(0), 0.25f)
+                    && qFuzzyCompare(flatOut.resolvedLevels.at(1), 0.70f),
+                QStringLiteral("a flat map falls back to the stock 0.25/0.70, identically every time"));
+            check(flatOut.status.contains(QStringLiteral("no metal")),
+                QStringLiteral("and says why: \"%1\"").arg(flatOut.status));
+
+            // A node wired inBlack ABOVE inWhite is inverted deliberately — the
+            // diffuse gate means "darker is more metal". Autodetect reasons in
+            // ascending terms, and handing that gate an ascending pair reverses
+            // its meaning silently: bright albedo starts counting as metal and
+            // the mask collapses. Caught in the wild — steel converted at 0%
+            // metal the moment auto levels was switched on by default.
+            QImage twoTone(64, 64, QImage::Format_RGBA8888);
+            twoTone.fill(QColor(40, 40, 40, 255));
+            for (int y = 0; y < 20; ++y)
+                for (int x = 0; x < 64; ++x) twoTone.setPixelColor(x, y, QColor(160, 160, 160, 255));
+            NodeGraph::EvalArgs invArgs;
+            invArgs.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(twoTone));
+            invArgs.params = levels->defaultParams();
+            invArgs.params.insert(QStringLiteral("inBlack"), 0.20); // above inWhite: inverted
+            invArgs.params.insert(QStringLiteral("inWhite"), 0.11);
+            NodeGraph::EvalOutput invOut;
+            levels->evaluate(invArgs, &invOut);
+            check(invOut.resolvedLevels.size() == 2
+                    && invOut.resolvedLevels.at(0) > invOut.resolvedLevels.at(1),
+                QStringLiteral("auto levels keeps an inverted node inverted: %1 / %2")
+                    .arg(invOut.resolvedLevels.value(0)).arg(invOut.resolvedLevels.value(1)));
+            // And an ascending node stays ascending.
+            check(fitted.resolvedLevels.at(0) < fitted.resolvedLevels.at(1),
+                QStringLiteral("and an ascending one ascending"));
+
+            // On by default. A single stored pair cannot fit every map — one
+            // graph is shared by every material of a profile — so the node
+            // deciding per material IS the intended behaviour, and the stored
+            // 0.25/0.70 becomes the fallback for the flat-dielectric case.
+            check(levels->param(QStringLiteral("autoLevels"))
+                    && levels->param(QStringLiteral("autoLevels"))->defaultValue.toBool(),
+                QStringLiteral("auto levels ships on"));
+        }
+
+        // Upscaling an under-sized map. The engine has to hold two properties
+        // whatever backend runs: a resample that does not shift the image, and
+        // a normal that comes back a unit vector — a model trained on pictures
+        // will happily return a blue channel that is not sqrt(1-x²-y²).
+        {
+            QImage flatNormal(8, 8, QImage::Format_RGBA8888);
+            flatNormal.fill(QColor(128, 128, 255, 255));
+            const QImage zeroed = Upscaler::zeroBlue(flatNormal);
+            check(zeroed.pixelColor(3, 3).blue() == 0 && zeroed.pixelColor(3, 3).red() == 128,
+                QStringLiteral("a normal goes into the model as RG0, leaving RG alone"));
+            const QImage rebuilt = Upscaler::reconstructBlue(zeroed);
+            check(std::abs(rebuilt.pixelColor(3, 3).blue() - 255) <= 1,
+                QStringLiteral("and comes back a unit vector: flat normal Z = %1")
+                    .arg(rebuilt.pixelColor(3, 3).blue()));
+            // A tilted normal has to rebuild to the RIGHT Z, not just a high
+            // one — this is the check that catches a sign or scale slip.
+            QImage tilted(4, 4, QImage::Format_RGBA8888);
+            tilted.fill(QColor(200, 128, 0, 255)); // x = +0.568, y = 0
+            const int expected = int(std::lround((std::sqrt(std::max(0.0,
+                1.0 - std::pow(200 / 127.5 - 1.0, 2.0))) + 1.0) * 127.5));
+            check(std::abs(Upscaler::reconstructBlue(tilted).pixelColor(1, 1).blue() - expected) <= 1,
+                QStringLiteral("a tilted normal rebuilds to its own Z, expected %1").arg(expected));
+
+            // An over-long XY, which is what the normal-trained models warn
+            // they can return ("do not rely on this network producing unit
+            // vectors"). Clamping Z to zero and leaving XY alone would keep a
+            // non-unit normal and ship a shading error, so XY is rescaled onto
+            // the unit circle instead.
+            QImage overshoot(4, 4, QImage::Format_RGBA8888);
+            overshoot.fill(QColor(243, 243, 0, 255)); // x = y = +0.906, |xy| = 1.28
+            const QColor fixed = Upscaler::reconstructBlue(overshoot).pixelColor(1, 1);
+            const double fx = fixed.red() / 127.5 - 1.0;
+            const double fy = fixed.green() / 127.5 - 1.0;
+            const double fz = fixed.blue() / 127.5 - 1.0;
+            const double length = std::sqrt(fx * fx + fy * fy + fz * fz);
+            check(std::abs(length - 1.0) < 0.02,
+                QStringLiteral("an over-long normal is renormalised, not just clamped (|n| = %1)")
+                    .arg(length, 0, 'f', 3));
+            // Rescaling must not swing the direction: equal X and Y in, equal
+            // X and Y out.
+            check(std::abs(fx - fy) < 0.02 && fx > 0.6,
+                QStringLiteral("and keeps its direction while doing so (x %1, y %2)")
+                    .arg(fx, 0, 'f', 3).arg(fy, 0, 'f', 3));
+
+            // Lanczos on flat input must stay flat: ringing shows up here first,
+            // and a filter that shifts would move the whole texture half a texel.
+            QImage flat(16, 16, QImage::Format_RGBA8888);
+            flat.fill(QColor(90, 140, 200, 255));
+            const QImage enlarged = Upscaler::lanczos(flat, QSize(32, 32));
+            check(enlarged.size() == QSize(32, 32)
+                    && enlarged.pixelColor(16, 16) == QColor(90, 140, 200, 255)
+                    && enlarged.pixelColor(0, 0) == QColor(90, 140, 200, 255),
+                QStringLiteral("Lanczos enlarges flat colour without ringing or shift"));
+
+            // With no upscaler configured the request still has to return a
+            // usable image at the requested size — the node must never have to
+            // care whether a model was available.
+            Upscaler::Request request;
+            request.image = flat;
+            request.kind = Upscaler::MapKind::Data;
+            request.factor = 2;
+            const Upscaler::Result produced = Upscaler::upscale(request);
+            check(produced.image.size() == QSize(32, 32) && !produced.engine.isEmpty(),
+                QStringLiteral("an upscale always returns the asked-for size, engine \"%1\"")
+                    .arg(produced.engine));
+            check(Upscaler::defaultModel(Upscaler::MapKind::Data).isEmpty(),
+                QStringLiteral("and a data map never gets a neural model"));
+        }
+
+        // The Upscale node reads the conversion-wide policy when left on
+        // "Project setting", and expresses its target against the material's
+        // own highest map so one rule covers a batch of mixed resolutions.
+        {
+            const NodeGraph::NodeTypeSpec* upscale = registry.find(QStringLiteral("image.upscale"));
+            check(upscale && upscale->param(QStringLiteral("mode"))
+                    && upscale->param(QStringLiteral("mode"))->enumLabels.size() == 6,
+                QStringLiteral("Upscale offers project/off/match/2x/4x/fixed"));
+            // A real 512 map, not a small stand-in claiming to be one: the node
+            // measures the image it was handed, because the resolution reported
+            // down a wire is the material's largest map, not this one's.
+            QImage small(512, 512, QImage::Format_RGBA8888);
+            small.fill(QColor(120, 120, 120, 255));
+            const auto run = [&](int policy, int mode, int materialMax) {
+                NodeGraph::EvalArgs args;
+                args.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(small));
+                args.inputNative.insert(QStringLiteral("image"), 512);
+                args.params = upscale->defaultParams();
+                args.params.insert(QStringLiteral("mode"), mode);
+                args.context.previewMode = false;
+                args.context.materialMaxResolution = materialMax;
+                args.context.upscalePolicy = policy;
+                NodeGraph::EvalOutput out;
+                upscale->evaluate(args, &out);
+                return out;
+            };
+            // 512 map in a 1024 material: off does nothing, match doubles it,
+            // and 2x-highest goes to 2048.
+            check(run(0, 0, 1024).nativeResolution == 512,
+                QStringLiteral("policy off leaves an under-sized map alone"));
+            check(run(1, 0, 1024).nativeResolution == 1024,
+                QStringLiteral("policy match raises 512 to the material's 1024"));
+            check(run(2, 0, 1024).nativeResolution == 2048,
+                QStringLiteral("policy 2x targets twice the highest map"));
+            check(run(3, 0, 1024).nativeResolution == 4096,
+                QStringLiteral("policy 4x targets four times it"));
+            // A per-node override beats the policy in both directions.
+            check(run(3, 1, 1024).nativeResolution == 512,
+                QStringLiteral("a node set to Off ignores a 4x policy"));
+            check(run(0, 2, 1024).nativeResolution == 1024,
+                QStringLiteral("and a node set to Match ignores an off policy"));
+            // Already at the material's best: nothing to do, and it says so
+            // rather than resampling for no reason.
+            const NodeGraph::EvalOutput level = run(1, 0, 512);
+            check(level.nativeResolution == 512 && level.status.contains(QStringLiteral("already")),
+                QStringLiteral("a map already at the material max is passed through: \"%1\"")
+                    .arg(level.status));
+        }
+
+        // Nodes that stand for a whole material rather than one map: the two
+        // ends of the graph plus the Separate/Combine pair. Selecting any of
+        // them shades a material and offers its maps one at a time, so none of
+        // them may draw the R/G/B/A strip that isolates a single image.
+        {
+            struct MaterialNode { const char* id; const char* side; };
+            static const MaterialNode materialNodes[] = {
+                {"source.material.fo4", "source"}, {"source.material.fo76", "source"},
+                {"unpack.fo4", "source"}, {"unpack.fo76", "source"},
+                {"composite.pbrChannels", "output"}, {"output.pbrMaterial", "output"}};
+            NodeGraph::Node probe;
+            probe.showPreview = true;
+            for (const MaterialNode& entry : materialNodes) {
+                const NodeGraph::NodeTypeSpec* spec = registry.find(QLatin1String(entry.id));
+                if (!spec) { check(false, QStringLiteral("%1 is registered").arg(QLatin1String(entry.id))); continue; }
+                check(spec->materialPreview == QLatin1String(entry.side),
+                    QStringLiteral("%1 previews the %2 material: \"%3\"")
+                        .arg(QLatin1String(entry.id), QLatin1String(entry.side), spec->materialPreview));
+                check(!NodeGraph::nodeShowsChannelStrip(*spec, probe),
+                    QStringLiteral("%1 draws no R/G/B/A strip").arg(QLatin1String(entry.id)));
+                // The terminal ends the graph and so keeps no outputs at all;
+                // what it holds is what arrives, and the preview reads that off
+                // its inputs. Every other material node still publishes maps.
+                const bool terminal = spec->outputs.isEmpty();
+                int maps = 0;
+                for (const NodeGraph::PortSpec& port : terminal ? spec->inputs : spec->outputs)
+                    if (port.type == NodeGraph::ValueType::Image) ++maps;
+                check(maps > 1, QStringLiteral("%1 offers %2 maps to preview separately, from its %3")
+                    .arg(QLatin1String(entry.id)).arg(maps)
+                    .arg(terminal ? QStringLiteral("inputs") : QStringLiteral("outputs")));
+            }
+            // Nothing may hang off the end of the graph.
+            const NodeGraph::NodeTypeSpec* sink = registry.find(QStringLiteral("output.pbrMaterial"));
+            check(sink && sink->outputs.isEmpty(),
+                QStringLiteral("Output Material (PBR) has no outputs — it is where a material stops"));
+            // Separating FO76 must reach every map the shader needs, or the
+            // picker cannot offer them however the graph is wired downstream.
+            const NodeGraph::NodeTypeSpec* unpack76 = registry.find(QStringLiteral("unpack.fo76"));
+            check(unpack76 && unpack76->output(QStringLiteral("diffuse")) && unpack76->output(QStringLiteral("normal"))
+                    && unpack76->output(QStringLiteral("reflectance")) && unpack76->output(QStringLiteral("smoothness"))
+                    && unpack76->output(QStringLiteral("ao")) && unpack76->output(QStringLiteral("opacity"))
+                    && unpack76->output(QStringLiteral("subsurface")) && unpack76->output(QStringLiteral("glowMask")),
+                QStringLiteral("Separate Maps (Fallout 76) exposes every source map individually"));
+        }
+
+        // The packed textures declare what lives in each channel, so the preview
+        // can offer roughness on its own. The declaration has to match what the
+        // packer actually wrote, or the picker shows the wrong map under the
+        // right name — the one failure mode nothing else here would catch.
+        {
+            const NodeGraph::NodeTypeSpec* combiner = registry.find(QStringLiteral("composite.pbrChannels"));
+            const NodeGraph::NodeTypeSpec* terminal = registry.find(QStringLiteral("output.pbrMaterial"));
+            const auto channelsOf = [](const NodeGraph::NodeTypeSpec* spec, const char* portId) {
+                const NodeGraph::PortSpec* port = spec ? spec->output(QLatin1String(portId)) : nullptr;
+                return port ? port->channelMaps : QVector<NodeGraph::ChannelMap>{};
+            };
+            // The terminal declares the layout on its INPUTS, being where the
+            // packed textures arrive rather than where they are produced.
+            const auto arrivingAt = [](const NodeGraph::NodeTypeSpec* spec, const char* portId) {
+                const NodeGraph::PortSpec* port = spec ? spec->input(QLatin1String(portId)) : nullptr;
+                return port ? port->channelMaps : QVector<NodeGraph::ChannelMap>{};
+            };
+            check(channelsOf(combiner, "rmaos").size() == 4 && channelsOf(combiner, "normal").size() == 3
+                    && channelsOf(combiner, "baseColor").size() == 2,
+                QStringLiteral("the three packed textures declare the maps inside them"));
+            check(channelsOf(combiner, "rmaos") == arrivingAt(terminal, "rmaos")
+                    && channelsOf(combiner, "normal") == arrivingAt(terminal, "normal")
+                    && channelsOf(combiner, "baseColor") == arrivingAt(terminal, "baseColor"),
+                QStringLiteral("what Combine packs and what the terminal receives are the same layout"));
+
+            // Pack four distinguishable values, then pull each declared map back
+            // out the way the preview does and check it is the one named.
+            const auto flat = [](int value) {
+                QImage image(4, 4, QImage::Format_RGBA8888);
+                image.fill(QColor(value, value, value, 255));
+                return image;
+            };
+            NodeGraph::EvalArgs args;
+            args.inputs.insert(QStringLiteral("baseColor"), NodeGraph::Value::fromImage(flat(10)));
+            args.inputs.insert(QStringLiteral("roughness"), NodeGraph::Value::fromImage(flat(41)));
+            args.inputs.insert(QStringLiteral("metallic"), NodeGraph::Value::fromImage(flat(52)));
+            args.inputs.insert(QStringLiteral("ao"), NodeGraph::Value::fromImage(flat(203)));
+            args.inputs.insert(QStringLiteral("specular"), NodeGraph::Value::fromImage(flat(74)));
+            args.params = combiner->defaultParams();
+            NodeGraph::EvalOutput packed;
+            combiner->evaluate(args, &packed);
+            const QImage rmaos = packed.outputs.value(QStringLiteral("rmaos")).image();
+
+            struct Expected { const char* label; int value; };
+            static const Expected wanted[] = {{"Roughness", 41}, {"Metallic", 52},
+                {"Ambient Occlusion", 203}, {"Specular F0", 74}};
+            for (const NodeGraph::ChannelMap& map : channelsOf(combiner, "rmaos")) {
+                const QColor texel = NodeGraph::applyChannelMask(rmaos, map.mask).pixelColor(0, 0);
+                int expected = -1;
+                for (const Expected& candidate : wanted)
+                    if (map.label == QLatin1String(candidate.label)) expected = candidate.value;
+                check(expected >= 0 && texel.red() == expected && texel.red() == texel.green()
+                        && texel.green() == texel.blue(),
+                    QStringLiteral("isolating \"%1\" gives grey %2, expected %3")
+                        .arg(map.label).arg(texel.red()).arg(expected));
+            }
+            // Opacity is the base colour's alpha, not one of its colour channels.
+            const QImage base = packed.outputs.value(QStringLiteral("baseColor")).image();
+            for (const NodeGraph::ChannelMap& map : channelsOf(combiner, "baseColor"))
+                if (map.label == QStringLiteral("Base Color"))
+                    check(NodeGraph::applyChannelMask(base, map.mask).pixelColor(0, 0).alpha() == 255,
+                        QStringLiteral("the base colour view drops opacity rather than keying on it"));
+
+            // Specular F0 stays at the dielectric constant when nothing is
+            // wired to it. It used to default to full, which would have shipped
+            // a mirror finish on every material that left the slot alone. Its
+            // own evaluation, since the pack above deliberately supplies one.
+            NodeGraph::EvalArgs bare = args;
+            bare.inputs.remove(QStringLiteral("specular"));
+            NodeGraph::EvalOutput noSpecular;
+            combiner->evaluate(bare, &noSpecular);
+            const QColor unwired = noSpecular.outputs.value(QStringLiteral("rmaos")).image().pixelColor(0, 0);
+            check(unwired.alpha() == 10,
+                QStringLiteral("an unwired Specular F0 packs the 0.04 dielectric constant, got %1")
+                    .arg(unwired.alpha()));
+        }
+
+        // The stock FO76 conversion does not derive specular per texel: _r is a
+        // reflectance colour, and pushing its luma through the 0.02-0.08 band
+        // varied F0 across surfaces that physically have none to vary.
+        {
+            const NodeGraph::Graph stock = ConverterNodes::defaultFo76Graph();
+            QString packer;
             for (const NodeGraph::Node& node : stock.nodes)
-                if (node.typeId == QStringLiteral("output.texture"))
-                    outputsByRole.insert(node.params.value(QStringLiteral("role")).toInt(), node.id);
-            check(outputsByRole.size() == 4, QStringLiteral("stock graph declares all four output roles"));
-            QString packId;
-            for (const NodeGraph::Connection& connection : stock.connectionsTo(outputsByRole.value(1)))
-                packId = connection.fromNode;
-            const NodeGraph::Node* pack = stock.node(packId);
-            check(pack && pack->typeId == QStringLiteral("image.channelPack"),
-                QStringLiteral("the shipped normal is assembled by a channel pack"));
-            QStringList packedPorts;
-            for (const NodeGraph::Connection& connection : stock.connectionsTo(packId))
-                packedPorts.append(connection.toPort);
-            check(packedPorts.contains(QStringLiteral("r")) && packedPorts.contains(QStringLiteral("g"))
-                    && packedPorts.contains(QStringLiteral("b")) && packedPorts.contains(QStringLiteral("a")),
-                QStringLiteral("the normal pack routes every channel including B: %1")
-                    .arg(packedPorts.join(QStringLiteral(","))));
+                if (node.typeId == QStringLiteral("composite.pbrChannels")) packer = node.id;
+            const bool specularWired = std::any_of(stock.connections.cbegin(), stock.connections.cend(),
+                [&packer](const NodeGraph::Connection& link) {
+                    return link.toNode == packer && link.toPort == QStringLiteral("specular");
+                });
+            check(!specularWired,
+                QStringLiteral("the stock FO76 graph leaves Specular F0 unwired, holding it constant"));
+
+            // Both metal signals read as Levels, not Smoothstep: Levels is the
+            // only node that draws the distribution under its own handles, and
+            // these thresholds are exactly the ones that need placing by eye.
+            // The second is deliberately inverted — darker diffuse means metal.
+            int levelsNodes = 0;
+            bool inverted = false, ascending = false;
+            for (const NodeGraph::Node& node : stock.nodes) {
+                if (node.typeId != QStringLiteral("image.levels")) continue;
+                ++levelsNodes;
+                const double black = node.params.value(QStringLiteral("inBlack")).toDouble();
+                const double white = node.params.value(QStringLiteral("inWhite")).toDouble();
+                if (qFuzzyCompare(black, 0.25) && qFuzzyCompare(white, 0.70)) ascending = true;
+                if (qFuzzyCompare(black, 0.20) && qFuzzyCompare(white, 0.11)) inverted = true;
+            }
+            check(levelsNodes == 2 && ascending && inverted,
+                QStringLiteral("both metal signals are Levels: reflectance 0.25/0.70, diffuse "
+                               "0.20/0.11 mirrored: %1 nodes, ascending=%2 inverted=%3")
+                    .arg(levelsNodes).arg(ascending).arg(inverted));
+
+            // The diffuse gate can only ever REMOVE metal, so its window has to
+            // sit in the measured gap and lean towards metal: 3.2x darker under
+            // metal than under dielectric across 200 materials (median 17.8 vs
+            // 64.3 of 255). Full signal at metal's p75, zero by dielectric's
+            // p25 — anything tighter starts deleting real metal surfaces.
+            check(0.11 * 255 >= 26.4 && 0.20 * 255 <= 53.1,
+                QStringLiteral("the diffuse window sits inside the measured gap: full signal by "
+                               "metal's p75 of 26.4, zero by dielectric's p25 of 53.1"));
+
+            // The reflectance threshold reads the map in the space it is STORED
+            // in. 0.25/0.70 are stored-value numbers taken from surveying the
+            // corpus; linearising first would collapse the distribution into the
+            // bottom fifth and make both numbers meaningless.
+            QString reflectanceLuma;
+            for (const NodeGraph::Connection& link : stock.connections) {
+                const NodeGraph::Node* target = stock.node(link.toNode);
+                if (!target || target->typeId != QStringLiteral("image.levels")) continue;
+                const NodeGraph::Node* source = stock.node(link.fromNode);
+                if (!source || source->typeId != QStringLiteral("image.luminance")) continue;
+                const NodeGraph::Node* levels = target;
+                if (qFuzzyCompare(levels->params.value(QStringLiteral("inWhite")).toDouble(), 0.70))
+                    reflectanceLuma = source->id;
+            }
+            const NodeGraph::Node* lumaNode = stock.node(reflectanceLuma);
+            check(lumaNode && !lumaNode->params.value(QStringLiteral("linearize")).toBool(),
+                QStringLiteral("the reflectance luminance feeding it does not linearise"));
+            // Both mask thresholds were measured on stored values, so neither
+            // luminance may linearise. One of them doing so silently moves its
+            // window by a gamma and the threshold stops meaning anything.
+            const bool anyLinearising = std::any_of(stock.nodes.cbegin(), stock.nodes.cend(),
+                [](const NodeGraph::Node& node) {
+                    return node.typeId == QStringLiteral("image.luminance")
+                        && node.params.value(QStringLiteral("linearize")).toBool();
+                });
+            check(!anyLinearising,
+                QStringLiteral("neither mask luminance linearises — both windows are stored-space"));
+
+            // One threshold pair only works on both authoring conventions
+            // because BC4 is mapped onto the BC1 scale first. These are the two
+            // anchors: a BC4 dielectric has to land on the BC1 dielectric floor
+            // and a BC4 metal top on the BC1 metal top, or the pair above stops
+            // reaching full metal on 64% of the corpus.
+            const auto flat = [](int value) {
+                QImage image(4, 4, QImage::Format_RGBA8888);
+                image.fill(QColor(value, value, value, 255));
+                return image;
+            };
+            const auto alignedValue = [&flat](int stored) {
+                return ConverterNodes::normaliseReflectanceToSrgbScale(flat(stored), false)
+                    .pixelColor(0, 0).red();
+            };
+            const int dielectric = alignedValue(9);   // 0.035 linear, the flat 4x4 constant
+            const int metalTop = alignedValue(53);    // 0.208 linear, textured BC4 p99
+            check(std::abs(dielectric - 56) <= 1,
+                QStringLiteral("a BC4 dielectric lands on the BC1 floor of 56: got %1").arg(dielectric));
+            check(std::abs(metalTop - 179) <= 2,
+                QStringLiteral("a BC4 metal top lands on the BC1 top of ~179: got %1").arg(metalTop));
+            check(dielectric < int(0.25 * 255) && metalTop >= int(0.70 * 255),
+                QStringLiteral("so 0.25/0.70 spans BC4 end to end: %1 below black, %2 at/above white")
+                    .arg(dielectric).arg(metalTop));
+            // An sRGB map is already on the reference scale and must not move.
+            const QImage untouched = ConverterNodes::normaliseReflectanceToSrgbScale(flat(56), true);
+            check(untouched.pixelColor(0, 0).red() == 56,
+                QStringLiteral("a BC1 sRGB map passes through untouched"));
+
+            // The conversion path harvests the terminal's maps, and it reads
+            // them the same way the preview does — by following the wires INTO
+            // it, since the terminal keeps no outputs. These are two separate
+            // readers of one fact: when only the preview was updated, every
+            // conversion failed with "no base colour" while the preview looked
+            // perfect. Nothing but running the real path catches that.
+            {
+                const NodeGraph::Graph stockFo76 = ConverterNodes::defaultFo76Graph();
+                QString terminal;
+                for (const NodeGraph::Node& node : stockFo76.nodes)
+                    if (node.typeId == QStringLiteral("output.pbrMaterial")) terminal = node.id;
+                QStringList wired;
+                for (const NodeGraph::Connection& link : stockFo76.connections)
+                    if (link.toNode == terminal) wired.append(link.toPort);
+                check(wired.contains(QStringLiteral("baseColor")),
+                    QStringLiteral("the terminal is fed a base colour to harvest: %1")
+                        .arg(wired.join(QStringLiteral(","))));
+                // Everything the writer needs must arrive by a wire, because a
+                // wire is now the only way anything reaches it.
+                check(wired.contains(QStringLiteral("normal")) && wired.contains(QStringLiteral("rmaos")),
+                    QStringLiteral("along with the normal and RMAOS it writes"));
+            }
+            check(std::none_of(stock.nodes.cbegin(), stock.nodes.cend(),
+                    [](const NodeGraph::Node& node) {
+                        return node.typeId == QStringLiteral("image.smoothstep");
+                    }),
+                QStringLiteral("and no Smoothstep is left behind"));
+            // Everything else it packs must still arrive, or "hold F0 constant"
+            // would be indistinguishable from having dropped a whole branch.
+            QSet<QString> packed;
+            for (const NodeGraph::Connection& link : stock.connections)
+                if (link.toNode == packer) packed.insert(link.toPort);
+            check(packed.contains(QStringLiteral("baseColor")) && packed.contains(QStringLiteral("normal"))
+                    && packed.contains(QStringLiteral("roughness")) && packed.contains(QStringLiteral("metallic"))
+                    && packed.contains(QStringLiteral("ao")) && packed.contains(QStringLiteral("curvature")),
+                QStringLiteral("and still packs every other channel: %1")
+                    .arg(QStringList(packed.cbegin(), packed.cend()).join(QStringLiteral(","))));
+        }
+
+        // An ordinary single-image node keeps its channel strip: the suppression
+        // above must key off materialPreview, not off having image outputs.
+        {
+            const NodeGraph::NodeTypeSpec* levels = registry.find(QStringLiteral("image.levels"));
+            NodeGraph::Node probe;
+            probe.showPreview = true;
+            check(levels && levels->materialPreview.isEmpty()
+                    && NodeGraph::nodeShowsChannelStrip(*levels, probe),
+                QStringLiteral("a single-map node still shows its R/G/B/A toggles"));
+            // Folding the preview away takes the strip with it, as before.
+            probe.showPreview = false;
+            check(levels && !NodeGraph::nodeShowsChannelStrip(*levels, probe),
+                QStringLiteral("hiding a node's preview hides its channel strip too"));
         }
 
         // Graph files round-trip through disk (what `convert --graph` consumes).
@@ -2103,6 +3037,230 @@ int main(int argc, char* argv[])
                 QStringLiteral("node parameters reach the conversion math"));
         }
 
+        // Levels: the histogram it publishes is what the node body plots, and
+        // the channel setting decides how much of the texel the remap touches.
+        {
+            const NodeGraph::NodeTypeSpec* levelsSpec = registry.find(QStringLiteral("image.levels"));
+            check(levelsSpec && levelsSpec->histogram.valid()
+                && levelsSpec->histogram.blackPoint == QStringLiteral("inBlack")
+                && levelsSpec->histogram.whitePoint == QStringLiteral("inWhite"),
+                QStringLiteral("Levels declares a histogram strip bound to its own params"));
+
+            QImage source(4, 4, QImage::Format_RGBA8888);
+            source.fill(QColor(64, 128, 192, 255));
+            NodeGraph::EvalArgs args;
+            args.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(source));
+            args.params = levelsSpec->defaultParams();
+
+            NodeGraph::EvalOutput plotted;
+            levelsSpec->evaluate(args, &plotted);
+            const int expected = NodeGraph::kHistogramChannels * NodeGraph::kHistogramBuckets;
+            const bool sized = plotted.histogram.size() == expected;
+            // A flat 4x4 image puts all 16 texels in one bucket per channel.
+            check(sized && plotted.histogram[0 * NodeGraph::kHistogramBuckets + 64] == 16u
+                && plotted.histogram[1 * NodeGraph::kHistogramBuckets + 128] == 16u
+                && plotted.histogram[2 * NodeGraph::kHistogramBuckets + 192] == 16u
+                && plotted.histogram[3 * NodeGraph::kHistogramBuckets + 255] == 16u,
+                QStringLiteral("Levels publishes a per-channel histogram of its input"));
+
+            // Luminance (the default) drives R, G and B together and leaves
+            // alpha alone; a single channel scopes the edit to that channel.
+            // Auto levels off: these check the REMAP against a stated window,
+            // and autodetection would pick its own and answer a different
+            // question. It ships on, so saying so explicitly is required.
+            args.params.insert(QStringLiteral("autoLevels"), false);
+            args.params.insert(QStringLiteral("inBlack"), 0.0);
+            args.params.insert(QStringLiteral("inWhite"), 0.5);
+            NodeGraph::EvalOutput lumaOut;
+            levelsSpec->evaluate(args, &lumaOut);
+            const QColor lumaTexel = lumaOut.outputs.value(QStringLiteral("image")).image().pixelColor(1, 1);
+            check(lumaTexel.red() == 128 && lumaTexel.green() == 255 && lumaTexel.blue() == 255
+                && lumaTexel.alpha() == 255,
+                QStringLiteral("Levels on Luminance remaps RGB together and leaves alpha alone"));
+
+            args.params.insert(QStringLiteral("channel"), 0); // Red
+            NodeGraph::EvalOutput redOut;
+            levelsSpec->evaluate(args, &redOut);
+            const QColor redTexel = redOut.outputs.value(QStringLiteral("image")).image().pixelColor(1, 1);
+            check(redTexel.red() == 128 && redTexel.green() == 128 && redTexel.blue() == 192,
+                QStringLiteral("Levels scoped to one channel leaves the others untouched"));
+        }
+
+        // The filter and mask nodes, each checked on the property that is the
+        // reason it exists rather than on an exact texel.
+        {
+            const auto run = [&](const char* id, const QImage& in, const QJsonObject& params) {
+                const NodeGraph::NodeTypeSpec* s = registry.find(QLatin1String(id));
+                NodeGraph::EvalArgs a;
+                a.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(in));
+                a.params = s ? s->defaultParams() : QJsonObject();
+                for (auto it = params.begin(); it != params.end(); ++it) a.params.insert(it.key(), it.value());
+                NodeGraph::EvalOutput out;
+                if (s) s->evaluate(a, &out);
+                return out.outputs.value(QStringLiteral("image")).image();
+            };
+
+            // Histogram Scan: full contrast is a hard threshold at the position.
+            QImage ramp(256, 1, QImage::Format_RGBA8888);
+            for (int x = 0; x < 256; ++x) ramp.setPixelColor(x, 0, QColor(x, x, x, 255));
+            const QImage scanned = run("image.histogramScan", ramp,
+                {{QStringLiteral("position"), 0.5}, {QStringLiteral("contrast"), 1.0}});
+            check(!scanned.isNull() && scanned.pixelColor(60, 0).red() == 0
+                && scanned.pixelColor(200, 0).red() == 255,
+                QStringLiteral("Histogram Scan at full contrast thresholds at the position"));
+
+            // Median blur is the one that removes an isolated spike outright,
+            // which is why it is the tool for block-compression noise.
+            QImage speckled(9, 9, QImage::Format_RGBA8888);
+            speckled.fill(QColor(40, 40, 40, 255));
+            speckled.setPixelColor(4, 4, QColor(255, 255, 255, 255));
+            const QImage medianed = run("image.blur", speckled,
+                {{QStringLiteral("kind"), 2}, {QStringLiteral("radius"), 1}});
+            const QImage boxed = run("image.blur", speckled,
+                {{QStringLiteral("kind"), 0}, {QStringLiteral("radius"), 1}});
+            check(medianed.pixelColor(4, 4).red() == 40 && boxed.pixelColor(4, 4).red() > 40,
+                QStringLiteral("Median removes an isolated spike where Box only spreads it"));
+
+            // Flip Normal Y touches green and nothing else.
+            QImage normal(2, 2, QImage::Format_RGBA8888);
+            normal.fill(QColor(128, 200, 255, 255));
+            const QColor flipped = run("image.normalFlipY", normal, {}).pixelColor(0, 0);
+            check(flipped.red() == 128 && flipped.green() == 55 && flipped.blue() == 255,
+                QStringLiteral("Flip Normal Y inverts green alone"));
+
+            // Height to Normal: a flat height field is flat blue, and a slope
+            // has to tilt the normal away from it.
+            QImage flat(8, 8, QImage::Format_RGBA8888);
+            flat.fill(QColor(128, 128, 128, 255));
+            const QColor flatNormal = run("derive.heightToNormal", flat, {}).pixelColor(4, 4);
+            QImage slope(8, 8, QImage::Format_RGBA8888);
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 8; ++x) slope.setPixelColor(x, y, QColor(x * 32, x * 32, x * 32, 255));
+            const QColor slopeNormal = run("derive.heightToNormal", slope, {}).pixelColor(4, 4);
+            check(std::abs(flatNormal.red() - 128) <= 1 && flatNormal.blue() > 250
+                && slopeNormal.red() < 120,
+                QStringLiteral("Height to Normal is flat on flat height and tilts on a slope"));
+
+            // Resize reports the size it actually produced, since the status is
+            // what the under-resolution warning reads.
+            const NodeGraph::NodeTypeSpec* resizeSpec = registry.find(QStringLiteral("image.resize"));
+            NodeGraph::EvalArgs resizeArgs;
+            resizeArgs.inputs.insert(QStringLiteral("image"), NodeGraph::Value::fromImage(flat));
+            resizeArgs.params = resizeSpec->defaultParams();
+            resizeArgs.params.insert(QStringLiteral("size"), 32);
+            NodeGraph::EvalOutput resized;
+            resizeSpec->evaluate(resizeArgs, &resized);
+            check(resized.outputs.value(QStringLiteral("image")).image().size() == QSize(32, 32)
+                && resized.nativeResolution == 32,
+                QStringLiteral("Resize reaches the requested size and reports it"));
+        }
+
+        // Channel isolation is display-only, and has to mean the same thing in
+        // the node thumbnail and in the 3D viewport, so both call this.
+        {
+            QImage source(2, 2, QImage::Format_RGBA8888);
+            source.fill(QColor(10, 120, 240, 64));
+
+            const QColor green = NodeGraph::applyChannelMask(source, NodeGraph::ChannelG).pixelColor(0, 0);
+            check(green.red() == 120 && green.green() == 120 && green.blue() == 120 && green.alpha() == 255,
+                QStringLiteral("isolating one channel shows it as opaque grayscale"));
+
+            const QColor alpha = NodeGraph::applyChannelMask(source, NodeGraph::ChannelA).pixelColor(0, 0);
+            check(alpha.red() == 64 && alpha.alpha() == 255,
+                QStringLiteral("isolating alpha shows the alpha values, not transparency"));
+
+            // Several channels: the disabled ones zero out, and alpha goes
+            // opaque so switching a channel off never reads as transparent.
+            const QColor rb = NodeGraph::applyChannelMask(source,
+                NodeGraph::ChannelR | NodeGraph::ChannelB).pixelColor(0, 0);
+            check(rb.red() == 10 && rb.green() == 0 && rb.blue() == 240 && rb.alpha() == 255,
+                QStringLiteral("a partial mask zeroes the disabled channels and stays opaque"));
+
+            check(NodeGraph::applyChannelMask(source, NodeGraph::kChannelsRgba).pixelColor(0, 0).alpha() == 64,
+                QStringLiteral("the full RGBA mask leaves the image untouched"));
+        }
+
+        // Curves: the interpolation has to stay monotone. A plain cubic spline
+        // overshoots between control points, which on a tone curve invents
+        // highlights and crushes shadows nobody asked for.
+        {
+            const QVector<QPointF> identity = NodeGraph::curvePoints(QStringLiteral("[[0,0],[1,1]]"));
+            check(std::abs(NodeGraph::evaluateCurve(identity, 0.25) - 0.25) < 1e-6
+                && std::abs(NodeGraph::evaluateCurve(identity, 0.8) - 0.8) < 1e-6,
+                QStringLiteral("an identity curve is the identity"));
+
+            // A hard step between two close points is where a naive spline
+            // rings; every sample must stay inside the control points' range.
+            const QVector<QPointF> step =
+                NodeGraph::curvePoints(QStringLiteral("[[0,0],[0.45,0.02],[0.55,0.98],[1,1]]"));
+            bool inRange = true, monotone = true;
+            double previous = -1.0;
+            for (int i = 0; i <= 200; ++i) {
+                const double y = NodeGraph::evaluateCurve(step, i / 200.0);
+                if (y < -1e-6 || y > 1.0 + 1e-6) inRange = false;
+                if (y < previous - 1e-6) monotone = false;
+                previous = y;
+            }
+            check(inRange && monotone,
+                QStringLiteral("a steep curve never overshoots or reverses"));
+
+            // Malformed input must fall back to identity, not blank the image.
+            const QVector<QPointF> broken = NodeGraph::curvePoints(QStringLiteral("nonsense"));
+            check(broken.size() == 2 && std::abs(NodeGraph::evaluateCurve(broken, 0.5) - 0.5) < 1e-6,
+                QStringLiteral("a malformed curve param falls back to identity"));
+
+            const QString round = NodeGraph::curveToString(step);
+            check(NodeGraph::curvePoints(round).size() == step.size(),
+                QStringLiteral("curve points round-trip through their JSON form"));
+        }
+
+        // Folding: every state has to change the node's measured height, or the
+        // layout would keep reserving space for what is no longer drawn.
+        {
+            const NodeGraph::NodeTypeSpec* texSpec = registry.find(QStringLiteral("source.texture"));
+            const NodeGraph::NodeTypeSpec* packSpec = registry.find(QStringLiteral("image.channelPack"));
+            NodeGraph::Graph folded;
+            const QString producer = folded.addNode(QStringLiteral("source.texture"), *texSpec, QPointF(0, 0));
+            const QString consumer = folded.addNode(QStringLiteral("image.channelPack"), *packSpec, QPointF(300, 0));
+            folded.connect(registry, {producer, QStringLiteral("image"), consumer, QStringLiteral("r")});
+
+            NodeGraph::Node* node = folded.node(producer);
+            const double full = NodeGraph::nodeSize(*texSpec, *node, folded).height();
+            node->showPreview = false;
+            const double noPreview = NodeGraph::nodeSize(*texSpec, *node, folded).height();
+            node->showPreview = true;
+            node->showSettings = false;
+            const double noSettings = NodeGraph::nodeSize(*texSpec, *node, folded).height();
+            node->showSettings = true;
+            node->collapsed = true;
+            const double collapsed = NodeGraph::nodeSize(*texSpec, *node, folded).height();
+            node->collapsed = false;
+            check(noPreview < full && noSettings < full && collapsed < noPreview && collapsed < noSettings,
+                QStringLiteral("each fold state shrinks the node (full %1, no preview %2, no settings %3, collapsed %4)")
+                    .arg(full).arg(noPreview).arg(noSettings).arg(collapsed));
+
+            // Hiding unused ports must never drop a port that carries a wire.
+            NodeGraph::Node* sink = folded.node(consumer);
+            sink->hideUnusedPorts = true;
+            check(NodeGraph::portVisible(*sink, folded, QStringLiteral("r"), false)
+                && !NodeGraph::portVisible(*sink, folded, QStringLiteral("g"), false),
+                QStringLiteral("hiding unused ports keeps the connected one and drops the rest"));
+            check(NodeGraph::nodeSize(*packSpec, *sink, folded).height()
+                    < NodeGraph::nodeSize(*packSpec, *folded.node(producer), folded).height() + 1000,
+                QStringLiteral("hiding unused ports is reflected in the node height"));
+
+            // Fold state has to survive a save/load round trip, or reopening a
+            // graph would silently unfold everything.
+            folded.node(producer)->showPreview = false;
+            folded.node(producer)->collapsed = true;
+            const NodeGraph::Graph reloaded = NodeGraph::Graph::fromJson(folded.toJson());
+            const NodeGraph::Node* reloadedNode = reloaded.node(producer);
+            const NodeGraph::Node* reloadedSink = reloaded.node(consumer);
+            check(reloadedNode && !reloadedNode->showPreview && reloadedNode->collapsed
+                && reloadedNode->showSettings && reloadedSink && reloadedSink->hideUnusedPorts,
+                QStringLiteral("fold state round-trips through the graph file"));
+        }
+
         // Evaluator: dependency order, thumbnails, and incremental caching, on
         // a graph of pure generators so the test needs nothing from disk.
         {
@@ -2140,6 +3298,146 @@ int main(int argc, char* argv[])
             check(third[constant].cached && !third[levels].cached && !third[inverted].cached,
                 QStringLiteral("a parameter change re-runs that node and its dependents, not its inputs"));
         }
+    }
+
+    // ---- Standard upscale models, one per map role -------------------------
+    {
+        // Not named "slots": that is a Qt keyword macro and expands to nothing.
+        const QVector<Upscaler::MapSlot> roles = Upscaler::allSlots();
+        check(roles.size() == 9, QStringLiteral("every map role is offered (%1)").arg(roles.size()));
+        QSet<QString> keys, labels;
+        for (const Upscaler::MapSlot slot : roles) {
+            keys.insert(Upscaler::slotKey(slot));
+            labels.insert(Upscaler::slotLabel(slot));
+        }
+        check(keys.size() == roles.size() && labels.size() == roles.size(),
+            QStringLiteral("roles have distinct settings keys and labels"));
+
+        // Handling class per role. Reflectance rides with the pictures because
+        // it carries a metal's hue; it earns its own ROW, not its own kind.
+        check(Upscaler::kindForSlot(Upscaler::MapSlot::Normal) == Upscaler::MapKind::Normal
+                && Upscaler::kindForSlot(Upscaler::MapSlot::BaseColor) == Upscaler::MapKind::Color
+                && Upscaler::kindForSlot(Upscaler::MapSlot::Glow) == Upscaler::MapKind::Color
+                && Upscaler::kindForSlot(Upscaler::MapSlot::Reflectance) == Upscaler::MapKind::Color
+                && Upscaler::kindForSlot(Upscaler::MapSlot::Smoothness) == Upscaler::MapKind::Data
+                && Upscaler::kindForSlot(Upscaler::MapSlot::AmbientOcclusion) == Upscaler::MapKind::Data,
+            QStringLiteral("each role maps to the right handling class"));
+
+        // Auto reads the port label, so the labels Separate Maps actually emits
+        // have to land on the right role — this is the whole mechanism.
+        check(Upscaler::slotForLabel(QStringLiteral("Diffuse")) == Upscaler::MapSlot::BaseColor
+                && Upscaler::slotForLabel(QStringLiteral("Reflectance")) == Upscaler::MapSlot::Reflectance
+                && Upscaler::slotForLabel(QStringLiteral("Normal")) == Upscaler::MapSlot::Normal
+                && Upscaler::slotForLabel(QStringLiteral("Smoothness")) == Upscaler::MapSlot::Smoothness
+                && Upscaler::slotForLabel(QStringLiteral("Ambient Occlusion")) == Upscaler::MapSlot::AmbientOcclusion
+                && Upscaler::slotForLabel(QStringLiteral("Subsurface")) == Upscaler::MapSlot::Subsurface
+                && Upscaler::slotForLabel(QStringLiteral("Glow Mask")) == Upscaler::MapSlot::Glow,
+            QStringLiteral("Separate Maps port labels resolve to their roles"));
+        // Ordering matters: "Reflectance" contains no colour word but a naive
+        // pass that checked colour first would still have to not claim it.
+        check(Upscaler::slotForLabel(QStringLiteral("Specular / Gloss")) == Upscaler::MapSlot::SpecularGloss
+                && Upscaler::slotForLabel(QStringLiteral("Curvature")) == Upscaler::MapSlot::Other,
+            QStringLiteral("and an unrecognised label falls to Other rather than guessing"));
+
+        // The preference match, against a real install's model list. This is
+        // pure name-matching and it got it wrong once in a way that looked
+        // right: a "conservative" hint for data maps matched Photo-Conservative
+        // — the photographic class the list existed to avoid — so every data
+        // role silently resolved to a photo model.
+        const QStringList installedFixture{
+            QStringLiteral("Anime-HQ-W4xEX"), QStringLiteral("AnimeVideo-MiniV1.8-W2xEX"),
+            QStringLiteral("Omni-MiniV2-W2xEX"), QStringLiteral("Photo-Conservative-x4"),
+            QStringLiteral("Photo-HQ-W4xEX"), QStringLiteral("Photo-Small-W2xEX"),
+            QStringLiteral("Universal-FastV2-W2xEX"), QStringLiteral("realesr-general-wdn-x4v3"),
+            QStringLiteral("realesr-general-x4v3"), QStringLiteral("realesrgan-x4plus")};
+        for (const Upscaler::MapSlot dataRole : {Upscaler::MapSlot::Reflectance,
+                 Upscaler::MapSlot::Smoothness, Upscaler::MapSlot::AmbientOcclusion,
+                 Upscaler::MapSlot::Other}) {
+            const QString picked = Upscaler::chooseModel(dataRole, installedFixture);
+            check(!picked.contains(QStringLiteral("Photo"), Qt::CaseInsensitive)
+                    && !picked.contains(QStringLiteral("Anime"), Qt::CaseInsensitive),
+                QStringLiteral("%1 does not resolve to a picture model (%2)")
+                    .arg(Upscaler::slotLabel(dataRole), picked));
+        }
+        check(Upscaler::chooseModel(Upscaler::MapSlot::Smoothness, installedFixture)
+                == QStringLiteral("realesr-general-x4v3"),
+            QStringLiteral("data roles take the plain general model, not its denoising variant"));
+        check(Upscaler::chooseModel(Upscaler::MapSlot::BaseColor, installedFixture)
+                .contains(QStringLiteral("Photo")),
+            QStringLiteral("base colour does take a photographic model"));
+        // No normal-trained model in that list, and a photo model would bend
+        // the vectors in ways reconstructBlue cannot undo.
+        check(Upscaler::chooseModel(Upscaler::MapSlot::Normal, installedFixture).isEmpty(),
+            QStringLiteral("normal declines outright rather than borrowing a picture model"));
+        check(Upscaler::chooseModel(Upscaler::MapSlot::Normal,
+                  installedFixture + QStringList{QStringLiteral("4x-Normal-RG0")})
+                == QStringLiteral("4x-Normal-RG0"),
+            QStringLiteral("and takes a normal-trained one the moment it is installed"));
+        // An install of nothing but anime models — entirely possible, since the
+        // official ncnn release ships no models and a real install is whatever
+        // was assembled by hand. A network built to invent clean line art out
+        // of gradients is the worst thing to hand a roughness map, so the data
+        // roles decline and resample rather than take it.
+        const QStringList animeOnly{QStringLiteral("realesrgan-x4plus-anime"),
+            QStringLiteral("realesr-animevideov3-x4"), QStringLiteral("Anime-HQ-W4xEX")};
+        check(Upscaler::chooseModel(Upscaler::MapSlot::Smoothness, animeOnly).isEmpty()
+                && Upscaler::chooseModel(Upscaler::MapSlot::Reflectance, animeOnly).isEmpty(),
+            QStringLiteral("with only anime models installed, data roles fall to Lanczos"));
+        check(!Upscaler::chooseModel(Upscaler::MapSlot::BaseColor, animeOnly).isEmpty(),
+            QStringLiteral("while base colour still takes one — it is at least a picture"));
+        // The real install, where the plain model and its anime sibling differ
+        // by a suffix. A hint is a substring, so "realesrgan-x4plus" matches
+        // BOTH — and the anime file sorts FIRST, because the listing compares
+        // full filenames and '-' precedes '.'. Taking the first hit handed base
+        // colour the anime model with the plain one sitting right beside it.
+        const QStringList officialSet{QStringLiteral("realesr-animevideov3-x2"),
+            QStringLiteral("realesr-animevideov3-x3"), QStringLiteral("realesr-animevideov3-x4"),
+            QStringLiteral("realesr-general-wdn-x4v3"), QStringLiteral("realesr-general-x4v3"),
+            QStringLiteral("realesrgan-x4plus-anime"), QStringLiteral("realesrgan-x4plus")};
+        check(Upscaler::chooseModel(Upscaler::MapSlot::BaseColor, officialSet)
+                == QStringLiteral("realesrgan-x4plus"),
+            QStringLiteral("base colour takes the plain model, not its anime sibling (%1)")
+                .arg(Upscaler::chooseModel(Upscaler::MapSlot::BaseColor, officialSet)));
+        check(Upscaler::chooseModel(Upscaler::MapSlot::Smoothness, officialSet)
+                == QStringLiteral("realesr-general-x4v3"),
+            QStringLiteral("and data roles the plain general one (%1)")
+                .arg(Upscaler::chooseModel(Upscaler::MapSlot::Smoothness, officialSet)));
+
+        check(Upscaler::modelNativeScale(QStringLiteral("realesrgan-x4plus")) == 4
+                && Upscaler::modelNativeScale(QStringLiteral("Photo-Small-W2xEX")) == 2
+                && Upscaler::modelNativeScale(QStringLiteral("some-model")) == 0,
+            QStringLiteral("a model's native scale is read from its name"));
+
+        // Pinning round trip. The test binary has its own settings scope, so
+        // this cannot reach the real configuration.
+        const QString pinned = QStringLiteral("test-model-x4");
+        Upscaler::setModelForSlot(Upscaler::MapSlot::Smoothness, pinned);
+        check(Upscaler::slotModelIsPinned(Upscaler::MapSlot::Smoothness),
+            QStringLiteral("choosing a model pins it"));
+        // Not installed here, so it must fall back rather than run a network
+        // that is not present — a choice made against another install.
+        check(Upscaler::modelForSlot(Upscaler::MapSlot::Smoothness)
+                == Upscaler::suggestedModelForSlot(Upscaler::MapSlot::Smoothness),
+            QStringLiteral("a pinned model missing from this install falls back to the suggestion"));
+        Upscaler::setModelForSlot(Upscaler::MapSlot::Smoothness, QString());
+        check(Upscaler::modelForSlot(Upscaler::MapSlot::Smoothness).isEmpty(),
+            QStringLiteral("pinning Lanczos explicitly is honoured, not read as unset"));
+        Upscaler::clearSlotModel(Upscaler::MapSlot::Smoothness);
+        check(!Upscaler::slotModelIsPinned(Upscaler::MapSlot::Smoothness),
+            QStringLiteral("and clearing it goes back to suggested"));
+
+        // The node's role list and the dialog's are the same list, or a graph
+        // and the settings would disagree about what index means what.
+        const NodeGraph::NodeTypeSpec* upscale =
+            ConverterNodes::sharedRegistry().find(QStringLiteral("image.upscale"));
+        const NodeGraph::ParamSpec* role = upscale ? upscale->param(QStringLiteral("mapSlot")) : nullptr;
+        check(role && role->enumLabels.size() == roles.size() + 1,
+            QStringLiteral("the Upscale node offers Auto plus every role (%1)")
+                .arg(role ? role->enumLabels.size() : -1));
+        bool listsMatch = role != nullptr;
+        for (int index = 0; role && index < roles.size(); ++index)
+            if (role->enumLabels.at(index + 1) != Upscaler::slotLabel(roles.at(index))) listsMatch = false;
+        check(listsMatch, QStringLiteral("and in the same order the settings table uses"));
     }
 
     QTextStream(stdout) << "Failures: " << failures << Qt::endl;

@@ -728,7 +728,7 @@ int runConvert(const QStringList& args)
         if (!conversionGraph.nodes.isEmpty() && source.entry.isEmpty()) {
             QStringList graphErrors;
             materialJob.supplied = ConverterNodes::runGraph(conversionGraph, source.path,
-                job.textureRoot, job.geometryNifPath, &graphErrors);
+                job.textureRoot, job.geometryNifPath, job.correctionMaskPath, &graphErrors);
             if (!materialJob.supplied.active) {
                 jobResult.materialPath = material;
                 jobResult.errors.append(graphErrors.isEmpty()

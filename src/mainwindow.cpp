@@ -10,6 +10,7 @@
 #include "texturearchive.h"
 #include "texturebrowserdialog.h"
 #include "textureimage.h"
+#include "upscaler.h"
 #include "wheelfocusguard.h"
 
 #include <QAction>
@@ -289,6 +290,7 @@ void MainWindow::setWorkspaceMode(bool convert)
     // them visibly inert while the converter queue owns the window.
     m_shaderCombo->setEnabled(!convert);
     m_search->setEnabled(!convert);
+    updateWindowTitle();
 }
 
 void MainWindow::buildMenus()
@@ -329,6 +331,49 @@ void MainWindow::buildMenus()
     settings->addAction(tr("Batch Operations…"), this, &MainWindow::showBatchOperations);
     settings->addAction(tr("Preview Cubemaps…"), this, &MainWindow::showEditorSettings);
     settings->addAction(tr("Texture Browser…"), this, [this] { TextureBrowserDialog(m_textureRoot, this).exec(); });
+    // Upscaling: one policy for a whole conversion run, plus where the neural
+    // upscaler lives. The policy is expressed against each material's OWN
+    // highest-resolution map, so a single choice covers a batch of mixed sizes.
+    auto* upscaling = settings->addMenu(tr("Upscaling"));
+    struct PolicyEntry { const char* label; int value; };
+    static const PolicyEntry policies[] = {{QT_TR_NOOP("Off"), 0},
+        {QT_TR_NOOP("Match the highest map"), 1}, {QT_TR_NOOP("2x the highest map"), 2},
+        {QT_TR_NOOP("4x the highest map"), 3}};
+    auto* policyGroup = new QActionGroup(this);
+    const int activePolicy = QSettings().value(QStringLiteral("Convert/upscalePolicy"), 0).toInt();
+    for (const PolicyEntry& entry : policies) {
+        QAction* action = upscaling->addAction(tr(entry.label));
+        action->setCheckable(true);
+        action->setChecked(entry.value == activePolicy);
+        policyGroup->addAction(action);
+        const int value = entry.value;
+        connect(action, &QAction::triggered, this, [this, value] {
+            QSettings().setValue(QStringLiteral("Convert/upscalePolicy"), value);
+            statusBar()->showMessage(value == 0
+                ? tr("Upscaling off — maps convert at the size they ship")
+                : tr("Under-sized maps will be raised on the next conversion"), 5000);
+        });
+    }
+    upscaling->addSeparator();
+    // One model per map role, chosen once. Without this the model was a
+    // substring guess against whatever happened to be installed, which is not
+    // something anyone could see, predict, or change.
+    upscaling->addAction(tr("Standard Models…"), this, [this] { showUpscaleModelsDialog(); });
+    upscaling->addAction(tr("Choose Upscaler…"), this, [this] {
+        const QString fileName = QFileDialog::getOpenFileName(this, tr("Choose the upscaler executable"),
+            Upscaler::binaryPath(), tr("Executable (*.exe)"));
+        if (fileName.isEmpty()) return;
+        Upscaler::setBinaryPath(fileName);
+        const QStringList found = Upscaler::models();
+        // A binary with no models beside it is inert, and that is worth saying
+        // now rather than after a batch has quietly fallen back to Lanczos.
+        if (found.isEmpty())
+            QMessageBox::warning(this, tr("No models found"),
+                tr("No .param models sit beside %1, so upscaling will fall back to Lanczos.").arg(fileName));
+        else
+            statusBar()->showMessage(tr("Upscaler ready — %1 model(s) available").arg(found.size()), 8000);
+    });
+
     // Runtime-owned surface state definitions: export the built-in defaults
     // as the starter JSON asset, or preview a modded definitions file.
     auto* stateDefinitions = settings->addMenu(tr("Surface State Definitions"));
@@ -1443,8 +1488,175 @@ bool MainWindow::maybeSave()
     return true;
 }
 
+void MainWindow::showUpscaleModelsDialog()
+{
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("UpscaleModelsDialog"));
+    dialog.setWindowTitle(tr("Standard Upscale Models"));
+    auto* layout = new QVBoxLayout(&dialog);
+
+    auto* intro = new QLabel(tr("Which trained model runs for each kind of map. A graph's "
+                                "Upscale nodes use these unless a node names a model itself."), &dialog);
+    intro->setWordWrap(true);
+    intro->setObjectName(QStringLiteral("Muted"));
+    layout->addWidget(intro);
+
+    // Where the weights live. Defaulting to the folder beside the binary is
+    // only a convention — the official Real-ESRGAN release ships no models at
+    // all, so a working install is one that was assembled by hand and the
+    // weights can be anywhere. Hardcoding it made a good install report "no
+    // models found", which reads exactly like a broken one.
+    auto* folderRow = new QHBoxLayout();
+    folderRow->addWidget(new QLabel(tr("Models folder"), &dialog));
+    auto* folderEdit = new QLineEdit(Upscaler::modelsPath(), &dialog);
+    folderEdit->setReadOnly(true);
+    folderRow->addWidget(folderEdit, 1);
+    auto* browse = new QPushButton(tr("Browse…"), &dialog);
+    folderRow->addWidget(browse);
+    auto* resetFolder = new QPushButton(tr("Default"), &dialog);
+    resetFolder->setToolTip(tr("Back to the models folder beside the upscaler binary."));
+    folderRow->addWidget(resetFolder);
+    layout->addLayout(folderRow);
+
+    const QStringList installed = Upscaler::models();
+    if (installed.isEmpty()) {
+        auto* warning = new QLabel(tr("No models are installed beside the configured upscaler, "
+                                      "so every map resamples with Lanczos. Set one under "
+                                      "<b>Choose Upscaler…</b> first."), &dialog);
+        warning->setWordWrap(true);
+        layout->addWidget(warning);
+    }
+
+    auto* table = new QTreeWidget(&dialog);
+    table->setObjectName(QStringLiteral("UpscaleModelTable"));
+    table->setHeaderLabels({tr("Map"), tr("Model"), tr("Scale")});
+    table->setRootIsDecorated(false);
+    table->setUniformRowHeights(true);
+    table->setSelectionMode(QAbstractItemView::NoSelection);
+    table->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+    table->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    layout->addWidget(table, 1);
+
+    // Kept so Restore Suggested can reset every row without rebuilding the
+    // dialog, and so OK can write them all in one pass.
+    struct Row { Upscaler::MapSlot slot; QComboBox* combo; QTreeWidgetItem* item; };
+    QVector<Row> rows;
+    for (const Upscaler::MapSlot slot : Upscaler::allSlots()) {
+        auto* item = new QTreeWidgetItem(table);
+        item->setText(0, Upscaler::slotLabel(slot));
+        auto* combo = new QComboBox(table);
+        // Lanczos first and always available: it is a legitimate choice, not
+        // the absence of one, and for a normal with no normal-trained model
+        // installed it is the only correct answer.
+        combo->addItem(tr("Lanczos (no model)"), QString());
+        for (const QString& model : installed) combo->addItem(model, model);
+        const QString active = Upscaler::modelForSlot(slot);
+        const int found = combo->findData(active);
+        combo->setCurrentIndex(found >= 0 ? found : 0);
+        WheelFocusGuard::install(combo);
+        table->setItemWidget(item, 1, combo);
+        const auto describe = [item, combo] {
+            const QString model = combo->currentData().toString();
+            const int scale = Upscaler::modelNativeScale(model);
+            // The scale is worth showing: a model only runs at the size it was
+            // trained for, and anything else is resampled from that.
+            item->setText(2, model.isEmpty() ? tr("any")
+                : scale ? QStringLiteral("%1×").arg(scale) : tr("unstated"));
+        };
+        describe();
+        QObject::connect(combo, &QComboBox::currentIndexChanged, &dialog, describe);
+        if (!Upscaler::slotModelIsPinned(slot))
+            item->setToolTip(0, tr("Suggested, not chosen — picking anything here pins it."));
+        rows.append({slot, combo, item});
+    }
+
+    // Restoration is a separate axis: a 1:1 de-block that runs BEFORE any
+    // enlargement. One setting rather than nine, because BC artifacts are BC
+    // artifacts whatever the map means.
+    auto* restoreRow = new QHBoxLayout();
+    restoreRow->addWidget(new QLabel(tr("Restore (1:1)"), &dialog));
+    auto* restoreCombo = new QComboBox(&dialog);
+    restoreCombo->setToolTip(tr("Removes block-compression artifacts without resizing. "
+                                "Only 1× models are listed — anything else would change the size."));
+    restoreCombo->addItem(tr("Off"), QString());
+    for (const QString& model : installed)
+        if (Upscaler::modelNativeScale(model) == 1) restoreCombo->addItem(model, model);
+    const int restoreFound = restoreCombo->findData(Upscaler::restorationModel());
+    restoreCombo->setCurrentIndex(restoreFound >= 0 ? restoreFound : 0);
+    WheelFocusGuard::install(restoreCombo);
+    restoreRow->addWidget(restoreCombo, 1);
+    if (restoreCombo->count() == 1)
+        restoreRow->addWidget(new QLabel(tr("no 1× models installed"), &dialog));
+    layout->addLayout(restoreRow);
+
+    auto* hint = new QLabel(tr("Reflectance feeds the metal inference: a model that invents "
+                               "detail there changes what converts as metal, not only how it looks."), &dialog);
+    hint->setWordWrap(true);
+    hint->setObjectName(QStringLiteral("Muted"));
+    layout->addWidget(hint);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel
+        | QDialogButtonBox::RestoreDefaults, &dialog);
+    buttons->button(QDialogButtonBox::RestoreDefaults)->setText(tr("Restore Suggested"));
+    connect(buttons->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, &dialog, [&rows] {
+        for (const Row& row : rows) {
+            const int found = row.combo->findData(Upscaler::suggestedModelForSlot(row.slot));
+            row.combo->setCurrentIndex(found >= 0 ? found : 0);
+        }
+    });
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.resize(560, 420);
+
+    // The folder is applied immediately rather than on OK: changing it changes
+    // which models exist, and every combo above was filled from the old list.
+    // Re-opening the dialog is the honest way to show the new one.
+    connect(browse, &QPushButton::clicked, &dialog, [this, &dialog, folderEdit] {
+        const QString chosen = QFileDialog::getExistingDirectory(&dialog,
+            tr("Choose the folder holding the .param/.bin models"), folderEdit->text());
+        if (chosen.isEmpty()) return;
+        Upscaler::setModelsPath(chosen);
+        folderEdit->setText(chosen);
+        dialog.accept();
+        QTimer::singleShot(0, this, [this] { showUpscaleModelsDialog(); });
+    });
+    connect(resetFolder, &QPushButton::clicked, &dialog, [this, &dialog] {
+        Upscaler::clearModelsPath();
+        dialog.accept();
+        QTimer::singleShot(0, this, [this] { showUpscaleModelsDialog(); });
+    });
+
+    if (dialog.exec() != QDialog::Accepted) return;
+    for (const Row& row : rows) Upscaler::setModelForSlot(row.slot, row.combo->currentData().toString());
+    Upscaler::setRestorationModel(restoreCombo->currentData().toString());
+    statusBar()->showMessage(tr("Standard upscale models saved"), 5000);
+}
+
+void MainWindow::scanConverterSources()
+{
+    if (m_convertWorkspace) m_convertWorkspace->scanNow();
+}
+
+void MainWindow::selectFirstConvertMaterial()
+{
+    // A scanned-but-unselected converter shows a placeholder where the graph
+    // goes, so every capture of the canvas has to pick a row first.
+    if (m_convertWorkspace) m_convertWorkspace->selectFirstMaterial();
+}
+
 void MainWindow::updateWindowTitle()
 {
+    // In the converter the authored document is not what is on screen, and
+    // showing its name there is actively misleading.
+    if (m_workspaceStack && m_workspaceStack->currentIndex() == 1) {
+        const QString source = m_convertWorkspace ? m_convertWorkspace->sourceLabel() : QString();
+        setWindowTitle(source.isEmpty()
+                ? tr("Material Converter — FO4 PBR Material Editor")
+                : tr("%1 — Material Converter — FO4 PBR Material Editor").arg(source));
+        return;
+    }
     const QString name = m_document.fileName().isEmpty() ? tr("Untitled") : QFileInfo(m_document.fileName()).fileName();
     setWindowTitle(tr("%1%2 — FO4 PBR Material Editor").arg(name, m_document.modified() ? QStringLiteral(" *") : QString()));
 }
