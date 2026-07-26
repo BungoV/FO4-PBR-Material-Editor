@@ -21,15 +21,16 @@ downstream of them — the derivations, geometry AO, masks, workspace, and
 `.pbrm` output — is shared:
 
 - **Fallout 4** (BGSM/BGEM version 2): a **spec-gloss workflow that never
-  states metallicity**, so conversion is dielectric by default — `_s.G`
-  inverts to roughness (with the `.bgsm` scalar substituted where that channel
-  is flat, which is 13.4% of the corpus and would otherwise ship a mirror
-  finish), and `_s.R` clamps into the physical F0 window anchored on the
-  corpus median. Metal albedo recovery and the cubemap metal declaration still
-  exist and still work, but they are **opt-in**: measured across all 6616
-  vanilla materials, nothing in a `.bgsm` classifies metal better than a coin
-  flip. See *RMAOS ← `_s`* below for the four tests behind that. Metal is the
-  correction mask's job.
+  states metallicity**. `_s.G` inverts to roughness (with the `.bgsm` scalar
+  substituted where that channel is flat, which is 13.4% of the corpus and
+  would otherwise ship a mirror finish), and `_s.R` does double duty — clamped
+  into the physical F0 window anchored on the corpus median, and windowed
+  through Levels into a **metal stencil**. Measured across all 6616 vanilla
+  materials nothing in a `.bgsm` *classifies* metal better than a coin flip
+  (see *RMAOS ← `_s`* below for the four tests), but `_s.R` still has the right
+  spatial shape, so it is a starting point the user tunes and then masks rather
+  than an answer. Two steps: adjust the Levels window, then paint out what
+  should not be metal.
 - **Fallout 76** (BGSM/BGEM version 20+): a **true specular workflow** —
   the diffuse is strictly the Lambertian term, so **metals are authored
   with black diffuse** and their color (gold's yellow, steel's grey) lives
@@ -75,15 +76,11 @@ header variants).
 
 ### Base Color ← `_d`
 
-Pass-through, which for Fallout 4 is the whole story by default: with no metal
-inferred there is nothing to recover, and the diffuse *is* the base colour
-(sRGB, alpha preserved for opacity).
-
-**Metal albedo recovery** below runs only where metallic is non-zero — that is,
-under an opted-in cubemap declaration or a painted correction mask. Vanilla
-metals are authored dark because the engine composites the cubemap on top, and
-PBR metal base color *is* the reflectance color, so recovered texels take **hue
-from the diffuse, brightness from spec**:
+Pass-through for dielectrics (sRGB, alpha preserved for opacity), with **metal
+albedo recovery** wherever the `_s.R` stencil says metal. Vanilla metals are
+authored dark because the engine composites the cubemap on top, and PBR metal
+base color *is* the reflectance color, so recovered texels take **hue from the
+diffuse, brightness from spec**:
 
 ```
 m           = metallic confidence (below)
@@ -307,19 +304,75 @@ In order:
    is 93% metal, but the generic `mipblur_defaultoutside1` carries 1309
    materials at 68% — and the other 32% are brick walls, hair and bloodbug fur.
 
-So **Fallout 4 converts dielectric.** `_s.R` goes where it belongs, into the F0
-window; metallic stays 0. Metal comes from the **correction mask**, where it is
-a decision someone made rather than one a heuristic guessed. A material with
-`bEnvironmentMapping` set gets a note saying it was reflective in game and
-converted dielectric — a note, deliberately *not* a review flag, because
-dielectric is the design and flagging 2381 materials would bury the queue.
+#### Metallic: a stencil, then a mask
 
-`Options::useCubemapMetalDeclaration` (the **Cubemap declares metal** parameter
-on *FO4 Conversion*) opts in to the cubemap rule for sets where the artist did
-name metal cubemaps. It admits metal only inside an explicitly metal-named cube
-and places it with a Levels window at **0.12 black / 0.45 white** — measured so
-78% of the 522 declared-metal materials stay metal at their median texel and 95%
-at p90, where the old 0.25 cut half of every declared metal in two.
+The conclusion above kills `_s.R` as a *classifier*. It does not kill it as a
+**stencil**, and that distinction is the whole FO4 metal workflow.
+
+The artist put the panel seams, rivets and wear into `_s.R`. Its *shape* is
+right. What it gets wrong is whole **regions** — the brick body, the leather
+grip, the wooden stock. Regional errors are two or three fills to paint out,
+where building metal up from zero means redrawing every rivet by hand. So FO4
+converts metal from `_s.R` and the user subtracts what should not be metal —
+the same direction of work as masking a layer in Substance Painter.
+
+That reframing changes what the window is tuned for, and it is easy to get
+wrong. Optimising for *decisiveness* alone — as little as possible in the
+ambiguous band — trivially favours a high threshold, because most of the corpus
+is mostly non-metal. That objective is wrong here. **Because the workflow
+subtracts, under-detecting is the fatal failure**: a metal object stencilled at
+0% gives the user nothing to paint out. Over-detecting is the cheap error.
+
+Measured over the name-labelled sets, "dead" = a metal material left with under
+2% metal, i.e. no usable starting point:
+
+| window | metal dead | median metal area | ambiguous |
+| --- | --- | --- | --- |
+| 0.35 / 0.45 | **21.0%** | 17.3% | 6.9% |
+| 0.25 / 0.35 | 12.5% | 35.4% | 12.5% |
+| **0.20 / 0.30** | **7.8%** | **46.0%** | **14.2%** |
+| 0.15 / 0.25 | 5.5% | 58.4% | 15.7% |
+| 0.20 / 0.45 | 8.0% | 34.7% | 31.8% |
+
+**0.20 black / 0.30 white** is the default — placed low so real metal survives,
+kept narrow so what it emits commits rather than smearing. 0.35/0.45 scored best
+on ambiguity alone and killed `MetalVerTrimFuturistic01` and `SerratedBlade`
+outright.
+
+On real vanilla with this window: SerratedBlade 80%, TireIron 88%,
+MetalVerTrimFuturistic01 45%, BrickRed01 50%. The brick is wrong — visibly and
+obviously wrong, which is the point. It is one fill to remove.
+
+**`fSpecularMult` is deliberately excluded from the stencil.** It scales the
+specular *response*, not the material class, so it belongs on the F0 axis where
+it genuinely dims a reflection. `MetalVerTrimFuturistic01` is metal trim whose
+`_s.R` peaks at 84/255 against a mult of 0.400; folding the mult in put it at
+0.13 and stencilled the material at 0% metal.
+
+The workflow is two steps, in this order:
+
+1. **Adjust the Levels**, per material, against the histogram the node draws
+   under its own handles. Drag the black point down for a mostly-metal object,
+   up for a mostly-painted one. Setting the black point to 1 converts fully
+   dielectric — that is the "no metal here at all" answer, and it holds even for
+   a saturated `_s.R` against a `fSpecularMult` above 1.
+2. **Paint the correction mask** for what the window cannot separate.
+   `applyMetallicCorrection` is 0.5-neutral and bidirectional: below 0.5 forces
+   dielectric, above forces metal, strength scaling with distance from neutral.
+   Subtracting is the common direction; adding is there for the metal the
+   stencil missed entirely.
+
+A material that produces metal and has never been masked is **flagged** — it is
+genuinely unfinished work, which is what the flagged walk exists for. Once a
+mask exists the material stops being flagged, whether the mask removed metal or
+added it.
+
+`cubemapDeclaresMetal()` survives here, but it changes **no pixel**. It orders
+the review queue: a material naming `metalchrome01cube_e` is 93% likely to be
+genuinely metal, so most of its stencil is probably right and it needs a light
+pass; one on the generic sky cube needs a hard look. The 3.1× enrichment is
+useful for deciding *what to review first* and useless for deciding what is
+metal.
 
 #### Model-space normals
 

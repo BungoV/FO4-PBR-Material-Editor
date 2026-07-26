@@ -79,9 +79,8 @@ bool cubemapDeclaresMetal(const QString& envmapTexture)
     if (name.isEmpty()) return false;
     // Explicitly metal-named cubes only. mipblur_defaultoutside1 carries by far
     // the most volume (1309 materials) and reads 68% metal by asset naming, but
-    // it is the generic sky cube: the other 32% are brick walls and hair, so
-    // admitting it would convert those to chrome. The names below cover 522
-    // vanilla materials scoring 55-100% metal.
+    // it is the generic sky cube: the other 32% are brick walls and hair. The
+    // names below cover 522 vanilla materials scoring 55-100% metal.
     static const char* const declarations[] = {
         "metalchrome", "metalbrushed", "metalshine", "chrome_e", "bronze_e",
         "copper_e", "gold_e", "silver_e", "steel_e",
@@ -91,14 +90,20 @@ bool cubemapDeclaresMetal(const QString& envmapTexture)
     return false;
 }
 
-float metallicConfidenceFo4(float specStrength, bool cubemapDeclaresMetal,
-    const Options& options)
+float metallicConfidenceFo4(float specStrength, const Options& options)
 {
-    if (!cubemapDeclaresMetal || !options.useCubemapMetalDeclaration) return 0.0f;
+    // Closing the window converts fully dielectric, and it has to hold for a
+    // saturated spec map too: specStrength is clamped to [0,1], so a start at
+    // or above 1 can admit nothing. Without this the degenerate smoothstep
+    // (edge0 == edge1) returns 1 for a texel sitting exactly on the edge, and
+    // vanilla ships plenty of _s.R at 255 against a specularMult above 1.
+    if (options.metalSpecStart >= 1.0f) return 0.0f;
     // One signal, not a joint one. The second opinion FO76 gets from diffuse
     // darkness does not exist here: measured over 5350 vanilla materials the
     // diffuse under high spec is BRIGHTER (median 95 against 76), so the FO76
     // gate transplanted into FO4 removed metal from the texels carrying it.
+    // Metal that should not be here is subtracted by the painted mask, which is
+    // the cheap direction -- see applyMetallicCorrection.
     return std::clamp(smoothstepf(options.metalSpecStart, options.metalSpecFull, specStrength),
         0.0f, 1.0f);
 }
@@ -214,11 +219,6 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
     }
     const float specMult = std::clamp(material.specularMult, 0.0f, 4.0f);
 
-    // Metal is a per-material declaration in FO4, made by the cubemap the
-    // artist chose and by nothing else in the file. Resolved once, outside the
-    // loop, because it cannot vary across the surface.
-    const bool declaredMetal = cubemapDeclaresMetal(material.envmapTexture);
-
     // The .bgsm smoothness scalar is a FALLBACK for a gloss channel that says
     // nothing, not a multiplier on one that does -- measured non-default in
     // 80.9% of flat-G maps against 20.8% of textured ones. Multiplying instead
@@ -240,14 +240,19 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
         for (int x = 0; x < width; ++x) {
             const QVector3D diffuseSrgb(diffuseLine[x * 4] / 255.0f, diffuseLine[x * 4 + 1] / 255.0f, diffuseLine[x * 4 + 2] / 255.0f);
             const QVector3D diffuseLinear = srgbToLinear(diffuseSrgb);
-            float specStrength = 0.0f, gloss = scalarGloss;
+            float storedSpec = 0.0f, gloss = scalarGloss;
             if (specular.valid()) {
                 const uchar* specTexel = specular.texel(x, y);
-                specStrength = std::clamp(specTexel[0] / 255.0f * specScale, 0.0f, 1.0f);
+                storedSpec = std::clamp(specTexel[0] / 255.0f * specScale, 0.0f, 1.0f);
                 if (!glossFromScalar) gloss = specTexel[1] / 255.0f;
             }
-            specStrength = std::clamp(specStrength * specMult, 0.0f, 1.0f);
-            float metallic = metallicConfidenceFo4(specStrength, declaredMetal, options);
+            // specularMult scales the SPECULAR RESPONSE, not the material class.
+            // It belongs on F0, where it genuinely dims a reflection, and NOT on
+            // the metal stencil: MetalVerTrimFuturistic01 is metal trim whose
+            // spec peaks at 84/255 against a mult of 0.400, and folding the
+            // mult in dropped it to 0.13 and stencilled the material at 0%.
+            const float specStrength = std::clamp(storedSpec * specMult, 0.0f, 1.0f);
+            float metallic = metallicConfidenceFo4(storedSpec, options);
             if (correction.valid())
                 metallic = applyMetallicCorrection(metallic, correction.texel(x, y)[0] / 255.0f);
             if (metallic > 0.5f) ++metalTexels;

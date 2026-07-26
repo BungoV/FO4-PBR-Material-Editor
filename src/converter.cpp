@@ -336,19 +336,20 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         if (material.environmentMapping && !material.envmapTexture.trimmed().isEmpty() && !sources.hasCubemapTint)
             result.notes.append(QStringLiteral("cubemap unavailable for tint: ") + material.envmapTexture);
 
-        // A note, deliberately not a flag. Fallout 4 converts dielectric by
-        // design, so a reflective material is the normal case, not a problem --
-        // flagging every one buried the review queue under a third of the
-        // corpus. The note still records which materials the game treated as
-        // reflective, so a --json run can list metal candidates for masking
-        // without the workspace treating them as unfinished work.
-        if (material.environmentMapping && !options.math.useCubemapMetalDeclaration
-            && correctionMask.isNull()) {
+        // Fallout 4's metal is a STENCIL off _s.R, not an answer, so a material
+        // that produced metal and has never been masked is genuinely unfinished
+        // work -- exactly what the flagged walk is for. Once a mask exists the
+        // material has been looked at and stops being flagged, whether the mask
+        // removed metal or added it.
+        if (converted.metalCoverage > 0.0f && correctionMask.isNull()) {
+            result.flagged = true;
             result.notes.append(QStringLiteral(
-                "reflective in game (cubemap %1): converted dielectric — "
-                "paint a correction mask to make it metal")
-                    .arg(material.envmapTexture.trimmed().isEmpty()
-                             ? QStringLiteral("none") : material.envmapTexture.trimmed()));
+                "%1% metal from _s.R, unmasked — tune the Levels window, then "
+                "paint out what should not be metal%2")
+                    .arg(converted.metalCoverage * 100.0f, 0, 'f', 1)
+                    .arg(cubemapDeclaresMetal(material.envmapTexture)
+                             ? QStringLiteral(" (names a metal cubemap, so most of this is probably right)")
+                             : QString()));
         }
     }
     if (converted.baseColor.isNull()) {

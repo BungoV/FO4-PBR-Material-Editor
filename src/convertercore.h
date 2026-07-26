@@ -23,22 +23,32 @@ struct Options {
     float metalF0Max = 0.85f;
     float diffuseReliabilityThreshold = 0.09f; // linear luma below which the cubemap tint owns the hue
     float cubemapTintSaturationClamp = 0.35f;  // scene-neutral cubes must not tint metals
-    // FO4 metal window, applied ONLY inside a cubemap metal declaration (see
-    // cubemapDeclaresMetal). Measured over the 522 vanilla materials that name
-    // an explicitly metal cubemap: median _s.R p50 = 62/255, p90 = 106/255. A
-    // black point at 0.12 leaves 78% of those materials metal at their median
-    // and 95% at p90; the old 0.25 cut half of every declared metal in two.
-    float metalSpecStart = 0.12f, metalSpecFull = 0.45f;
-    // Whether the cubemap name may declare metal at all. OFF by default:
-    // nothing in a .bgsm states metallicity, so Fallout 4 converts dielectric
-    // and _s.R goes where it belongs -- clamped into the F0 window below.
-    // Metal comes from the correction mask, where it is a decision someone
-    // made rather than one a heuristic guessed. Turning this on admits metal
-    // for materials naming an explicitly metal cubemap (chrome, brushed,
-    // bronze); that reads 55-100% metal by asset naming across 522 vanilla
-    // materials, which is the best any automatic rule managed, and still not
-    // good enough to be the default.
-    bool useCubemapMetalDeclaration = false;
+    // FO4 metal window over _s.R. This is a STENCIL, not a classifier, and the
+    // distinction sets the numbers. As a classifier _s.R is worthless -- 53%
+    // precision, measured (see docs) -- but the artist put the panel seams,
+    // rivets and wear into that channel, so its SHAPE is right and what it gets
+    // wrong is whole regions: the brick body, the leather grip, the wood stock.
+    // Those are a couple of fills to mask out, where painting metal in from
+    // nothing means rebuilding all that structure by hand.
+    //
+    // Because the workflow subtracts, UNDER-detecting is the fatal failure: a
+    // metal object stencilled at 0% gives the user nothing to paint out.
+    // Over-detecting is the cheap error -- a brick wall reading metal is one
+    // fill to remove. So the window is placed low and kept narrow: low so real
+    // metal survives, narrow so what it does emit is decisive rather than
+    // smeared across the ambiguous band a PBR validator flags.
+    //
+    // Measured over the name-labelled vanilla sets, share of METAL materials
+    // left with under 2% metal ("dead", no usable starting point):
+    //     0.35/0.45   21.0% dead,  6.9% ambiguous   <- optimising ambiguity
+    //     0.25/0.35   12.5% dead, 12.5% ambiguous      alone picks this, and
+    //     0.20/0.30    7.8% dead, 14.2% ambiguous   <- it is the wrong target
+    //     0.15/0.25    5.5% dead, 15.7% ambiguous
+    // 0.35/0.45 killed MetalVerTrimFuturistic01 and SerratedBlade outright.
+    //
+    // The user drags these per material against the histogram on the Levels
+    // node; setting metalSpecStart to 1 converts fully dielectric.
+    float metalSpecStart = 0.20f, metalSpecFull = 0.30f;
     // Gloss/smoothness -> roughness response curve (1 = linear invert).
     float glossCurve = 1.0f;
     // Dielectric F0 window (the physical dielectric range).
@@ -73,22 +83,21 @@ float luminance(const QVector3D& linearColor);
 // Roughness from FO4 glossiness / FO76 smoothness.
 float glossToRoughness(float gloss, const Options& options);
 
-// Does this cubemap path name an explicit metal? Fallout 4 states metallicity
-// nowhere -- not in _s, not in the diffuse, not in bEnvironmentMapping (vanilla
-// puts that on brick) -- so the one place an artist ever wrote "this is metal"
-// is the cubemap they chose. Matches chrome/brushed/bronze/copper/gold/silver/
-// steel cube names; deliberately NOT the general-purpose sky cubes, which carry
-// the volume but are used on everything. See docs/FO4-Conversion.md.
+// Does this cubemap path name an explicit metal? Not a gate on the conversion
+// -- nothing in a .bgsm is reliable enough for that -- but the strongest hint
+// the format carries (55-100% metal by asset naming across 522 vanilla
+// materials), so it orders the review queue: materials naming a metal cubemap
+// are the ones worth masking first. Matches chrome/brushed/bronze/copper/gold/
+// silver/steel cube names; deliberately NOT the general-purpose sky cubes,
+// which carry the volume but are used on brick. See docs/FO4-Conversion.md.
 bool cubemapDeclaresMetal(const QString& envmapTexture);
 
-// FO4 metallic confidence. The cubemap declaration decides WHETHER a material
-// has metal; _s.R decides WHERE on the surface it is, cutting the grime and
-// paint that sit over it. There is no second per-texel opinion: the diffuse
+// FO4 metallic stencil from _s.R. One signal, no second opinion: the diffuse
 // darkness that makes FO76's gate reliable runs backwards in FO4 (measured
 // ratio 0.84, agreeing in 26% of materials against FO76's 92.5%), so including
-// it removed metal from exactly the texels that carry it.
-float metallicConfidenceFo4(float specStrength, bool cubemapDeclaresMetal,
-    const Options& options);
+// it removed metal from exactly the texels that carry it. The result is a
+// starting point for masking, not an answer -- see Options::metalSpecStart.
+float metallicConfidenceFo4(float specStrength, const Options& options);
 
 // FO76 metallic confidence: reflectance intensity joined with diffuse
 // near-blackness (true specular workflow - metals have black diffuse).

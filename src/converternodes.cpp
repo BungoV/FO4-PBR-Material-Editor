@@ -265,8 +265,6 @@ Converter::Options mathOptions(const QJsonObject& params)
     options.specNormalizePercentile = paramFloat(params, "specPercentile", options.specNormalizePercentile);
     options.metalSpecStart = paramFloat(params, "metalSpecStart", options.metalSpecStart);
     options.metalSpecFull = paramFloat(params, "metalSpecFull", options.metalSpecFull);
-    options.useCubemapMetalDeclaration = paramBool(params, "cubemapDeclaresMetal",
-        options.useCubemapMetalDeclaration);
     options.dielectricF0Min = paramFloat(params, "dielectricF0Min", options.dielectricF0Min);
     options.dielectricF0Max = paramFloat(params, "dielectricF0Max", options.dielectricF0Max);
     options.fo76ReflectanceStart = paramFloat(params, "fo76ReflectanceStart", options.fo76ReflectanceStart);
@@ -717,16 +715,15 @@ void registerAll(Registry& registry)
         spec.params = sharedMathParams();
         spec.params.prepend(floatParam("recovery", "Metal recovery", 1.0, 0.0, 1.0, 0.05,
             "How strongly dark vanilla metals are rebuilt toward their true albedo."));
-        spec.params.append(boolParam("cubemapDeclaresMetal", "Cubemap declares metal", false,
-            "Off (the default) converts Fallout 4 fully dielectric: _s.R clamps into the "
-            "F0 window and metal comes from the correction mask. On admits metal for "
-            "materials naming an explicitly metal cubemap."));
         spec.params.append(boolParam("normalizeSpec", "Normalize spec", false,
             "Percentile-stretch each spec map. Off by default: it stretches a continuous "
-            "quantity per material, and the chrome it once prevented is gated elsewhere now."));
+            "quantity per material, which flattens the difference between materials."));
         spec.params.append(floatParam("specPercentile", "Spec clamp %", 0.98, 0.5, 1.0, 0.01));
-        spec.params.append(floatParam("metalSpecStart", "Metal spec start", 0.12, 0.0, 1.0, 0.01));
-        spec.params.append(floatParam("metalSpecFull", "Metal spec full", 0.45, 0.0, 1.0, 0.01));
+        spec.params.append(floatParam("metalSpecStart", "Metal spec start", 0.20, 0.0, 1.0, 0.01,
+            "The _s.R stencil window, read before specularMult. Keep it in step with the "
+            "Levels node feeding Metallic, or the recovered metal colour lands somewhere the "
+            "metallic channel does not. Set to 1 to convert fully dielectric."));
+        spec.params.append(floatParam("metalSpecFull", "Metal spec full", 0.30, 0.0, 1.0, 0.01));
         spec.evaluate = [](const EvalArgs& args, EvalOutput* output) {
             const Bgsm::Material* material = materialInput(args, output);
             if (!material) return;
@@ -2630,29 +2627,41 @@ Graph defaultFo4Graph()
 
     // ---- FO4 conversion, written out as nodes -------------------------------
     // Structurally unlike FO76's, because the two titles do not store the same
-    // thing. FO76 states reflectance per texel in _r, so its metal mask is a
-    // measurement. Fallout 4 states metallicity NOWHERE, so there is no metal
-    // branch here at all and the graph reads:
+    // thing:
     //
-    //   roughness = 1 - _s.G     (the .bgsm smoothness where G is flat)
-    //   F0        = clamp(_s.R)  into the dielectric window, off convert.fo4
-    //   metallic  = unwired, which Combine Maps holds at 0
+    //   metallic  = levels(.35,.45, _s.R)   a STENCIL, then masked by hand
+    //   roughness = 1 - _s.G                (the .bgsm smoothness where G is flat)
+    //   F0        = clamp(_s.R) into the dielectric window, off convert.fo4
     //
-    // That is not a shortcut, it is the measurement. Over 6616 vanilla
-    // materials nothing classifies metal better than a coin flip: _s.R alone
-    // separates metal from dielectric by +22 points at ~53% precision, _s.R and
-    // _s.G jointly do WORSE (+19), and inside the envmap gate the two
-    // populations are identical (metal p50 64, dielectric p50 63). The diffuse
-    // gate that carries FO76 runs backwards here. Metal comes from the
-    // correction mask, where it is a decision someone made.
+    // FO76 states reflectance per texel in _r, so its metal mask is a
+    // measurement and the Levels window is calibrated for accuracy. Fallout 4
+    // states metallicity nowhere: as a CLASSIFIER _s.R manages 53% precision,
+    // measured over 6616 materials, and _s.R with _s.G jointly does worse. But
+    // the artist put the panel seams, rivets and wear into that channel, so its
+    // SHAPE is right and what it gets wrong is whole regions -- the brick body,
+    // the leather grip, the wood stock. Those are a couple of fills to paint
+    // out, where building metal up from nothing means redrawing all of it.
+    //
+    // Because the workflow SUBTRACTS, the window is placed low and kept narrow.
+    // Low because a metal object stencilled at 0% gives nothing to paint out --
+    // measured, 0.35/0.45 leaves 21% of name-labelled metal materials dead and
+    // killed MetalVerTrimFuturistic01 outright, where 0.20/0.30 leaves 7.8%.
+    // Narrow because what it does emit should commit rather than smear across
+    // the ambiguous band: 14.2% of the median map, against 31.8% at 0.20/0.45.
+    // Drag the handles against the histogram per material -- that is the first
+    // half of the workflow, and painting is the second.
+    const QString metallic = builder.add("image.levels", 700, 120,
+        {{QStringLiteral("inBlack"), 0.20}, {QStringLiteral("inWhite"), 0.30}});
+    builder.link(upSpecular, "image", metallic, "image");
+
     const QString roughness = builder.add("image.invert", 700, 260);
     builder.link(unpack, "gloss", roughness, "image");
 
-    // convert.fo4 is here for the base colour and the F0 axis, not for metal:
-    // with the cubemap declaration off (its default) it recovers nothing and
-    // passes the diffuse through, which is the correct conversion for a
-    // dielectric. Turn the declaration on inside this node for a set where the
-    // artist did name metal cubemaps and you want them converted automatically.
+    // convert.fo4 supplies the base colour (with metal albedo recovery) and the
+    // F0 axis. It runs the same _s.R window internally, so the metal it
+    // recovers colour for is the metal the Levels node above stencils out --
+    // change one and change the other, or the recovery lands somewhere the
+    // metallic channel does not.
     const QString convert = builder.add("convert.fo4", 920, 380);
     builder.link(material, "material", convert, "material");
     builder.link(upDiffuse, "image", convert, "diffuse");
@@ -2678,8 +2687,7 @@ Graph defaultFo4Graph()
     builder.link(upNormal, "image", channels, "normal");
     builder.link(derive, "curvature", channels, "curvature");
     builder.link(roughness, "image", channels, "roughness");
-    // Metallic deliberately unwired — Combine Maps holds it at 0. Wire a
-    // painted correction mask in for a material that should be metal.
+    builder.link(metallic, "image", channels, "metallic");
     builder.link(derive, "ao", channels, "ao"); // derived detail AO, not the conversion's B
     builder.link(rmaosSplit, "a", channels, "specular");
     builder.link(convert, "emissive", channels, "emissive");
