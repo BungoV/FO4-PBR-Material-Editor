@@ -655,6 +655,93 @@ void registerAll(Registry& registry)
         registry.add(spec);
     }
 
+    {
+        // The painted correction, as a node. It used to be an input port on the
+        // conversion nodes that no preset ever wired, and the orchestrator only
+        // read the sidecar on the NON-graph path -- so every mask painted in
+        // the workspace was silently discarded, because the workspace always
+        // converts through the graph. Making it a source node fixes that and
+        // generalises it: a mask can drive metallic, or roughness, or a Mix
+        // factor, or anything else, instead of being a special case one node
+        // knew about.
+        //
+        // The pixels are per MATERIAL and the graph is a PRESET shared across
+        // all of them, so the node stores no image. It names a role and the
+        // evaluation context supplies that material's sidecar -- the same
+        // arrangement source.material.fo4 uses to mean "whatever the queue
+        // selected" rather than a fixed path.
+        NodeTypeSpec spec;
+        spec.id = QStringLiteral("source.paintMask");
+        spec.name = QStringLiteral("Paint Mask");
+        spec.category = QStringLiteral("Source");
+        spec.summary = QStringLiteral("The mask painted for this material. Wire Factor and Value "
+                                      "into a Mix to override whatever the graph inferred.");
+        spec.outputs = {imagePort("factor", "Factor"), imagePort("value", "Value"),
+            imagePort("raw", "Raw")};
+        spec.params = {ParamSpec{QStringLiteral("role"), QStringLiteral("Role"),
+            ParamSpec::Kind::Text, 0, 0, 0, QStringLiteral("metal"), {},
+            QStringLiteral("Which sidecar this node paints. One mask per role, so a graph can "
+                           "correct metal and something else independently.")}};
+        spec.evaluate = [](const EvalArgs& args, EvalOutput* output) {
+            QString path = args.context.correctionMaskPath;
+            const QString role = paramString(args.params, "role").trimmed();
+            // Any role but the default gets its own sidecar beside the first.
+            if (!path.isEmpty() && !role.isEmpty() && role != QLatin1String("metal"))
+                path.replace(QStringLiteral("_correction."), QStringLiteral("_") + role + QStringLiteral("."));
+
+            QImage mask;
+            if (!path.isEmpty()) mask = QImage(path);
+            if (mask.isNull()) {
+                // No mask painted yet is the normal case, not an error: a fully
+                // zero FACTOR overrides nothing, so a wired Mix passes the
+                // inference straight through.
+                output->outputs.insert(QStringLiteral("factor"), Value::fromImage(QImage()));
+                output->outputs.insert(QStringLiteral("value"), Value::fromImage(QImage()));
+                output->outputs.insert(QStringLiteral("raw"), Value::fromImage(QImage()));
+                output->status = QStringLiteral("nothing painted");
+                return;
+            }
+            const QImage raw = toRgba(mask);
+            QImage factor(raw.width(), raw.height(), QImage::Format_RGBA8888);
+            QImage value(raw.width(), raw.height(), QImage::Format_RGBA8888);
+            // 0.5 is neutral. Distance from it is HOW MUCH to override, which
+            // side decides WHAT to. Both are computed here rather than left to
+            // generic maths downstream because |m - 0.5| * 2 needs an
+            // intermediate outside 0-1, and every image port is 8-bit.
+            qint64 touched = 0;
+            for (int y = 0; y < raw.height(); ++y) {
+                const uchar* in = raw.constScanLine(y);
+                uchar* factorLine = factor.scanLine(y);
+                uchar* valueLine = value.scanLine(y);
+                for (int x = 0; x < raw.width(); ++x) {
+                    const int painted = in[x * 4];
+                    // Byte maths, not float. Neutral is 128, and 128/255 is not
+                    // 0.5 — computing |m - 0.5| in float leaves an unpainted
+                    // texel with a factor of 1/255, which is a Mix quietly
+                    // dragging the whole map 0.4% toward the override.
+                    // Distances are scaled by 255/127 so 0 and 255 both reach
+                    // exactly full strength and 128 reaches exactly zero.
+                    const uchar strengthByte = uchar(std::min(255, std::abs(painted - 128) * 255 / 127));
+                    const uchar side = painted >= 128 ? 255 : 0;
+                    if (strengthByte > 2) ++touched;
+                    factorLine[x * 4] = factorLine[x * 4 + 1] = factorLine[x * 4 + 2] = strengthByte;
+                    factorLine[x * 4 + 3] = 255;
+                    valueLine[x * 4] = valueLine[x * 4 + 1] = valueLine[x * 4 + 2] = side;
+                    valueLine[x * 4 + 3] = 255;
+                }
+            }
+            output->outputs.insert(QStringLiteral("factor"), Value::fromImage(factor));
+            output->outputs.insert(QStringLiteral("value"), Value::fromImage(value));
+            output->outputs.insert(QStringLiteral("raw"), Value::fromImage(raw));
+            output->nativeResolution = std::max(raw.width(), raw.height());
+            const double covered = 100.0 * double(touched)
+                / std::max<double>(1.0, double(raw.width()) * raw.height());
+            output->status = QStringLiteral("%1×%2 · %3% painted")
+                .arg(raw.width()).arg(raw.height()).arg(covered, 0, 'f', 1);
+        };
+        registry.add(spec);
+    }
+
     // ---------------- Inference ----------------
     // No whole-conversion nodes live here any more. `convert.fo4` and
     // `convert.fo76` used to do an entire title's conversion behind one header,
@@ -2642,10 +2729,23 @@ Graph defaultFo4Graph()
     // material stays tied to something, and a flat map stays flat. _s.R has no
     // anchor at all, so auto levels would stretch a brick wall's own spec
     // variation across the full range and stencil it as metal, every time.
-    const QString metallic = builder.add("image.levels", 700, 120,
+    const QString stencil = builder.add("image.levels", 700, 120,
         {{QStringLiteral("inBlack"), 0.20}, {QStringLiteral("inWhite"), 0.30},
             {QStringLiteral("autoLevels"), false}});
-    builder.link(upSpecular, "image", metallic, "image");
+    builder.link(upSpecular, "image", stencil, "image");
+
+    // ---- The painted correction -------------------------------------------
+    // Second half of the workflow, and the reason the stencil is allowed to
+    // over-detect: whatever it got wrong is painted out here. Factor is how
+    // hard the brush hit a texel, Value is which way, so the Mix overrides only
+    // where someone actually painted and passes the stencil through everywhere
+    // else. With nothing painted the Factor image is null and Mix returns A
+    // untouched, so an unmasked material converts exactly as before.
+    const QString paint = builder.add("source.paintMask", 700, 200);
+    const QString metallic = builder.add("image.mix", 920, 160);
+    builder.link(stencil, "image", metallic, "a");
+    builder.link(paint, "value", metallic, "b");
+    builder.link(paint, "factor", metallic, "factor");
 
     const QString roughness = builder.add("image.invert", 700, 260);
     builder.link(unpack, "gloss", roughness, "image");
@@ -2834,15 +2934,24 @@ Graph defaultFo76Graph()
     // 252-255 on every material tested, making the multiply a no-op.
     const QString darkSignal = builder.add("image.levels", 700, 200,
         {{QStringLiteral("inBlack"), 0.20}, {QStringLiteral("inWhite"), 0.11}});
-    const QString metallic = builder.add("math.op", 920, 160, {{QStringLiteral("operation"), 2}});
+    const QString inferred = builder.add("math.op", 920, 160, {{QStringLiteral("operation"), 2}});
+    // The painted correction overrides the inference wherever someone painted,
+    // and nowhere else. FO76's mask is a measurement rather than a stencil, so
+    // this is a genuine correction rather than the main event it is in FO4 —
+    // but a mask that only worked on one of the two titles would be a trap.
+    const QString paint = builder.add("source.paintMask", 920, 240);
+    const QString metallic = builder.add("image.mix", 1140, 200);
+    builder.link(inferred, "image", metallic, "a");
+    builder.link(paint, "value", metallic, "b");
+    builder.link(paint, "factor", metallic, "factor");
     builder.link(upDiffuse, "image", diffuseLinear, "image");
     builder.link(upReflectance, "image", reflectanceLinear, "image");
     builder.link(upReflectance, "image", reflLuma, "image");
     builder.link(upDiffuse, "image", diffLuma, "image");
     builder.link(reflLuma, "image", reflSignal, "image");
     builder.link(diffLuma, "image", darkSignal, "image");
-    builder.link(reflSignal, "image", metallic, "a");
-    builder.link(darkSignal, "image", metallic, "b");
+    builder.link(reflSignal, "image", inferred, "a");
+    builder.link(darkSignal, "image", inferred, "b");
 
     // Roughness is the inversion and nothing else. A gloss-curve node used to
     // sit here at pow(x, 1.0) — the identity — as a place to dial a curve in,

@@ -3159,11 +3159,19 @@ int main(int argc, char* argv[])
             check(!carriesConversionNode(fo4) && !carriesConversionNode(ConverterNodes::defaultFo76Graph()),
                 QStringLiteral("neither preset carries a whole-conversion node"));
 
-            // The Levels node feeding Combine Maps > Metallic is the metal
-            // stencil, and its window has to be the one convertFo4 uses.
-            QString metallicSource;
-            for (const NodeGraph::Connection& link : fo4.connections)
-                if (link.toPort == QStringLiteral("metallic")) metallicSource = link.fromNode;
+            // The metal stencil's window has to be the one convertFo4 uses.
+            // Walk back from Combine Maps > Metallic: the painted correction
+            // Mix sits in between now, so follow its A input to the Levels.
+            const auto sourceOf = [&fo4](const QString& node, const QString& port) {
+                for (const NodeGraph::Connection& link : fo4.connections)
+                    if (link.toPort == port && (node.isEmpty() || link.toNode == node))
+                        return link.fromNode;
+                return QString();
+            };
+            QString metallicSource = sourceOf(QString(), QStringLiteral("metallic"));
+            if (const NodeGraph::Node* mix = metallicSource.isEmpty() ? nullptr : fo4.node(metallicSource);
+                mix && mix->typeId == QStringLiteral("image.mix"))
+                metallicSource = sourceOf(mix->id, QStringLiteral("a"));
             const NodeGraph::Node* stencil = metallicSource.isEmpty() ? nullptr : fo4.node(metallicSource);
             check(stencil && stencil->typeId == QStringLiteral("image.levels"),
                 QStringLiteral("metallic is fed by a Levels node the user can drag"));
@@ -3185,6 +3193,26 @@ int main(int argc, char* argv[])
             for (const NodeGraph::Connection& link : fo4.connections)
                 if (link.toPort == QStringLiteral("specular")) specularSource = link.fromNode;
             const NodeGraph::Node* f0 = specularSource.isEmpty() ? nullptr : fo4.node(specularSource);
+            // The painted mask has to be WIRED, in both presets. It was an
+            // optional port on the retired conversion nodes that no preset ever
+            // connected, and the orchestrator only read the sidecar on the
+            // non-graph path — so every mask painted in the workspace was
+            // silently discarded, because the workspace always uses the graph.
+            for (const auto& preset : {std::make_pair(QStringLiteral("FO4"), fo4),
+                     std::make_pair(QStringLiteral("FO76"), ConverterNodes::defaultFo76Graph())}) {
+                QString paintNode;
+                for (const NodeGraph::Node& node : preset.second.nodes)
+                    if (node.typeId == QStringLiteral("source.paintMask")) paintNode = node.id;
+                bool factorWired = false, valueWired = false;
+                for (const NodeGraph::Connection& link : preset.second.connections) {
+                    if (link.fromNode != paintNode) continue;
+                    if (link.fromPort == QStringLiteral("factor")) factorWired = true;
+                    if (link.fromPort == QStringLiteral("value")) valueWired = true;
+                }
+                check(!paintNode.isEmpty() && factorWired && valueWired,
+                    QStringLiteral("the %1 preset wires a Paint Mask into the metal path").arg(preset.first));
+            }
+
             check(f0 && f0->typeId == QStringLiteral("image.levels")
                     && std::abs(f0->params.value(QStringLiteral("outBlack")).toDouble()
                            - defaults.dielectricF0Min) < 1e-4
@@ -3615,6 +3643,51 @@ int main(int argc, char* argv[])
         check(NodeCanvas::channelAsImage(QImage(), 0).isNull()
             && NodeCanvas::channelAsImage(source, 9).isNull(),
             QStringLiteral("a null image or a bad channel index copies nothing"));
+
+        // Paint Mask splits the 0.5-neutral sidecar into the two things a Mix
+        // needs. Both are computed in the node because |m - 0.5| * 2 needs an
+        // intermediate outside 0-1 and every image port is 8-bit.
+        {
+            QTemporaryDir maskDir;
+            QImage painted(4, 4, QImage::Format_RGBA8888);
+            painted.fill(QColor(128, 128, 128));            // neutral
+            painted.setPixelColor(0, 0, QColor(0, 0, 0));   // hard dielectric
+            painted.setPixelColor(1, 0, QColor(255, 255, 255)); // hard metal
+            painted.setPixelColor(2, 0, QColor(64, 64, 64));    // half-strength dielectric
+            const QString maskPath = QDir(maskDir.path()).filePath(QStringLiteral("m_correction.png"));
+            painted.save(maskPath);
+
+            const NodeGraph::NodeTypeSpec* paintSpec =
+                ConverterNodes::sharedRegistry().find(QStringLiteral("source.paintMask"));
+            NodeGraph::EvalArgs args;
+            args.params = paintSpec ? paintSpec->defaultParams() : QJsonObject();
+            args.context.correctionMaskPath = maskPath;
+            NodeGraph::EvalOutput out;
+            if (paintSpec) paintSpec->evaluate(args, &out);
+            const QImage factor = out.outputs.value(QStringLiteral("factor")).image();
+            const QImage value = out.outputs.value(QStringLiteral("value")).image();
+            check(!factor.isNull() && !value.isNull()
+                    && QColor(factor.pixelColor(3, 3)).red() == 0,
+                QStringLiteral("an unpainted texel has zero factor, so a Mix leaves the inference alone"));
+            check(QColor(factor.pixelColor(0, 0)).red() == 255
+                    && QColor(value.pixelColor(0, 0)).red() == 0,
+                QStringLiteral("a black stroke is full-strength and overrides to dielectric"));
+            check(QColor(factor.pixelColor(1, 0)).red() == 255
+                    && QColor(value.pixelColor(1, 0)).red() == 255,
+                QStringLiteral("a white stroke is full-strength and overrides to metal"));
+            const int partial = QColor(factor.pixelColor(2, 0)).red();
+            check(partial > 100 && partial < 155,
+                QStringLiteral("a half-strength stroke blends rather than snapping (%1)").arg(partial));
+
+            // Nothing painted must not fail — it is the normal case.
+            NodeGraph::EvalArgs empty;
+            empty.params = args.params;
+            NodeGraph::EvalOutput none;
+            if (paintSpec) paintSpec->evaluate(empty, &none);
+            check(none.error.isEmpty()
+                    && none.outputs.value(QStringLiteral("factor")).image().isNull(),
+                QStringLiteral("no mask painted is not an error, and overrides nothing"));
+        }
 
         // Every node that carries texture data must be able to offer this, so
         // the menu has something to enumerate: image outputs, by port.

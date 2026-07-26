@@ -356,11 +356,33 @@ The workflow is two steps, in this order:
    up for a mostly-painted one. Setting the black point to 1 converts fully
    dielectric — that is the "no metal here at all" answer, and it holds even for
    a saturated `_s.R` against a `fSpecularMult` above 1.
-2. **Paint the correction mask** for what the window cannot separate.
-   `applyMetallicCorrection` is 0.5-neutral and bidirectional: below 0.5 forces
-   dielectric, above forces metal, strength scaling with distance from neutral.
-   Subtracting is the common direction; adding is there for the metal the
-   stencil missed entirely.
+2. **Paint the correction mask** for what the window cannot separate. It is
+   0.5-neutral and bidirectional: below 0.5 forces dielectric, above forces
+   metal, strength scaling with distance from neutral. Subtracting is the common
+   direction; adding is there for the metal the stencil missed entirely.
+
+   The mask reaches the conversion as a **Paint Mask node** (`source.paintMask`),
+   wired into a Mix in both presets. It emits `Factor` (how hard a texel was
+   painted) and `Value` (which way), so the Mix overrides only where someone
+   painted and passes the inference through everywhere else. Both are computed
+   inside the node: `|m − 0.5| × 2` needs an intermediate outside 0–1 and every
+   image port is 8-bit. It is byte maths rather than float, because neutral is
+   byte 128 and 128/255 is *not* 0.5 — in float an unpainted texel came out with
+   a factor of 1/255, a Mix quietly dragging the whole map toward the override.
+
+   The node stores no pixels. Pixels are per **material** and a graph is a
+   **preset** shared across all of them, so the node names a role and the
+   evaluation context supplies that material's sidecar — the same arrangement
+   `source.material.fo4` uses to mean "whatever the queue selected". Give a
+   second Paint Mask node a different role and it gets its own sidecar, so one
+   graph can correct metal and something else independently.
+
+   **This is also a bug fix.** The mask used to be an optional input port on the
+   conversion nodes that no preset ever wired, and `converter.cpp` only read the
+   sidecar on the non-graph path — while the workspace *always* converts through
+   the graph. Every mask painted in the GUI was silently discarded. Verified
+   fixed end to end: TireIron converts 88% metal unmasked and 49% with half the
+   map painted dielectric.
 
 A material that produces metal and has never been masked is **flagged** — it is
 genuinely unfinished work, which is what the flagged walk exists for. Once a
