@@ -394,13 +394,29 @@ A→B→A mistake. Treating it as an error flagged roughly 3400 materials over a
 template that had already resolved correctly. An unresolvable root is still an
 error.
 
-#### The graph carries no conversion node
+#### Presets, not conversion nodes
 
-`convert.fo4` is gone from the stock FO4 graph, which is now generic nodes
-throughout, the way the FO76 one is: Separate Maps → Upscale → Levels for the
-metal stencil, Invert for roughness, sRGB→Linear / Mix / Linear→sRGB for base
-colour, one Levels for F0, Solid Colour × Math for emissive. The node stays
-registered as a reference to diff against.
+**`convert.fo4` and `convert.fo76` are retired — neither node type exists any
+more.** Both stock graphs are generic nodes throughout: Separate Maps → Upscale
+→ Levels for the metal stencil, Invert for roughness, sRGB→Linear / Mix /
+Linear→sRGB for base colour, one Levels for F0, Solid Colour × Math for
+emissive.
+
+A registered node that no shipped graph uses is a *second definition of the
+same conversion*, sitting one refactor away from disagreeing with the one that
+actually runs. The recipes live in the graph **presets** instead
+(`defaultFo4Graph`, `defaultFo76Graph`, and anything saved beside them), where
+every threshold is on the canvas and tunable per material.
+
+`Converter::convertFo4` / `convertFo76` stay as the batch path — that is the
+same maths, not a duplicate of it. The two are pinned to each other in tests:
+the preset's stencil Levels window must equal `Options::metalSpecStart/Full`,
+and the F0 ramp's out-points must equal the dielectric window. Checked
+end-to-end on real vanilla too — TireIron converts 88% metal through the preset
+against 88.2% through the batch path.
+
+A graph saved before the retirement still loads; the retired node reports as an
+unknown type rather than taking the graph down with it.
 
 One exception, and it is a real one rather than laziness. **Metal Albedo**
 (`color.metalAlbedo`) is its own node because rebuilding a metal's colour means
@@ -513,10 +529,10 @@ mask that must saturate; roughness is a measurement.
 
 The stock graph is therefore an Invert and nothing else. A gloss-curve node used
 to sit after it at `pow(x, 1.0)` — the identity — as somewhere to dial a curve
-in, but a node that computes nothing is clutter, and the curve already has three
-homes that do something: the `convert.fo76` node's `glossCurve` param,
-`pbrm convert --gloss-curve`, and `convertercore::glossToRoughness`. "No curve"
-is best expressed by there being no node.
+in, but a node that computes nothing is clutter, and the curve already has two
+homes that do something: `pbrm convert --gloss-curve` and
+`convertercore::glossToRoughness`. "No curve" is best expressed by there being
+no node.
 
 **Known open point.** The `.bgsm` `smoothness` scalar is *discarded* whenever an
 `_l` texture exists — `convertercore.cpp` sets it then overwrites it with the

@@ -257,49 +257,6 @@ const Bgsm::Material* materialInput(const EvalArgs& args, EvalOutput* output)
     return material.get();
 }
 
-Converter::Options mathOptions(const QJsonObject& params)
-{
-    Converter::Options options;
-    options.recoveryStrength = paramFloat(params, "recovery", options.recoveryStrength);
-    options.glossCurve = paramFloat(params, "glossCurve", options.glossCurve);
-    options.normalizeSpec = paramBool(params, "normalizeSpec", options.normalizeSpec);
-    options.specNormalizePercentile = paramFloat(params, "specPercentile", options.specNormalizePercentile);
-    options.metalSpecStart = paramFloat(params, "metalSpecStart", options.metalSpecStart);
-    options.metalSpecFull = paramFloat(params, "metalSpecFull", options.metalSpecFull);
-    options.dielectricF0Min = paramFloat(params, "dielectricF0Min", options.dielectricF0Min);
-    options.dielectricF0Max = paramFloat(params, "dielectricF0Max", options.dielectricF0Max);
-    options.fo76ReflectanceStart = paramFloat(params, "fo76ReflectanceStart", options.fo76ReflectanceStart);
-    options.fo76ReflectanceFull = paramFloat(params, "fo76ReflectanceFull", options.fo76ReflectanceFull);
-    options.fo76DarkStart = paramFloat(params, "fo76DarkStart", options.fo76DarkStart);
-    options.fo76DarkFull = paramFloat(params, "fo76DarkFull", options.fo76DarkFull);
-    return options;
-}
-
-void addConvertedOutputs(const Converter::ConvertedImages& converted, EvalOutput* output)
-{
-    output->outputs.insert(QStringLiteral("baseColor"), Value::fromImage(converted.baseColor));
-    output->outputs.insert(QStringLiteral("rmaos"), Value::fromImage(converted.rmaos));
-    output->outputs.insert(QStringLiteral("emissive"), Value::fromImage(converted.emissive));
-    // Null unless the material scatters, exactly like emissive: the port stays
-    // present so a hand-wired network can reach the mask without the conversion
-    // node silently dropping it.
-    output->outputs.insert(QStringLiteral("subsurface"), Value::fromImage(converted.subsurface));
-    output->outputs.insert(QStringLiteral("metallic"), Value::fromImage(converted.metallic));
-    output->outputs.insert(QStringLiteral("metalCoverage"), Value::fromScalar(converted.metalCoverage));
-    output->notes.append(QStringLiteral("metal coverage %1%").arg(int(std::lround(converted.metalCoverage * 100.0f))));
-}
-
-// Shared parameter block for both conversion profiles.
-QVector<ParamSpec> sharedMathParams()
-{
-    return {
-        floatParam("glossCurve", "Gloss curve", 1.0, 0.25, 4.0, 0.05,
-            "Response curve from glossiness/smoothness to roughness. 1 = linear invert."),
-        floatParam("dielectricF0Min", "Dielectric F0 min", 0.02, 0.0, 0.2, 0.005),
-        floatParam("dielectricF0Max", "Dielectric F0 max", 0.08, 0.0, 0.3, 0.005),
-    };
-}
-
 } // namespace
 
 void registerCategoryColors(Registry& registry)
@@ -699,79 +656,19 @@ void registerAll(Registry& registry)
     }
 
     // ---------------- Inference ----------------
-
-    {
-        NodeTypeSpec spec;
-        spec.id = QStringLiteral("convert.fo4");
-        spec.name = QStringLiteral("FO4 Conversion");
-        spec.category = QStringLiteral("Inference");
-        spec.summary = QStringLiteral("Metallic inference and metal albedo recovery for Fallout 4 sources.");
-        spec.inputs = {materialPort("material", "Material"), imagePort("diffuse", "Diffuse"),
-            imagePort("specular", "Specular (_s)", true), imagePort("glow", "Glow", true),
-            imagePort("correctionMask", "Correction Mask", true),
-            colorPort("cubemapTint", "Cubemap Tint", true)};
-        spec.outputs = {imagePort("baseColor", "Base Color"), imagePort("rmaos", "RMAOS"),
-            imagePort("emissive", "Emissive"), imagePort("subsurface", "Subsurface"),
-            imagePort("metallic", "Metallic"), scalarPort("metalCoverage", "Metal Coverage")};
-        spec.params = sharedMathParams();
-        spec.params.prepend(floatParam("recovery", "Metal recovery", 1.0, 0.0, 1.0, 0.05,
-            "How strongly dark vanilla metals are rebuilt toward their true albedo."));
-        spec.params.append(boolParam("normalizeSpec", "Normalize spec", false,
-            "Percentile-stretch each spec map. Off by default: it stretches a continuous "
-            "quantity per material, which flattens the difference between materials."));
-        spec.params.append(floatParam("specPercentile", "Spec clamp %", 0.98, 0.5, 1.0, 0.01));
-        spec.params.append(floatParam("metalSpecStart", "Metal spec start", 0.20, 0.0, 1.0, 0.01,
-            "The _s.R stencil window, read before specularMult. Keep it in step with the "
-            "Levels node feeding Metallic, or the recovered metal colour lands somewhere the "
-            "metallic channel does not. Set to 1 to convert fully dielectric."));
-        spec.params.append(floatParam("metalSpecFull", "Metal spec full", 0.30, 0.0, 1.0, 0.01));
-        spec.evaluate = [](const EvalArgs& args, EvalOutput* output) {
-            const Bgsm::Material* material = materialInput(args, output);
-            if (!material) return;
-            Converter::Fo4Sources sources;
-            sources.diffuse = args.inputs.value(QStringLiteral("diffuse")).image();
-            sources.specular = args.inputs.value(QStringLiteral("specular")).image();
-            sources.glow = args.inputs.value(QStringLiteral("glow")).image();
-            sources.correctionMask = args.inputs.value(QStringLiteral("correctionMask")).image();
-            const Value tint = args.inputs.value(QStringLiteral("cubemapTint"));
-            if (tint.isValid()) { sources.cubemapTint = tint.color(); sources.hasCubemapTint = true; }
-            if (sources.diffuse.isNull()) { output->error = QStringLiteral("Diffuse is required."); return; }
-            addConvertedOutputs(Converter::convertFo4(sources, *material, mathOptions(args.params)), output);
-        };
-        registry.add(spec);
-    }
-
-    {
-        NodeTypeSpec spec;
-        spec.id = QStringLiteral("convert.fo76");
-        spec.name = QStringLiteral("FO76 Conversion");
-        spec.category = QStringLiteral("Inference");
-        spec.summary = QStringLiteral("Specular->metalness reconstruction for Fallout 76 sources.");
-        spec.inputs = {materialPort("material", "Material"), imagePort("diffuse", "Diffuse"),
-            imagePort("reflectance", "Reflectance (_r)", true), imagePort("lighting", "Lighting (_l)", true),
-            imagePort("glow", "Glow", true), imagePort("correctionMask", "Correction Mask", true)};
-        spec.outputs = {imagePort("baseColor", "Base Color"), imagePort("rmaos", "RMAOS"),
-            imagePort("emissive", "Emissive"), imagePort("subsurface", "Subsurface"),
-            imagePort("metallic", "Metallic"), scalarPort("metalCoverage", "Metal Coverage")};
-        spec.params = sharedMathParams();
-        spec.params.append(floatParam("fo76ReflectanceStart", "Reflectance start", 0.12, 0.0, 1.0, 0.01));
-        spec.params.append(floatParam("fo76ReflectanceFull", "Reflectance full", 0.40, 0.0, 1.0, 0.01));
-        spec.params.append(floatParam("fo76DarkStart", "Diffuse dark start", 0.30, 0.0, 1.0, 0.01));
-        spec.params.append(floatParam("fo76DarkFull", "Diffuse dark full", 0.08, 0.0, 1.0, 0.01));
-        spec.evaluate = [](const EvalArgs& args, EvalOutput* output) {
-            const Bgsm::Material* material = materialInput(args, output);
-            if (!material) return;
-            Converter::Fo76Sources sources;
-            sources.diffuse = args.inputs.value(QStringLiteral("diffuse")).image();
-            sources.reflectance = args.inputs.value(QStringLiteral("reflectance")).image();
-            sources.lighting = args.inputs.value(QStringLiteral("lighting")).image();
-            sources.glow = args.inputs.value(QStringLiteral("glow")).image();
-            sources.correctionMask = args.inputs.value(QStringLiteral("correctionMask")).image();
-            if (sources.diffuse.isNull()) { output->error = QStringLiteral("Diffuse is required."); return; }
-            addConvertedOutputs(Converter::convertFo76(sources, *material, mathOptions(args.params)), output);
-        };
-        registry.add(spec);
-    }
+    // No whole-conversion nodes live here any more. `convert.fo4` and
+    // `convert.fo76` used to do an entire title's conversion behind one header,
+    // and both stock graphs have since been written out as explicit maths --
+    // Separate Maps, Levels, Invert, Mix, colour-space pairs. A registered node
+    // that no shipped graph uses is a second, divergent definition of the same
+    // conversion waiting to drift from the one that runs, so they are retired.
+    // The recipes live in the graph PRESETS instead (defaultFo4Graph,
+    // defaultFo76Graph, and anything saved beside them), where every threshold
+    // is on the canvas and tunable per material.
+    //
+    // Converter::convertFo4 / convertFo76 remain as the batch path in
+    // convertercore -- that is the same maths, not a duplicate of it, and the
+    // graphs are checked against it on real materials.
 
     // ---------------- Unpack ----------------
     // The mirror of Combine Maps (PBR): these are the only nodes that know how
@@ -2584,9 +2481,14 @@ Converter::SuppliedImages runGraph(const Graph& graph, const QString& materialPa
             const NodeTypeSpec* spec = registry.find(node.typeId);
             errors->append(QStringLiteral("%1: %2").arg(spec ? spec->name : node.typeId, result.error));
         }
-        if (node.typeId == QStringLiteral("convert.fo4") || node.typeId == QStringLiteral("convert.fo76")) {
-            const Value coverage = result.outputs.value(QStringLiteral("metalCoverage"));
-            if (coverage.isValid()) { supplied.metalCoverage = coverage.scalar(); reportedCoverage = true; }
+        // Keyed on the PORT, not on a node type. Nothing in the stock presets
+        // publishes coverage now that the conversion nodes are retired, so the
+        // measurement further down is the normal path — but a hand-wired graph
+        // can still state it, and a stated number beats a measured one.
+        const Value coverage = result.outputs.value(QStringLiteral("metalCoverage"));
+        if (coverage.isValid()) {
+            supplied.metalCoverage = coverage.scalar();
+            reportedCoverage = true;
             supplied.notes.append(result.notes);
         } else if (node.typeId == QStringLiteral("derive.normal")) {
             supplied.notes.append(result.notes);
@@ -2715,7 +2617,7 @@ Graph defaultFo4Graph()
     //
     //   metallic  = levels(.35,.45, _s.R)   a STENCIL, then masked by hand
     //   roughness = 1 - _s.G                (the .bgsm smoothness where G is flat)
-    //   F0        = clamp(_s.R) into the dielectric window, off convert.fo4
+    //   F0        = clamp(_s.R) into the dielectric window, via one Levels
     //
     // FO76 states reflectance per texel in _r, so its metal mask is a
     // measurement and the Levels window is calibrated for accuracy. Fallout 4
@@ -2861,10 +2763,13 @@ Graph defaultFo76Graph()
     builder.link(upNormal, "image", derive, "normal");
 
     // ---- FO76 inference, written out as nodes -------------------------------
-    // The same maths convert.fo76 does, made visible so it can be tuned and
-    // inspected map by map. convert.fo76 stays registered as the reference to
-    // diff against; it runs in float where these nodes run in 8-bit, so small
-    // differences are expected.
+    // The same maths Converter::convertFo76 does, made visible so it can be
+    // tuned and inspected map by map. That function is still the batch path, so
+    // it stays the reference to diff against; it runs in float where these
+    // nodes run in 8-bit, so small differences are expected. There is no
+    // convert.fo76 NODE any more -- a registered node no preset uses is a
+    // second definition of the conversion waiting to drift from the one that
+    // runs, and this preset is the recipe now.
     //
     //   metallic  = levels(.25,.70, luma(reflectance_srgb)) x levels(.20,.11, luma(diffuse_srgb))
     //   roughness = 1 - _l.R          (no curve; see docs/FO4-Conversion.md)
@@ -2942,8 +2847,8 @@ Graph defaultFo76Graph()
     // Roughness is the inversion and nothing else. A gloss-curve node used to
     // sit here at pow(x, 1.0) — the identity — as a place to dial a curve in,
     // but a node that computes nothing is clutter, and the curve already has
-    // three homes that do something: the convert.fo76 node's own glossCurve
-    // param, `pbrm convert --gloss-curve`, and convertercore::glossToRoughness.
+    // two homes that do something: `pbrm convert --gloss-curve` and
+    // convertercore::glossToRoughness.
     // The 900-material survey behind this (docs/FO4-Conversion.md) found FO76's
     // smoothness range is authored intent, so the default here is no curve at
     // all — and "no curve" is best expressed by there being no node.

@@ -2306,9 +2306,15 @@ int main(int argc, char* argv[])
         // math — a graph and a batch run must agree.
         NodeGraph::Registry registry;
         ConverterNodes::registerAll(registry);
-        check(registry.find(QStringLiteral("convert.fo4")) && registry.find(QStringLiteral("convert.fo76"))
+        check(registry.find(QStringLiteral("unpack.fo4")) && registry.find(QStringLiteral("unpack.fo76"))
                 && registry.find(QStringLiteral("derive.normal")) && registry.find(QStringLiteral("image.channelPack")),
             QStringLiteral("converter node library registers its pipeline stages"));
+        // The whole-conversion nodes are RETIRED. A registered node no shipped
+        // graph uses is a second definition of the same conversion waiting to
+        // drift from the one that runs; the recipes are the graph presets now.
+        check(!registry.find(QStringLiteral("convert.fo4"))
+                && !registry.find(QStringLiteral("convert.fo76")),
+            QStringLiteral("no whole-conversion node is registered for either title"));
 
         const NodeGraph::NodeTypeSpec* invertSpec = registry.find(QStringLiteral("image.invert"));
         const NodeGraph::NodeTypeSpec* deriveSpec = registry.find(QStringLiteral("derive.normal"));
@@ -3137,71 +3143,54 @@ int main(int argc, char* argv[])
             }
         }
 
-        // Node-level parity: the convert.fo4 node is a faithful wrapper, tested
-        // by invoking it with constructed inputs — no synthetic file format,
-        // no disk, so the test exercises the graph rather than a test fixture.
+        // Preset-level parity. The conversion nodes are retired, so there is no
+        // wrapper left to diff against the math -- what can drift now is the
+        // stock GRAPH against convertercore, because the thresholds are written
+        // in two places. Pin them to each other.
         {
-            Bgsm::Material material;
-            material.version = 2;
-            material.kind = Bgsm::Kind::Bgsm;
-            material.environmentMapping = true;
-            material.environmentMappingMaskScale = 1.0f;
-            material.specularEnabled = true;
-            material.specularMult = 1.7f;
-            material.smoothness = 0.82f;
-            material.envmapTexture = QStringLiteral("shared/cubemaps/metalbrushed01cube_e.dds");
+            const NodeGraph::Graph fo4 = ConverterNodes::defaultFo4Graph();
+            const Converter::Options defaults;
 
-            QImage diffuse(16, 16, QImage::Format_RGBA8888);
-            QImage specular(16, 16, QImage::Format_RGBA8888);
-            for (int y = 0; y < 16; ++y)
-                for (int x = 0; x < 16; ++x) {
-                    // Dark diffuse + strong spec: the metal-recovery path.
-                    diffuse.setPixelColor(x, y, QColor(20 + x, 18, 16, 255));
-                    specular.setPixelColor(x, y, QColor(200 + (x % 40), 180, 0, 255));
-                }
+            const auto carriesConversionNode = [](const NodeGraph::Graph& graph) {
+                for (const NodeGraph::Node& node : graph.nodes)
+                    if (node.typeId.startsWith(QStringLiteral("convert."))) return true;
+                return false;
+            };
+            check(!carriesConversionNode(fo4) && !carriesConversionNode(ConverterNodes::defaultFo76Graph()),
+                QStringLiteral("neither preset carries a whole-conversion node"));
 
-            const NodeGraph::NodeTypeSpec* convertSpec = registry.find(QStringLiteral("convert.fo4"));
-            NodeGraph::EvalArgs args;
-            args.params = convertSpec->defaultParams();
-            args.inputs.insert(QStringLiteral("material"),
-                NodeGraph::Value::fromOpaque(QLatin1String(ConverterNodes::kMaterialTag),
-                    std::static_pointer_cast<void>(std::make_shared<Bgsm::Material>(material))));
-            args.inputs.insert(QStringLiteral("diffuse"), NodeGraph::Value::fromImage(diffuse));
-            args.inputs.insert(QStringLiteral("specular"), NodeGraph::Value::fromImage(specular));
-            NodeGraph::EvalOutput nodeOutput;
-            convertSpec->evaluate(args, &nodeOutput);
+            // The Levels node feeding Combine Maps > Metallic is the metal
+            // stencil, and its window has to be the one convertFo4 uses.
+            QString metallicSource;
+            for (const NodeGraph::Connection& link : fo4.connections)
+                if (link.toPort == QStringLiteral("metallic")) metallicSource = link.fromNode;
+            const NodeGraph::Node* stencil = metallicSource.isEmpty() ? nullptr : fo4.node(metallicSource);
+            check(stencil && stencil->typeId == QStringLiteral("image.levels"),
+                QStringLiteral("metallic is fed by a Levels node the user can drag"));
+            if (stencil) {
+                const double black = stencil->params.value(QStringLiteral("inBlack")).toDouble();
+                const double white = stencil->params.value(QStringLiteral("inWhite")).toDouble();
+                check(std::abs(black - defaults.metalSpecStart) < 1e-4
+                        && std::abs(white - defaults.metalSpecFull) < 1e-4,
+                    QStringLiteral("and its window matches convertercore (%1/%2 against %3/%4)")
+                        .arg(black).arg(white).arg(defaults.metalSpecStart).arg(defaults.metalSpecFull));
+                // Auto levels would re-derive the window per material and
+                // stretch a brick wall's own spec variation into full metal.
+                check(!stencil->params.value(QStringLiteral("autoLevels")).toBool(true),
+                    QStringLiteral("auto levels is off on the stencil — _s.R has no anchor to re-derive against"));
+            }
 
-            Converter::Fo4Sources sources;
-            sources.diffuse = diffuse;
-            sources.specular = specular;
-            const Converter::ConvertedImages expected = Converter::convertFo4(sources, material, Converter::Options());
-            check(nodeOutput.error.isEmpty()
-                    && nodeOutput.outputs.value(QStringLiteral("baseColor")).image() == expected.baseColor
-                    && nodeOutput.outputs.value(QStringLiteral("rmaos")).image() == expected.rmaos,
-                QStringLiteral("convert.fo4 node matches a direct convertFo4 call texel for texel: %1").arg(nodeOutput.error));
-            check(qFuzzyCompare(nodeOutput.outputs.value(QStringLiteral("metalCoverage")).scalar() + 1.0f,
-                    expected.metalCoverage + 1.0f) && expected.metalCoverage > 0.9f,
-                QStringLiteral("convert.fo4 node reports the same metal coverage as the math"));
-
-            // And the stencil window reaches the math from the node's params.
-            args.params.insert(QStringLiteral("metalSpecStart"), 1.0);
-            args.params.insert(QStringLiteral("metalSpecFull"), 1.0);
-            NodeGraph::EvalOutput dielectric;
-            convertSpec->evaluate(args, &dielectric);
-            check(qFuzzyIsNull(dielectric.outputs.value(QStringLiteral("metalCoverage")).scalar()),
-                QStringLiteral("the stencil window reaches the math from the node's params"));
-            args.params.insert(QStringLiteral("metalSpecStart"), 0.35);
-            args.params.insert(QStringLiteral("metalSpecFull"), 0.45);
-
-            // Per-parameter fidelity: the node's params reach the math.
-            args.params.insert(QStringLiteral("glossCurve"), 2.5);
-            NodeGraph::EvalOutput curved;
-            convertSpec->evaluate(args, &curved);
-            Converter::Options curvedOptions;
-            curvedOptions.glossCurve = 2.5f;
-            check(curved.outputs.value(QStringLiteral("rmaos")).image()
-                    == Converter::convertFo4(sources, material, curvedOptions).rmaos,
-                QStringLiteral("node parameters reach the conversion math"));
+            // Same for the F0 ramp: its out-points are the dielectric window.
+            QString specularSource;
+            for (const NodeGraph::Connection& link : fo4.connections)
+                if (link.toPort == QStringLiteral("specular")) specularSource = link.fromNode;
+            const NodeGraph::Node* f0 = specularSource.isEmpty() ? nullptr : fo4.node(specularSource);
+            check(f0 && f0->typeId == QStringLiteral("image.levels")
+                    && std::abs(f0->params.value(QStringLiteral("outBlack")).toDouble()
+                           - defaults.dielectricF0Min) < 1e-4
+                    && std::abs(f0->params.value(QStringLiteral("outWhite")).toDouble()
+                           - defaults.dielectricF0Max) < 1e-4,
+                QStringLiteral("the F0 ramp lands on convertercore's dielectric window"));
         }
 
         // Levels: the histogram it publishes is what the node body plots, and
