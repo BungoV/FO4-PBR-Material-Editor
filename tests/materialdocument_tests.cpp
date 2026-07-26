@@ -3193,6 +3193,47 @@ int main(int argc, char* argv[])
             for (const NodeGraph::Connection& link : fo4.connections)
                 if (link.toPort == QStringLiteral("specular")) specularSource = link.fromNode;
             const NodeGraph::Node* f0 = specularSource.isEmpty() ? nullptr : fo4.node(specularSource);
+            // The gloss fallback has to reach the GRAPH, not just convertercore.
+            // Vanilla writes a flat _s.G pure white and puts the real value in
+            // the .bgsm smoothness, so without this the graph ships a mirror
+            // finish on 827 materials — and the workspace only ever converts
+            // through the graph, so "convertercore does it" is no protection.
+            {
+                const NodeGraph::NodeTypeSpec* unpack =
+                    ConverterNodes::sharedRegistry().find(QStringLiteral("unpack.fo4"));
+                QImage flatWhiteGloss(4, 4, QImage::Format_RGBA8888);
+                flatWhiteGloss.fill(QColor(120, 255, 0));  // R spec, G flat white
+                NodeGraph::EvalArgs args;
+                args.params = unpack ? unpack->defaultParams() : QJsonObject();
+                args.inputs.insert(QStringLiteral("diffuse"), NodeGraph::Value::fromImage(flatWhiteGloss));
+                args.inputs.insert(QStringLiteral("specular"), NodeGraph::Value::fromImage(flatWhiteGloss));
+                args.inputs.insert(QStringLiteral("smoothness"), NodeGraph::Value::fromScalar(0.2f));
+                NodeGraph::EvalOutput out;
+                if (unpack) unpack->evaluate(args, &out);
+                const QImage gloss = out.outputs.value(QStringLiteral("gloss")).image();
+                check(!gloss.isNull() && std::abs(QColor(gloss.pixelColor(1, 1)).red() - 51) <= 1,
+                    QStringLiteral("a flat _s.G unpacks to the .bgsm smoothness, not white (%1)")
+                        .arg(gloss.isNull() ? -1 : QColor(gloss.pixelColor(1, 1)).red()));
+
+                // A textured G ignores the scalar, as measured.
+                QImage texturedGloss(4, 4, QImage::Format_RGBA8888);
+                for (int y = 0; y < 4; ++y)
+                    for (int x = 0; x < 4; ++x)
+                        texturedGloss.setPixelColor(x, y, QColor(120, 40 + x * 50, 0));
+                args.inputs.insert(QStringLiteral("specular"), NodeGraph::Value::fromImage(texturedGloss));
+                NodeGraph::EvalOutput textured;
+                if (unpack) unpack->evaluate(args, &textured);
+                const QImage keptGloss = textured.outputs.value(QStringLiteral("gloss")).image();
+                check(!keptGloss.isNull() && QColor(keptGloss.pixelColor(3, 0)).red() == 190,
+                    QStringLiteral("a textured _s.G keeps its own values"));
+
+                // And the preset must actually wire the scalar in.
+                bool wired = false;
+                for (const NodeGraph::Connection& link : fo4.connections)
+                    if (link.toPort == QStringLiteral("smoothness")) wired = true;
+                check(wired, QStringLiteral("the FO4 preset wires the smoothness scalar into Separate Maps"));
+            }
+
             // The painted mask has to be WIRED, in both presets. It was an
             // optional port on the retired conversion nodes that no preset ever
             // connected, and the orchestrator only read the sidecar on the

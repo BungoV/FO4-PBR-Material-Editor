@@ -819,9 +819,12 @@ void registerAll(Registry& registry)
             spec.summary = QStringLiteral("Splits Fallout 4 source textures into single maps: "
                                           "_s.R is specular strength, _s.G is gloss.");
             // No env-mask port: BGSM v2 has no env-mask texture slot, so it was
-            // an input that could only ever be empty.
+            // an input that could only ever be empty. The smoothness scalar IS
+            // here, because unpacking _s is exactly where the fallback belongs
+            // — see the gloss output below.
             spec.inputs = {imagePort("diffuse", "Diffuse (_d)"), imagePort("specular", "Specular (_s)", true),
-                imagePort("normal", "Normal (_n)", true), imagePort("glow", "Glow (_g)", true)};
+                imagePort("normal", "Normal (_n)", true), imagePort("glow", "Glow (_g)", true),
+                scalarPort("smoothness", "Smoothness", true)};
             spec.outputs = {imagePort("diffuse", "Diffuse"), imagePort("opacity", "Opacity"),
                 imagePort("specularStrength", "Specular Strength"), imagePort("gloss", "Gloss"),
                 imagePort("normal", "Normal"), imagePort("glow", "Glow")};
@@ -835,7 +838,26 @@ void registerAll(Registry& registry)
                 output->outputs.insert(QStringLiteral("diffuse"), Value::fromImage(rgbOnly(diffuse)));
                 output->outputs.insert(QStringLiteral("opacity"), Value::fromImage(splitChannel(diffuse, 3, true)));
                 output->outputs.insert(QStringLiteral("specularStrength"), Value::fromImage(splitChannel(specular, 0, false)));
-                output->outputs.insert(QStringLiteral("gloss"), Value::fromImage(splitChannel(specular, 1, false)));
+
+                // Gloss, with the .bgsm smoothness substituted wherever _s.G
+                // carries nothing. Vanilla writes a flat G as PURE WHITE and
+                // puts the real value in the scalar, so reading the texel
+                // literally gives gloss 1.0 and a MIRROR FINISH — on 827
+                // materials, 13.4% of the corpus. convertercore has done this
+                // since the survey; the graph did not, and the workspace only
+                // ever converts through the graph, so every one of those
+                // materials still shipped a mirror until this port existed.
+                QImage gloss = splitChannel(specular, 1, false);
+                const Value smoothness = args.inputs.value(QStringLiteral("smoothness"));
+                if (!gloss.isNull() && smoothness.type() == ValueType::Scalar
+                    && Converter::channelIsFlat(specular, 1)) {
+                    const uchar level = uchar(std::lround(
+                        std::clamp(smoothness.scalar(), 0.0f, 1.0f) * 255.0f));
+                    gloss.fill(QColor(level, level, level));
+                    output->notes.append(QStringLiteral("flat _s.G — gloss from the .bgsm smoothness (%1)")
+                                             .arg(double(smoothness.scalar()), 0, 'f', 3));
+                }
+                output->outputs.insert(QStringLiteral("gloss"), Value::fromImage(gloss));
                 output->outputs.insert(QStringLiteral("normal"),
                     Value::fromImage(args.inputs.value(QStringLiteral("normal")).image()));
                 output->outputs.insert(QStringLiteral("glow"),
@@ -2732,6 +2754,9 @@ Graph defaultFo4Graph()
     builder.link(material, "smoothSpec", unpack, "specular");
     builder.link(material, "normal", unpack, "normal");
     builder.link(material, "glow", unpack, "glow");
+    // The gloss fallback. Without this wire a flat _s.G reads as pure white and
+    // ships a mirror finish, which is 13.4% of the vanilla corpus.
+    builder.link(material, "smoothness", unpack, "smoothness");
 
     const QString upDiffuse = builder.add("image.upscale", 300, 40);
     const QString upSpecular = builder.add("image.upscale", 300, 120);

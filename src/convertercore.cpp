@@ -257,7 +257,13 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
                 metallic = applyMetallicCorrection(metallic, correction.texel(x, y)[0] / 255.0f);
             if (metallic > 0.5f) ++metalTexels;
 
-            const QVector3D metalAlbedo = recoverMetalAlbedoFo4(diffuseLinear, specStrength,
+            // Raw spec, not specStrength: recovery produces an ALBEDO, which is
+            // a material property, and specularMult is a highlight dial. Same
+            // argument as the stencil above, and the same failure if ignored —
+            // a metal trim with mult 0.400 recovered into the bottom of the F0
+            // window and came out near-black. It also keeps this in step with
+            // the graph's Metal Albedo node, which reads the same raw channel.
+            const QVector3D metalAlbedo = recoverMetalAlbedoFo4(diffuseLinear, storedSpec,
                 sources.cubemapTint, sources.hasCubemapTint, options);
             const float blend = metallic * std::clamp(options.recoveryStrength, 0.0f, 1.0f);
             const QVector3D baseLinear = diffuseLinear * (1.0f - blend) + metalAlbedo * blend;
