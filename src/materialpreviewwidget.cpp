@@ -3963,11 +3963,43 @@ void MaterialPreviewWidget::layoutViewportOverlay()
     m_overlayDimension->setGeometry(right-channelWidth-spacing-dimensionWidth,margin,dimensionWidth,height);
     m_overlayDimension->raise();
     m_overlayChannel->raise();
+
+    // Supplied toolbar along the bottom, centred. Bottom because the top
+    // corners are taken and because a brush strip belongs near the thing being
+    // painted rather than over it.
+    if (m_viewportToolbar && m_viewportToolbar->isVisible()) {
+        // sizeHint() is (-1,-1) on a widget with no layout and no content, and
+        // subtracting that from the canvas height puts the bar a pixel BELOW
+        // the bottom edge — off-screen, with nothing to suggest why. Fall back
+        // to whatever size it currently has.
+        const QSize hint = m_viewportToolbar->sizeHint();
+        const QSize bar(hint.width() > 0 ? hint.width() : m_viewportToolbar->width(),
+            hint.height() > 0 ? hint.height() : m_viewportToolbar->height());
+        const int width = std::clamp(bar.width(), 1, std::max(1, m_materialCanvas->width() - margin * 2));
+        const int height = std::clamp(bar.height(), 1, std::max(1, m_materialCanvas->height() - margin * 2));
+        m_viewportToolbar->setGeometry((m_materialCanvas->width() - width) / 2,
+            m_materialCanvas->height() - height - margin, width, height);
+        m_viewportToolbar->raise();
+    }
+}
+
+void MaterialPreviewWidget::setViewportToolbar(QWidget* toolbar)
+{
+    if (m_viewportToolbar == toolbar) return;
+    if (m_viewportToolbar) m_viewportToolbar->setParent(nullptr);
+    m_viewportToolbar = toolbar;
+    if (m_viewportToolbar && m_materialCanvas) {
+        m_viewportToolbar->setParent(m_materialCanvas);
+        m_viewportToolbar->installEventFilter(this); // re-place it when it resizes
+        layoutViewportOverlay();
+    }
 }
 
 bool MaterialPreviewWidget::eventFilter(QObject* watched,QEvent* event)
 {
-    if (watched==m_materialCanvas && (event->type()==QEvent::Resize || event->type()==QEvent::Show))
+    if ((watched==m_materialCanvas || watched==m_viewportToolbar)
+        && (event->type()==QEvent::Resize || event->type()==QEvent::Show
+            || event->type()==QEvent::Hide))
         layoutViewportOverlay();
     return QFrame::eventFilter(watched,event);
 }

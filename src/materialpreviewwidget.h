@@ -622,6 +622,16 @@ private:
     // than holding their own state, so the two can never disagree.
     void buildViewportOverlay();
     void layoutViewportOverlay();
+
+public:
+    // A caller-owned strip floated over the bottom of the viewport. The preview
+    // owns WHERE it sits; whoever supplies it owns what is in it, so a tool
+    // that only makes sense to one workspace does not have to be understood
+    // here. Pass nullptr to take it away.
+    void setViewportToolbar(QWidget* toolbar);
+
+private:
+    QWidget* m_viewportToolbar = nullptr;
     bool eventFilter(QObject* watched, QEvent* event) override; // keeps the overlay in the corner
     QToolButton* m_overlayDimension = nullptr;
     QComboBox* m_overlayChannel = nullptr;

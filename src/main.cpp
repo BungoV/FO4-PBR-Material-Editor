@@ -635,6 +635,25 @@ int main(int argc, char* argv[])
         QApplication::sendEvent(canvas, &disarmed);
         require(painted == 2, QStringLiteral("disarming returns LMB to the camera (%1 samples)").arg(painted));
 
+        // The supplied toolbar has to land ON the canvas and inside it, or the
+        // brush strip is off-screen and the whole feature is invisible.
+        {
+            auto* bar = new QFrame(nullptr);
+            bar->setFixedSize(320, 34);
+            preview->setViewportToolbar(bar);
+            bar->show();
+            QApplication::processEvents();
+            const QRect canvasRect(QPoint(0, 0), QSize(canvas->width(), canvas->height()));
+            require(bar->parentWidget() == canvas,
+                QStringLiteral("the viewport toolbar is reparented onto the canvas"));
+            require(canvasRect.contains(bar->geometry()),
+                QStringLiteral("and sits inside it (%1,%2 %3x%4 in %5x%6)")
+                    .arg(bar->x()).arg(bar->y()).arg(bar->width()).arg(bar->height())
+                    .arg(canvas->width()).arg(canvas->height()));
+            require(bar->y() > canvas->height() / 2,
+                QStringLiteral("along the bottom, clear of the top-corner pickers"));
+        }
+
         report << QStringLiteral("Failures: %1").arg(failures);
         QFile out(reportPath);
         if (out.open(QIODevice::WriteOnly | QIODevice::Text))

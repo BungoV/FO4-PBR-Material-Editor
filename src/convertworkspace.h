@@ -112,6 +112,10 @@ private:
     // only one when a graph has just the one. Empty means nowhere to paint.
     QString brushTargetNode() const;
     QString brushTargetLabel() const;
+    // The brush strip floated over the viewport. Built once, shown only while a
+    // Paint Mask node is selected — which is also the only time painting works.
+    void buildBrushBar();
+    void updateBrushBar();
     static QString maskKeyFor(const QString& materialKey, const QString& nodeId);
     void clearMaskFills();
     void saveMask();
@@ -158,7 +162,8 @@ private:
     QPushButton* m_maskLoadNif = nullptr;
     QComboBox* m_maskFillMode = nullptr;
     QComboBox* m_maskFillValue = nullptr;
-    QCheckBox* m_maskBrushEnabled = nullptr;
+    QFrame* m_brushBar = nullptr;
+    QLabel* m_brushName = nullptr;
     QSlider* m_maskBrushSize = nullptr;
     QSlider* m_maskBrushFlow = nullptr;
     QComboBox* m_maskBrushValue = nullptr;

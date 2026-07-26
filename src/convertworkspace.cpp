@@ -5,6 +5,7 @@
 #include "disclosureicon.h"
 #include "dragnumericedit.h"
 #include "maskpaint.h"
+#include "wheelfocusguard.h"
 #include "materialdocument.h"
 #include "materialpreviewwidget.h"
 #include "nodecanvas.h"
@@ -405,53 +406,6 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     maskRow->addStretch();
     selectedLayout->addLayout(maskRow);
 
-    // Freehand brush over the 2D view. The fills above are for whole parts —
-    // "this boot is not metal" — and this is for everything they cannot reach:
-    // the strip of grime along a seam, the painted half of a panel. Both write
-    // the same 0.5-neutral mask, so a material can use either or both.
-    auto* brushRow = new QHBoxLayout();
-    brushRow->setSpacing(9);
-    m_maskBrushEnabled = new QCheckBox(tr("Brush"), m_selectedGroup);
-    m_maskBrushEnabled->setToolTip(tr("Paint the correction mask directly in the viewport. Best in the 2D view, "
-                                      "where the painted mask is tinted over the texture. Shift and Ctrl still pan "
-                                      "and dolly mid-stroke."));
-    connect(m_maskBrushEnabled, &QCheckBox::toggled, this, [this](bool on) {
-        m_preview->canvas()->setMaskPaintEnabled(on);
-        // One pointer, one meaning: arming the brush disarms the fill picker.
-        if (on && m_maskPickEnabled->isChecked()) m_maskPickEnabled->setChecked(false);
-        refreshMaskOverlay();
-    });
-    brushRow->addWidget(m_maskBrushEnabled);
-    brushRow->addWidget(new QLabel(tr("Size"), m_selectedGroup));
-    m_maskBrushSize = new QSlider(Qt::Horizontal, m_selectedGroup);
-    m_maskBrushSize->setRange(2, 250);   // thousandths of the UV square
-    m_maskBrushSize->setValue(40);
-    m_maskBrushSize->setMaximumWidth(110);
-    m_maskBrushSize->setToolTip(tr("Brush radius as a fraction of the texture, so it keeps its size on the "
-                                   "material however far you zoom."));
-    connect(m_maskBrushSize, &QSlider::valueChanged, this, [this](int value) {
-        m_preview->canvas()->setMaskBrushRadius(float(value) / 1000.0f);
-    });
-    brushRow->addWidget(m_maskBrushSize);
-    m_maskBrushFlow = new QSlider(Qt::Horizontal, m_selectedGroup);
-    m_maskBrushFlow->setRange(5, 100);
-    m_maskBrushFlow->setValue(60);
-    m_maskBrushFlow->setMaximumWidth(80);
-    m_maskBrushFlow->setToolTip(tr("How fast a stroke reaches full strength. Below 100 it builds up, so a light "
-                                   "pass nudges the inference instead of overriding it outright."));
-    brushRow->addWidget(new QLabel(tr("Flow"), m_selectedGroup));
-    brushRow->addWidget(m_maskBrushFlow);
-    m_maskBrushValue = new QComboBox(m_selectedGroup);
-    // Dielectric first: the FO4 stencil over-detects by design, so subtracting
-    // is the common direction and should be the one already selected.
-    m_maskBrushValue->addItem(tr("Paint Dielectric"), 0.0);
-    m_maskBrushValue->addItem(tr("Paint Metal"), 1.0);
-    m_maskBrushValue->addItem(tr("Erase to Inferred"), 0.5);
-    m_maskBrushValue->setToolTip(tr("What the brush paints. Erase returns those texels to whatever the graph inferred."));
-    brushRow->addWidget(m_maskBrushValue);
-    brushRow->addStretch();
-    selectedLayout->addLayout(brushRow);
-
     m_maskStatus = new QLabel(m_selectedGroup);
     m_maskStatus->setObjectName(QStringLiteral("Muted"));
     m_maskStatus->setWordWrap(true);
@@ -490,6 +444,7 @@ ConvertWorkspace::ConvertWorkspace(QWidget* parent)
     m_preview = new MaterialPreviewWidget(splitter, /*converterMode=*/true);
     connect(m_preview->canvas(), &PbrPreviewGL::meshTrianglePicked, this, &ConvertWorkspace::handleTrianglePicked);
     connect(m_preview->canvas(), &PbrPreviewGL::maskPainted, this, &ConvertWorkspace::handleMaskPainted);
+    buildBrushBar();
     splitter->addWidget(m_preview);
     // The canvas is the work surface, so it takes the width the folded
     // setup rows and the deleted inspector column gave back.
@@ -1238,6 +1193,7 @@ void ConvertWorkspace::buildGraphMode(QSplitter* parent)
         showNodeInPreview(selected);
     });
     connect(m_canvas, &NodeCanvas::nodeSelected, this, [this](const QString& nodeId) {
+        updateBrushBar();
         if (nodeId.isEmpty()) {
             m_nodeHint->setText(canvasHint());
             // Back to the converted material on the surface. With nothing
@@ -1618,20 +1574,99 @@ QString ConvertWorkspace::currentMaterialKey() const
 
 QString ConvertWorkspace::brushTargetNode() const
 {
-    // Whichever Paint Mask node is selected on the canvas takes the stroke. With
-    // one in the graph — the stock presets — selection is redundant and the
-    // fallback finds it, so the brush works without a trip to the canvas. With
-    // several, selecting is how you say which mask you are painting.
-    const NodeGraph::Graph& graph = m_canvas->graph();
+    // Selection IS the brush. Painting is only ever possible while a Paint Mask
+    // node is selected, and the stroke goes to that node — no separate arming
+    // toggle to leave switched on over a material it was never meant for, and
+    // no ambiguity about which of several masks a stroke lands in.
     const QString selected = m_canvas->selectedNode();
-    if (const NodeGraph::Node* node = selected.isEmpty() ? nullptr : graph.node(selected);
-        node && node->typeId == QStringLiteral("source.paintMask"))
-        return node->id;
-    QString onlyOne;
-    int found = 0;
-    for (const NodeGraph::Node& node : graph.nodes)
-        if (node.typeId == QStringLiteral("source.paintMask")) { onlyOne = node.id; ++found; }
-    return found == 1 ? onlyOne : QString();
+    const NodeGraph::Node* node = selected.isEmpty() ? nullptr : m_canvas->graph().node(selected);
+    return node && node->typeId == QStringLiteral("source.paintMask") ? node->id : QString();
+}
+
+void ConvertWorkspace::buildBrushBar()
+{
+    // Lives over the viewport rather than in the side panel: it is only ever
+    // relevant while a mask is selected, and it belongs next to the surface
+    // being painted.
+    m_brushBar = new QFrame(nullptr);
+    m_brushBar->setObjectName(QStringLiteral("ViewportToolbar"));
+    m_brushBar->setAutoFillBackground(true);
+    auto* layout = new QHBoxLayout(m_brushBar);
+    layout->setContentsMargins(10, 6, 10, 6);
+    layout->setSpacing(8);
+
+    m_brushName = new QLabel(m_brushBar);
+    m_brushName->setObjectName(QStringLiteral("SectionTitle"));
+    layout->addWidget(m_brushName);
+
+    layout->addWidget(new QLabel(tr("Size"), m_brushBar));
+    m_maskBrushSize = new QSlider(Qt::Horizontal, m_brushBar);
+    m_maskBrushSize->setRange(2, 250);   // thousandths of the UV square
+    m_maskBrushSize->setValue(40);
+    m_maskBrushSize->setFixedWidth(110);
+    m_maskBrushSize->setToolTip(tr("Radius as a fraction of the texture, so the brush keeps its size "
+                                   "on the material however far you zoom."));
+    connect(m_maskBrushSize, &QSlider::valueChanged, this, [this](int value) {
+        m_preview->canvas()->setMaskBrushRadius(float(value) / 1000.0f);
+    });
+    layout->addWidget(m_maskBrushSize);
+
+    layout->addWidget(new QLabel(tr("Flow"), m_brushBar));
+    m_maskBrushFlow = new QSlider(Qt::Horizontal, m_brushBar);
+    m_maskBrushFlow->setRange(5, 100);
+    m_maskBrushFlow->setValue(60);
+    m_maskBrushFlow->setFixedWidth(80);
+    m_maskBrushFlow->setToolTip(tr("How fast a stroke reaches full strength. Below 100 it builds up, so "
+                                   "a light pass nudges the inference instead of overriding it."));
+    layout->addWidget(m_maskBrushFlow);
+
+    m_maskBrushValue = new QComboBox(m_brushBar);
+    // Dielectric first: the FO4 stencil over-detects by design, so subtracting
+    // is the common direction and should be the one already selected.
+    m_maskBrushValue->addItem(tr("Dielectric"), 0.0);
+    m_maskBrushValue->addItem(tr("Metal"), 1.0);
+    m_maskBrushValue->addItem(tr("Erase"), 0.5);
+    m_maskBrushValue->setToolTip(tr("What the brush paints. Erase returns those texels to whatever fed the mask."));
+    WheelFocusGuard::install(m_maskBrushValue);
+    layout->addWidget(m_maskBrushValue);
+
+    auto* clear = new QPushButton(tr("Clear"), m_brushBar);
+    clear->setToolTip(tr("Wipe this mask back to neutral."));
+    connect(clear, &QPushButton::clicked, this, [this] {
+        const QString material = currentMaterialKey();
+        const QString node = brushTargetNode();
+        if (material.isEmpty() || node.isEmpty()) return;
+        m_masks[maskKeyFor(material, node)].mask = MaskPaint::neutralMask();
+        refreshMaskOverlay();
+        m_maskStatus->setText(tr("%1 cleared").arg(brushTargetLabel()));
+    });
+    layout->addWidget(clear);
+
+    auto* save = new QPushButton(tr("Save"), m_brushBar);
+    save->setToolTip(tr("Write the mask sidecars and attach them to this material's conversions."));
+    connect(save, &QPushButton::clicked, this, &ConvertWorkspace::saveMask);
+    layout->addWidget(save);
+
+    m_brushBar->hide();
+    m_preview->setViewportToolbar(m_brushBar);
+}
+
+void ConvertWorkspace::updateBrushBar()
+{
+    if (!m_brushBar) return;
+    const QString node = brushTargetNode();
+    const bool active = !node.isEmpty() && !currentMaterialKey().isEmpty();
+    m_brushName->setText(active ? brushTargetLabel() : QString());
+    m_brushBar->setVisible(active);
+    // The canvas only accepts strokes while the bar is up, so there is exactly
+    // one thing to look at to know whether a click will paint.
+    m_preview->canvas()->setMaskPaintEnabled(active);
+    if (active) {
+        m_preview->canvas()->setMaskBrushRadius(float(m_maskBrushSize->value()) / 1000.0f);
+        // One pointer, one meaning: a selected mask disarms the fill picker.
+        if (m_maskPickEnabled->isChecked()) m_maskPickEnabled->setChecked(false);
+    }
+    refreshMaskOverlay();
 }
 
 QString ConvertWorkspace::brushTargetLabel() const
@@ -1769,7 +1804,9 @@ void ConvertWorkspace::refreshMaskOverlay()
     // Only while the brush is armed. A permanent tint would sit over every
     // material the queue walks through and make the preview a liar about what
     // the conversion looks like.
-    const bool show = m_maskBrushEnabled && m_maskBrushEnabled->isChecked()
+    // Only while a mask is selected. A permanent tint would sit over every
+    // material the queue walks and make the preview lie about the conversion.
+    const bool show = !brushTargetNode().isEmpty()
         && state != m_masks.constEnd() && !state->mask.isNull();
     m_preview->canvas()->setMaskOverlay(show ? state->mask : QImage());
 }
