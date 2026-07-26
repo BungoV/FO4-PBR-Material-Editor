@@ -25,6 +25,10 @@ public:
     // Evaluation results supply thumbnails, notes, and per-node errors.
     void setResults(const QHash<QString, NodeGraph::NodeResult>& results);
     QString selectedNode() const { return m_selected; }
+    // One channel of an image, splatted across RGB so it reads as greyscale
+    // wherever it is pasted. Alpha comes back opaque for the same reason: a
+    // copied alpha channel that pastes as transparency shows nothing.
+    static QImage channelAsImage(const QImage& source, int channel);
     void frameAll();
     // Centres one node at a working zoom. Frame All is the wrong tool once a
     // graph is big enough that "all" is the thing you were trying to escape.

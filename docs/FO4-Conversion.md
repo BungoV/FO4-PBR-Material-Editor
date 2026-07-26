@@ -394,6 +394,33 @@ A→B→A mistake. Treating it as an error flagged roughly 3400 materials over a
 template that had already resolved correctly. An unresolvable root is still an
 error.
 
+#### The graph carries no conversion node
+
+`convert.fo4` is gone from the stock FO4 graph, which is now generic nodes
+throughout, the way the FO76 one is: Separate Maps → Upscale → Levels for the
+metal stencil, Invert for roughness, sRGB→Linear / Mix / Linear→sRGB for base
+colour, one Levels for F0, Solid Colour × Math for emissive. The node stays
+registered as a reference to diff against.
+
+One exception, and it is a real one rather than laziness. **Metal Albedo**
+(`color.metalAlbedo`) is its own node because rebuilding a metal's colour means
+normalising to unit luminance and then scaling to a target brightness, and the
+intermediate routinely exceeds 1 — a near-black diffuse divided by its own luma
+is enormous. Every image port here is 8-bit, so a Divide followed by a Multiply
+clips the hue away in between, and clamping per channel instead of rescaling by
+the maximum *flattens* hue, which is a bug the tests already pin.
+
+Two details that would otherwise bite:
+
+- **Auto levels is OFF on both FO4 Levels nodes.** It defaults on, and it is
+  right for FO76 — `_r` has a real absolute anchor at the 0.22 dielectric floor,
+  so re-deriving per material stays tied to something and a flat map stays flat.
+  `_s.R` has no anchor, so auto levels would stretch a brick wall's own spec
+  variation across the full range and stencil it as metal every time.
+- **`fSpecularMult` reaches F0 through a Solid Colour node** wired from the
+  material's scalar port. That scalar bridge is what lets a graph use the
+  numbers a `.bgsm` states instead of hard-coding them.
+
 Output BC7 linear, full mip chain, **Toksvig folded from the converted
 normal automatically** — the converter always has the paired normal in hand.
 

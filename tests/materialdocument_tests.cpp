@@ -2,6 +2,7 @@
 #include "converter.h"
 #include "convertercore.h"
 #include "converternodes.h"
+#include "nodecanvas.h"
 #include "nodegraph.h"
 #include "normalderive.h"
 #include "upscaler.h"
@@ -3604,6 +3605,36 @@ int main(int argc, char* argv[])
         for (int index = 0; role && index < roles.size(); ++index)
             if (role->enumLabels.at(index + 1) != Upscaler::slotLabel(roles.at(index))) listsMatch = false;
         check(listsMatch, QStringLiteral("and in the same order the settings table uses"));
+    }
+
+    {
+        // Copying one channel off a node: the value has to land in all three
+        // colour channels or it pastes as a red/green/blue tint instead of the
+        // greyscale map it is, and alpha has to come back OPAQUE or a copied
+        // alpha channel pastes as transparency and shows nothing at all.
+        QImage source(2, 2, QImage::Format_RGBA8888);
+        source.fill(QColor(10, 90, 170, 40));
+        for (int channel = 0; channel < 4; ++channel) {
+            const QImage extracted = NodeCanvas::channelAsImage(source, channel);
+            const QColor texel = extracted.pixelColor(1, 1);
+            const int expected = channel == 0 ? 10 : channel == 1 ? 90 : channel == 2 ? 170 : 40;
+            check(texel.red() == expected && texel.green() == expected
+                    && texel.blue() == expected && texel.alpha() == 255,
+                QStringLiteral("channel %1 copies as opaque greyscale (%2)")
+                    .arg(channel).arg(texel.red()));
+        }
+        check(NodeCanvas::channelAsImage(QImage(), 0).isNull()
+            && NodeCanvas::channelAsImage(source, 9).isNull(),
+            QStringLiteral("a null image or a bad channel index copies nothing"));
+
+        // Every node that carries texture data must be able to offer this, so
+        // the menu has something to enumerate: image outputs, by port.
+        int withImageOutputs = 0;
+        for (const NodeGraph::NodeTypeSpec* spec : ConverterNodes::sharedRegistry().all())
+            for (const NodeGraph::PortSpec& port : spec->outputs)
+                if (port.type == NodeGraph::ValueType::Image) { ++withImageOutputs; break; }
+        check(withImageOutputs > 20,
+            QStringLiteral("%1 node types expose an image output to copy from").arg(withImageOutputs));
     }
 
     QTextStream(stdout) << "Failures: " << failures << Qt::endl;

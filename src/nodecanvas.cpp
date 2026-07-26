@@ -5,10 +5,12 @@
 
 #include <QStringBuilder>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QColorDialog>
 #include <QComboBox>
 #include <QContextMenuEvent>
 #include <QFileDialog>
+#include <QGuiApplication>
 #include <QFormLayout>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -2161,6 +2163,23 @@ void NodeCanvas::keyPressEvent(QKeyEvent* event)
     QWidget::keyPressEvent(event);
 }
 
+QImage NodeCanvas::channelAsImage(const QImage& source, int channel)
+{
+    if (source.isNull() || channel < 0 || channel > 3) return QImage();
+    const QImage rgba = source.convertToFormat(QImage::Format_RGBA8888);
+    QImage result(rgba.width(), rgba.height(), QImage::Format_RGBA8888);
+    for (int y = 0; y < rgba.height(); ++y) {
+        const uchar* in = rgba.constScanLine(y);
+        uchar* out = result.scanLine(y);
+        for (int x = 0; x < rgba.width(); ++x) {
+            const uchar value = in[x * 4 + channel];
+            out[x * 4] = out[x * 4 + 1] = out[x * 4 + 2] = value;
+            out[x * 4 + 3] = 255;
+        }
+    }
+    return result;
+}
+
 void NodeCanvas::contextMenuEvent(QContextMenuEvent* event)
 {
     const QPointF graphPoint = toGraph(event->pos());
@@ -2192,6 +2211,42 @@ void NodeCanvas::contextMenuEvent(QContextMenuEvent* event)
             menu.addAction(tr("Reset Levels"), this,
                 [this, underCursor] { applyHistogramAction(underCursor, QStringLiteral("reset")); });
             menu.addSeparator();
+        }
+        // Copy what a node actually produced to the clipboard, whole or one
+        // channel at a time. Reading a packed map is otherwise a round trip
+        // through a Separate Channels node and an export, and the question is
+        // usually "what is in the green channel here" rather than a permanent
+        // edit to the graph.
+        if (spec && m_results.contains(underCursor)) {
+            const NodeGraph::NodeResult& result = m_results.value(underCursor);
+            QVector<QPair<QString, QImage>> images;
+            for (const NodeGraph::PortSpec& port : spec->outputs) {
+                if (port.type != NodeGraph::ValueType::Image) continue;
+                const QImage image = result.outputs.value(port.id).image();
+                if (!image.isNull()) images.append({port.name, image});
+            }
+            if (!images.isEmpty()) {
+                QMenu* copy = menu.addMenu(tr("Copy"));
+                // The resolution is on the label because the canvas evaluates
+                // at preview size: what lands on the clipboard is what the node
+                // holds here, not necessarily what a conversion would write.
+                for (const QPair<QString, QImage>& entry : images) {
+                    const QImage image = entry.second;
+                    QMenu* target = images.size() == 1 ? copy : copy->addMenu(entry.first);
+                    target->addAction(tr("Image  (%1×%2)").arg(image.width()).arg(image.height()),
+                        this, [image] { QGuiApplication::clipboard()->setImage(image); });
+                    target->addSeparator();
+                    static const char* const channelNames[] = {
+                        QT_TR_NOOP("Red"), QT_TR_NOOP("Green"), QT_TR_NOOP("Blue"), QT_TR_NOOP("Alpha")};
+                    for (int channel = 0; channel < 4; ++channel) {
+                        target->addAction(tr(channelNames[channel]), this, [image, channel] {
+                            QGuiApplication::clipboard()->setImage(
+                                NodeCanvas::channelAsImage(image, channel));
+                        });
+                    }
+                }
+                menu.addSeparator();
+            }
         }
         menu.addAction(tr("Delete Node"), this, [this, underCursor] {
             m_graph.removeNode(underCursor);

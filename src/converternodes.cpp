@@ -124,10 +124,11 @@ PortSpec packedPort(const char* id, const char* name, QVector<ChannelMap> maps, 
     return spec;
 }
 
-PortSpec scalarPort(const char* id, const char* name)
+PortSpec scalarPort(const char* id, const char* name, bool optional = false)
 {
     PortSpec spec;
     spec.id = QLatin1String(id); spec.name = QLatin1String(name); spec.type = ValueType::Scalar;
+    spec.optional = optional;
     return spec;
 }
 
@@ -1138,6 +1139,82 @@ void registerAll(Registry& registry)
             static_cast<float (*)(float)>(&Converter::linearToSrgb));
     }
 
+    {
+        // The one piece of the Fallout 4 conversion that generic nodes cannot
+        // express, and the reason it gets a node of its own rather than staying
+        // inside a monolith. Rebuilding a metal's albedo means normalising a
+        // colour to unit luminance and then scaling it to a target brightness:
+        // the intermediate routinely exceeds 1 (a near-black diffuse divided by
+        // its own luma is enormous), and every image port here is 8-bit, so a
+        // Divide followed by a Multiply would clip the hue away between them.
+        // Per-channel clamping instead of a max-rescale FLATTENS hue — a real
+        // bug the tests already pin.
+        NodeTypeSpec spec;
+        spec.id = QStringLiteral("color.metalAlbedo");
+        spec.name = QStringLiteral("Metal Albedo");
+        spec.category = QStringLiteral("Inference");
+        spec.summary = QStringLiteral("Rebuilds a metal's base colour: hue from the diffuse "
+                                      "(or the cubemap where the diffuse is too dark to trust), "
+                                      "brightness from specular strength.");
+        spec.inputs = {imagePort("diffuse", "Diffuse (linear)"),
+            imagePort("specular", "Specular Strength", true),
+            colorPort("tint", "Cubemap Tint", true)};
+        spec.outputs = {imagePort("image", "Image")};
+        spec.params = {
+            floatParam("reliability", "Diffuse trust", 0.09, 0.0, 0.5, 0.005,
+                "Linear luma below which the diffuse is too dark to carry hue and the "
+                "cubemap tint takes over. Vanilla authors some metals fully black."),
+            floatParam("f0Min", "Brightness min", 0.35, 0.0, 1.0, 0.01),
+            floatParam("f0Max", "Brightness max", 0.85, 0.0, 1.0, 0.01),
+            floatParam("tintClamp", "Tint saturation clamp", 0.35, 0.0, 1.0, 0.01,
+                "Stops a scene-neutral cubemap (DefaultOutside1's sky blue) tinting metals.")};
+        spec.evaluate = [](const EvalArgs& args, EvalOutput* output) {
+            const QImage diffuse = toRgba(args.inputs.value(QStringLiteral("diffuse")).image());
+            if (diffuse.isNull()) {
+                output->outputs.insert(QStringLiteral("image"), Value::fromImage(QImage()));
+                output->status = QStringLiteral("no input");
+                return;
+            }
+            const QImage specular = toRgba(args.inputs.value(QStringLiteral("specular")).image());
+            const Value tintValue = args.inputs.value(QStringLiteral("tint"));
+            const bool hasTint = tintValue.type() == ValueType::Color;
+            const QVector3D tint = hasTint ? tintValue.color() : QVector3D(0.5f, 0.5f, 0.5f);
+
+            Converter::Options options;
+            options.diffuseReliabilityThreshold = paramFloat(args.params, "reliability", 0.09f);
+            options.metalF0Min = paramFloat(args.params, "f0Min", 0.35f);
+            options.metalF0Max = paramFloat(args.params, "f0Max", 0.85f);
+            options.cubemapTintSaturationClamp = paramFloat(args.params, "tintClamp", 0.35f);
+
+            QImage result(diffuse.width(), diffuse.height(), QImage::Format_RGBA8888);
+            for (int y = 0; y < diffuse.height(); ++y) {
+                const uchar* in = diffuse.constScanLine(y);
+                uchar* out = result.scanLine(y);
+                const uchar* specLine = specular.isNull() ? nullptr
+                    : specular.constScanLine(std::min(y * specular.height() / diffuse.height(),
+                          specular.height() - 1));
+                for (int x = 0; x < diffuse.width(); ++x) {
+                    const QVector3D linear(in[x * 4] / 255.0f, in[x * 4 + 1] / 255.0f,
+                        in[x * 4 + 2] / 255.0f);
+                    const float strength = specLine
+                        ? specLine[std::min(x * specular.width() / diffuse.width(),
+                              specular.width() - 1) * 4] / 255.0f
+                        : 1.0f;
+                    const QVector3D metal = Converter::recoverMetalAlbedoFo4(linear, strength,
+                        tint, hasTint, options);
+                    out[x * 4] = uchar(std::lround(std::clamp(metal.x(), 0.0f, 1.0f) * 255.0f));
+                    out[x * 4 + 1] = uchar(std::lround(std::clamp(metal.y(), 0.0f, 1.0f) * 255.0f));
+                    out[x * 4 + 2] = uchar(std::lround(std::clamp(metal.z(), 0.0f, 1.0f) * 255.0f));
+                    out[x * 4 + 3] = in[x * 4 + 3];
+                }
+            }
+            output->outputs.insert(QStringLiteral("image"), Value::fromImage(result));
+            output->status = hasTint ? QStringLiteral("hue: diffuse + cubemap")
+                                     : QStringLiteral("hue: diffuse only");
+        };
+        registry.add(spec);
+    }
+
     // ---------------- Maths ----------------
 
     {
@@ -1353,12 +1430,17 @@ void registerAll(Registry& registry)
         spec.category = QStringLiteral("Source");
         spec.summary = QStringLiteral("A flat fill — wire a color from Source Material, or pick one, for "
                                       "slots the material states as a value rather than a texture.");
-        spec.inputs = {colorPort("color", "Color", true)};
+        // The scalar input is the bridge from a material's numbers into the
+        // image maths: Specular Mult, Smoothness and Emittance Mult are all
+        // scalar ports, and without somewhere to plug them a graph can only
+        // hard-code what the .bgsm already states.
+        spec.inputs = {colorPort("color", "Color", true), scalarPort("value", "Value", true)};
         spec.outputs = {imagePort("image", "Image")};
         spec.params = {ParamSpec{QStringLiteral("swatch"), QStringLiteral("Color"),
                            ParamSpec::Kind::Color, 0, 0, 0, QStringLiteral("#ffffff"), {},
                            QStringLiteral("Used when no color is wired in.")},
-            floatParam("multiplier", "Multiplier", 1.0, 0.0, 8.0, 0.01),
+            floatParam("multiplier", "Multiplier", 1.0, 0.0, 8.0, 0.01,
+                "Scales the colour. A wired Value replaces it."),
             enumParam("size", "Size", 0, QStringList{QStringLiteral("Material max"),
                                              QStringLiteral("256"), QStringLiteral("512"),
                                              QStringLiteral("1024"), QStringLiteral("2048")})};
@@ -1371,7 +1453,9 @@ void registerAll(Registry& registry)
                 const QColor swatch(paramString(args.params, "swatch"));
                 if (swatch.isValid()) color = QVector3D(float(swatch.redF()), float(swatch.greenF()), float(swatch.blueF()));
             }
-            const float multiplier = paramFloat(args.params, "multiplier", 1.0f);
+            const Value wiredValue = args.inputs.value(QStringLiteral("value"));
+            const float multiplier = wiredValue.type() == ValueType::Scalar
+                ? wiredValue.scalar() : paramFloat(args.params, "multiplier", 1.0f);
 
             int size = 0;
             switch (paramInt(args.params, "size", 0)) {
@@ -2650,47 +2734,86 @@ Graph defaultFo4Graph()
     // the ambiguous band: 14.2% of the median map, against 31.8% at 0.20/0.45.
     // Drag the handles against the histogram per material -- that is the first
     // half of the workflow, and painting is the second.
+    //
+    // Auto levels OFF, unlike the FO76 reflectance window. FO76's _r has a real
+    // absolute anchor -- the 0.22 dielectric floor -- so re-deriving per
+    // material stays tied to something, and a flat map stays flat. _s.R has no
+    // anchor at all, so auto levels would stretch a brick wall's own spec
+    // variation across the full range and stencil it as metal, every time.
     const QString metallic = builder.add("image.levels", 700, 120,
-        {{QStringLiteral("inBlack"), 0.20}, {QStringLiteral("inWhite"), 0.30}});
+        {{QStringLiteral("inBlack"), 0.20}, {QStringLiteral("inWhite"), 0.30},
+            {QStringLiteral("autoLevels"), false}});
     builder.link(upSpecular, "image", metallic, "image");
 
     const QString roughness = builder.add("image.invert", 700, 260);
     builder.link(unpack, "gloss", roughness, "image");
 
-    // convert.fo4 supplies the base colour (with metal albedo recovery) and the
-    // F0 axis. It runs the same _s.R window internally, so the metal it
-    // recovers colour for is the metal the Levels node above stencils out --
-    // change one and change the other, or the recovery lands somewhere the
-    // metallic channel does not.
-    const QString convert = builder.add("convert.fo4", 920, 380);
-    builder.link(material, "material", convert, "material");
-    builder.link(upDiffuse, "image", convert, "diffuse");
-    // The packed _s, straight from the source: this node reads both channels
-    // itself, which is why it is the one place a packed texture still travels
-    // past Separate Maps.
-    builder.link(material, "smoothSpec", convert, "specular");
-    builder.link(unpack, "glow", convert, "glow");
-    builder.link(tint, "tint", convert, "cubemapTint");
+    // ---- Base colour --------------------------------------------------------
+    // Mixed in LINEAR light and encoded once at the end. Mixing an sRGB diffuse
+    // against a linear metal albedo and then encoding applies the transfer
+    // twice over metal -- the same trap the FO76 path documents.
+    const QString diffuseLinear = builder.add("color.srgbToLinear", 700, 40);
+    builder.link(upDiffuse, "image", diffuseLinear, "image");
 
-    // Specular F0 comes off convert.fo4's RMAOS alpha. _s.R is a Blinn-Phong
-    // intensity with no physical anchor, so the mapping is anchored on the
-    // corpus: the measured median maps to the dielectric default 0.04 and the
-    // 0.02-0.08 window clamps the tails.
-    const QString rmaosSplit = builder.add("image.separate", 1140, 420);
-    builder.link(convert, "rmaos", rmaosSplit, "image");
+    const QString metalAlbedo = builder.add("color.metalAlbedo", 920, 40);
+    builder.link(diffuseLinear, "image", metalAlbedo, "diffuse");
+    builder.link(upSpecular, "image", metalAlbedo, "specular");
+    builder.link(tint, "tint", metalAlbedo, "tint");
+
+    const QString baseMix = builder.add("image.mix", 1140, 60);
+    const QString baseColor = builder.add("color.linearToSrgb", 1360, 60);
+    builder.link(diffuseLinear, "image", baseMix, "a");
+    builder.link(metalAlbedo, "image", baseMix, "b");
+    // The same stencil that writes the metallic channel decides where the
+    // recovered colour lands, so the two can never disagree.
+    builder.link(metallic, "image", baseMix, "factor");
+    builder.link(baseMix, "image", baseColor, "image");
+
+    // ---- Dielectric F0 ------------------------------------------------------
+    // _s.R is a Blinn-Phong intensity with no physical anchor, so the mapping is
+    // anchored on the corpus instead: the measured median (54/255 = 0.212) maps
+    // to the physical dielectric default 0.04, and the 0.02-0.08 window clamps
+    // the tails. The two in-points are that same line read backwards -- 0.106
+    // is where it crosses 0.02, 0.424 where it crosses 0.08 -- so one Levels
+    // node reproduces the clamped ramp exactly, and shows the histogram under
+    // it. Auto levels OFF: this is a physical quantity, not a classification,
+    // and stretching it per material is what the roughness rule warns against.
+    const QString specMultImage = builder.add("image.solidColor", 700, 340);
+    builder.link(material, "specMult", specMultImage, "value");
+    const QString specScaled = builder.add("math.op", 920, 320, {{QStringLiteral("operation"), 2}});
+    builder.link(upSpecular, "image", specScaled, "a");
+    builder.link(specMultImage, "image", specScaled, "b");
+    const QString specularF0 = builder.add("image.levels", 1140, 320,
+        {{QStringLiteral("inBlack"), 0.106}, {QStringLiteral("inWhite"), 0.424},
+            {QStringLiteral("outBlack"), 0.02}, {QStringLiteral("outWhite"), 0.08},
+            {QStringLiteral("autoLevels"), false}});
+    builder.link(specScaled, "image", specularF0, "image");
+
+    // ---- Emissive -----------------------------------------------------------
+    // The glow mask tinted by the material's emittance colour, exactly as FO76
+    // does it. The source node withholds both when the material does not emit,
+    // so an unauthored glow costs nothing.
+    const QString emitColor = builder.add("image.solidColor", 700, 620);
+    const QString emissive = builder.add("math.op", 920, 620, {{QStringLiteral("operation"), 2}});
+    builder.link(material, "emitColor", emitColor, "color");
+    builder.link(unpack, "glow", emissive, "a");
+    builder.link(emitColor, "image", emissive, "b");
 
     // The shipped normal keeps the original's RGB and takes only the derived
     // signed curvature in A. Feeding the whole normal in makes the old "B
     // defaulted to white" class of bug impossible.
-    const QString channels = builder.add("composite.pbrChannels", 1360, 240);
-    builder.link(convert, "baseColor", channels, "baseColor");
+    const QString channels = builder.add("composite.pbrChannels", 1580, 240);
+    builder.link(baseColor, "image", channels, "baseColor");
+    // Opacity now travels as its own map rather than riding the diffuse alpha
+    // through a conversion node, which is the whole point of Separate Maps.
+    builder.link(unpack, "opacity", channels, "opacity");
     builder.link(upNormal, "image", channels, "normal");
     builder.link(derive, "curvature", channels, "curvature");
     builder.link(roughness, "image", channels, "roughness");
     builder.link(metallic, "image", channels, "metallic");
     builder.link(derive, "ao", channels, "ao"); // derived detail AO, not the conversion's B
-    builder.link(rmaosSplit, "a", channels, "specular");
-    builder.link(convert, "emissive", channels, "emissive");
+    builder.link(specularF0, "image", channels, "specular");
+    builder.link(emissive, "image", channels, "emissive");
 
     const QString pbr = builder.add("output.pbrMaterial", 1580, 300);
     builder.link(channels, "baseColor", pbr, "baseColor");
