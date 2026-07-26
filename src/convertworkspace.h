@@ -108,6 +108,11 @@ private:
     void handleMaskPainted(const QPointF& uv);
     // Pushes the current mask to the viewport as a tinted overlay, or clears it.
     void refreshMaskOverlay();
+    // Which Paint Mask node the brush writes into: the selected one, or the
+    // only one when a graph has just the one. Empty means nowhere to paint.
+    QString brushTargetNode() const;
+    QString brushTargetLabel() const;
+    static QString maskKeyFor(const QString& materialKey, const QString& nodeId);
     void clearMaskFills();
     void saveMask();
     QString currentMaterialKey() const;

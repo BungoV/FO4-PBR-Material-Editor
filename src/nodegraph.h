@@ -109,6 +109,15 @@ struct EvalContext {
     QString outputRoot;    // mod folder for writes
     QString referenceMesh;       // optional NIF for geometry bakes
     QString correctionMaskPath;  // painted 0.5-neutral metallic correction for this material
+    // Where per-node painted masks live, and the name that scopes them to this
+    // material. A Paint Mask node owns its own pixels, so it needs somewhere to
+    // keep them that survives the graph being applied to the next material.
+    QString maskDirectory;
+    QString maskMaterialKey;
+    // Bumped whenever a mask changes. It exists purely so the cache key moves:
+    // a Paint Mask node reads a file, and nothing else in the key would notice
+    // that file being repainted.
+    int maskGeneration = 0;
     bool previewMode = true; // preview evaluates but never writes to disk
     int thumbnailSize = 128;
     // Largest authored texture dimension in this material. Nodes whose native
@@ -136,6 +145,10 @@ struct EvalArgs {
     QHash<QString, QString> inputLabels;
     QJsonObject params;
     EvalContext context;
+    // The evaluating node's own id. A node that owns per-instance data on disk
+    // needs to know which instance it is: two Paint Mask nodes in one graph are
+    // two different masks, and only the id tells them apart.
+    QString nodeId;
 };
 
 struct EvalOutput {

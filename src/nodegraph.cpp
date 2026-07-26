@@ -805,6 +805,12 @@ QHash<QString, NodeResult> Evaluator::evaluate(const Graph& graph, const EvalCon
     contextBytes += context.textureRoot.toUtf8() + '\x1f' + context.sourcePath.toUtf8() + '\x1f'
         + context.outputRoot.toUtf8() + '\x1f' + context.referenceMesh.toUtf8() + '\x1f'
         + context.correctionMaskPath.toUtf8() + '\x1f'
+        + context.maskDirectory.toUtf8() + '\x1f' + context.maskMaterialKey.toUtf8() + '\x1f'
+        // Paint Mask nodes read a file the key cannot otherwise see. The
+        // workspace bumps this every time a stroke is committed, so painting
+        // invalidates the cache — without it the graph would keep serving the
+        // mask as it was when the material was first evaluated.
+        + QByteArray::number(context.maskGeneration) + '\x1f'
         + QByteArray::number(context.previewMaxSize) + '\x1f'
         + QByteArray::number(context.materialMaxResolution) + '\x1f'
         + (context.previewMode ? "preview" : "write");
@@ -825,6 +831,7 @@ QHash<QString, NodeResult> Evaluator::evaluate(const Graph& graph, const EvalCon
         EvalArgs args;
         args.params = node->params;
         args.context = context;
+        args.nodeId = node->id;
         QByteArray keyBytes = node->typeId.toUtf8() + '\x1f'
             + QJsonDocument(node->params).toJson(QJsonDocument::Compact);
         bool upstreamFailed = false;

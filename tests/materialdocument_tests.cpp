@@ -3664,6 +3664,54 @@ int main(int argc, char* argv[])
             args.context.correctionMaskPath = maskPath;
             NodeGraph::EvalOutput out;
             if (paintSpec) paintSpec->evaluate(args, &out);
+
+            // Each node owns its OWN pixels: same material, two node ids, two
+            // masks. This is the whole point of the node holding the image
+            // rather than there being one correction per material.
+            {
+                const QString dir = maskDir.path();
+                QImage blackMask(4, 4, QImage::Format_RGBA8888);
+                blackMask.fill(QColor(0, 0, 0));
+                QImage whiteMask(4, 4, QImage::Format_RGBA8888);
+                whiteMask.fill(QColor(255, 255, 255));
+                const QString pathA = ConverterNodes::paintMaskPath(dir, QStringLiteral("mat"),
+                    QStringLiteral("aaaa1111"), false);
+                const QString pathB = ConverterNodes::paintMaskPath(dir, QStringLiteral("mat"),
+                    QStringLiteral("bbbb2222"), false);
+                check(!pathA.isEmpty() && pathA != pathB,
+                    QStringLiteral("two node ids resolve to two different mask files"));
+                blackMask.save(pathA);
+                whiteMask.save(pathB);
+
+                NodeGraph::EvalArgs perNode;
+                perNode.params = args.params;
+                perNode.context.maskDirectory = dir;
+                perNode.context.maskMaterialKey = QStringLiteral("mat");
+                perNode.nodeId = QStringLiteral("aaaa1111");
+                NodeGraph::EvalOutput outA;
+                if (paintSpec) paintSpec->evaluate(perNode, &outA);
+                perNode.nodeId = QStringLiteral("bbbb2222");
+                NodeGraph::EvalOutput outB;
+                if (paintSpec) paintSpec->evaluate(perNode, &outB);
+                const QImage valueA = outA.outputs.value(QStringLiteral("value")).image();
+                const QImage valueB = outB.outputs.value(QStringLiteral("value")).image();
+                check(!valueA.isNull() && !valueB.isNull()
+                        && QColor(valueA.pixelColor(0, 0)).red() == 0
+                        && QColor(valueB.pixelColor(0, 0)).red() == 255,
+                    QStringLiteral("and each node reads its own, not the other's"));
+
+                // A shared-scope node lifts out of the per-material key, so the
+                // same node serves every material the preset is applied to.
+                const QString sharedPath = ConverterNodes::paintMaskPath(dir,
+                    QStringLiteral("mat"), QStringLiteral("aaaa1111"), true);
+                const QString otherMaterial = ConverterNodes::paintMaskPath(dir,
+                    QStringLiteral("other"), QStringLiteral("aaaa1111"), true);
+                check(sharedPath == otherMaterial && sharedPath != pathA,
+                    QStringLiteral("shared scope drops the material from the path"));
+                check(ConverterNodes::paintMaskPath(dir, QString(),
+                          QStringLiteral("aaaa1111"), false).isEmpty(),
+                    QStringLiteral("a per-material mask with no material resolves to nothing"));
+            }
             const QImage factor = out.outputs.value(QStringLiteral("factor")).image();
             const QImage value = out.outputs.value(QStringLiteral("value")).image();
             check(!factor.isNull() && !value.isNull()

@@ -665,32 +665,40 @@ void registerAll(Registry& registry)
         // factor, or anything else, instead of being a special case one node
         // knew about.
         //
-        // The pixels are per MATERIAL and the graph is a PRESET shared across
-        // all of them, so the node stores no image. It names a role and the
-        // evaluation context supplies that material's sidecar -- the same
-        // arrangement source.material.fo4 uses to mean "whatever the queue
-        // selected" rather than a fixed path.
+        // Every Paint Mask node owns its OWN pixels, keyed by its node id: drop
+        // three of them in a graph and you get three independent masks to wire
+        // wherever you like. The id is a stable 8-char uuid fragment assigned at
+        // creation, so a node keeps its mask across edits, reloads and renames.
+        //
+        // Scope decides how far a mask reaches. Per material is the default,
+        // because a correction painted for a tire iron is nonsense on a brick
+        // wall and a graph is a PRESET applied to a whole queue. Shared is there
+        // for the case that genuinely is graph-wide — a UV-layout stencil, or a
+        // trim mask for a family of materials that share one texture set.
         NodeTypeSpec spec;
         spec.id = QStringLiteral("source.paintMask");
         spec.name = QStringLiteral("Paint Mask");
         spec.category = QStringLiteral("Source");
-        spec.summary = QStringLiteral("The mask painted for this material. Wire Factor and Value "
-                                      "into a Mix to override whatever the graph inferred.");
+        spec.summary = QStringLiteral("A mask you paint in the viewport, one per node. Wire Factor "
+                                      "and Value into a Mix to override whatever fed it.");
         spec.outputs = {imagePort("factor", "Factor"), imagePort("value", "Value"),
             imagePort("raw", "Raw")};
-        spec.params = {ParamSpec{QStringLiteral("role"), QStringLiteral("Role"),
-            ParamSpec::Kind::Text, 0, 0, 0, QStringLiteral("metal"), {},
-            QStringLiteral("Which sidecar this node paints. One mask per role, so a graph can "
-                           "correct metal and something else independently.")}};
+        spec.params = {
+            ParamSpec{QStringLiteral("label"), QStringLiteral("Name"),
+                ParamSpec::Kind::Text, 0, 0, 0, QStringLiteral("Metal"), {},
+                QStringLiteral("Shown on the node and in the brush target list. Naming only — the "
+                               "mask is tied to the node itself, so renaming keeps your painting.")},
+            enumParam("scope", "Scope", 0,
+                QStringList{QStringLiteral("Per material"), QStringLiteral("Shared")})};
         spec.evaluate = [](const EvalArgs& args, EvalOutput* output) {
-            QString path = args.context.correctionMaskPath;
-            const QString role = paramString(args.params, "role").trimmed();
-            // Any role but the default gets its own sidecar beside the first.
-            if (!path.isEmpty() && !role.isEmpty() && role != QLatin1String("metal"))
-                path.replace(QStringLiteral("_correction."), QStringLiteral("_") + role + QStringLiteral("."));
-
+            const QString path = ConverterNodes::paintMaskPath(args.context, args.nodeId,
+                paramInt(args.params, "scope", 0) == 1);
             QImage mask;
             if (!path.isEmpty()) mask = QImage(path);
+            // Graphs written before masks became per-node fall back to the one
+            // sidecar they did have, so an existing correction is not lost.
+            if (mask.isNull() && !args.context.correctionMaskPath.isEmpty())
+                mask = QImage(args.context.correctionMaskPath);
             if (mask.isNull()) {
                 // No mask painted yet is the normal case, not an error: a fully
                 // zero FACTOR overrides nothing, so a wired Mix passes the
@@ -2487,6 +2495,24 @@ Registry& defaultRegistry()
 
 const Registry& sharedRegistry() { return defaultRegistry(); }
 
+QString paintMaskPath(const QString& maskDirectory, const QString& materialKey,
+    const QString& nodeId, bool shared)
+{
+    if (maskDirectory.trimmed().isEmpty() || nodeId.trimmed().isEmpty()) return QString();
+    // Shared masks skip the material entirely, which is exactly what makes them
+    // shared. Per-material ones need a key; without one there is nowhere safe to
+    // put them, so the node reports nothing painted rather than guessing.
+    if (!shared && materialKey.trimmed().isEmpty()) return QString();
+    const QString stem = shared ? QStringLiteral("_shared") : materialKey;
+    return maskDirectory + QLatin1Char('/') + stem + QStringLiteral("__") + nodeId
+        + QStringLiteral(".png");
+}
+
+QString paintMaskPath(const NodeGraph::EvalContext& context, const QString& nodeId, bool shared)
+{
+    return paintMaskPath(context.maskDirectory, context.maskMaterialKey, nodeId, shared);
+}
+
 QImage normaliseReflectanceToSrgbScale(const QImage& image, bool sourceIsSrgb)
 {
     // Already on the reference scale.
@@ -2544,6 +2570,25 @@ Converter::SuppliedImages runGraph(const Graph& graph, const QString& materialPa
     context.textureRoot = textureRoot;
     context.referenceMesh = referenceMesh;
     context.correctionMaskPath = correctionMaskPath;
+    // Per-node masks live beside the legacy single sidecar, keyed by the
+    // material's base name. Derived from the sidecar path rather than passed
+    // separately so callers that already know where masks go keep working.
+    if (!correctionMaskPath.trimmed().isEmpty())
+        context.maskDirectory = QFileInfo(correctionMaskPath).absolutePath();
+    context.maskMaterialKey = QFileInfo(materialPath).completeBaseName();
+    // Paint Mask nodes read files nothing else in the cache key can see, so
+    // fold those files' timestamps in here. Computed from the graph rather than
+    // passed in, so no caller can forget: repaint a mask, the key moves, the
+    // node re-runs. Without it a second conversion would serve the mask as it
+    // was the first time, and the stroke would appear to do nothing.
+    for (const Node& node : graph.nodes) {
+        if (node.typeId != QStringLiteral("source.paintMask")) continue;
+        const QString path = paintMaskPath(context, node.id,
+            node.params.value(QStringLiteral("scope")).toInt() == 1);
+        if (path.isEmpty()) continue;
+        const QFileInfo info(path);
+        context.maskGeneration += int(info.exists() ? info.lastModified().toSecsSinceEpoch() & 0x7fffffff : 0);
+    }
     context.previewMode = false;   // full resolution, no preview downsample
     context.previewMaxSize = 0;
     context.thumbnailSize = 0;     // no thumbnails needed for a write run

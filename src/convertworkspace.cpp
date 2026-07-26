@@ -1616,6 +1616,40 @@ QString ConvertWorkspace::currentMaterialKey() const
     return row >= 0 ? m_entries[row].materialPath.toLower() : QString();
 }
 
+QString ConvertWorkspace::brushTargetNode() const
+{
+    // Whichever Paint Mask node is selected on the canvas takes the stroke. With
+    // one in the graph — the stock presets — selection is redundant and the
+    // fallback finds it, so the brush works without a trip to the canvas. With
+    // several, selecting is how you say which mask you are painting.
+    const NodeGraph::Graph& graph = m_canvas->graph();
+    const QString selected = m_canvas->selectedNode();
+    if (const NodeGraph::Node* node = selected.isEmpty() ? nullptr : graph.node(selected);
+        node && node->typeId == QStringLiteral("source.paintMask"))
+        return node->id;
+    QString onlyOne;
+    int found = 0;
+    for (const NodeGraph::Node& node : graph.nodes)
+        if (node.typeId == QStringLiteral("source.paintMask")) { onlyOne = node.id; ++found; }
+    return found == 1 ? onlyOne : QString();
+}
+
+QString ConvertWorkspace::brushTargetLabel() const
+{
+    const QString id = brushTargetNode();
+    const NodeGraph::Node* node = id.isEmpty() ? nullptr : m_canvas->graph().node(id);
+    if (!node) return QString();
+    const QString label = node->params.value(QStringLiteral("label")).toString().trimmed();
+    return label.isEmpty() ? tr("Paint Mask") : label;
+}
+
+// Masks are per node as well as per material, so the in-session key carries
+// both. Two Paint Mask nodes on one material are two separate images.
+QString ConvertWorkspace::maskKeyFor(const QString& materialKey, const QString& nodeId)
+{
+    return nodeId.isEmpty() ? materialKey : materialKey + QLatin1Char('|') + nodeId;
+}
+
 void ConvertWorkspace::loadMaskReference()
 {
     const QString key = currentMaterialKey();
@@ -1679,9 +1713,15 @@ void ConvertWorkspace::handleTrianglePicked(int triangle)
 
 void ConvertWorkspace::handleMaskPainted(const QPointF& uv)
 {
-    const QString key = currentMaterialKey();
-    if (key.isEmpty()) return;
-    MaskState& state = m_masks[key];
+    const QString material = currentMaterialKey();
+    if (material.isEmpty()) return;
+    const QString node = brushTargetNode();
+    if (node.isEmpty()) {
+        m_maskStatus->setText(tr("Select a Paint Mask node on the canvas — the graph has none, "
+                                 "or more than one and no choice made."));
+        return;
+    }
+    MaskState& state = m_masks[maskKeyFor(material, node)];
     if (state.mask.isNull()) state.mask = MaskPaint::neutralMask();
 
     const float target = float(m_maskBrushValue->currentData().toDouble());
@@ -1717,12 +1757,14 @@ void ConvertWorkspace::handleMaskPainted(const QPointF& uv)
     }
     ++m_brushStrokes;
     refreshMaskOverlay();
-    m_maskStatus->setText(tr("painted — Save Mask to apply"));
+    m_maskStatus->setText(tr("painting %1 — Save Mask to apply").arg(brushTargetLabel()));
 }
 
 void ConvertWorkspace::refreshMaskOverlay()
 {
-    const QString key = currentMaterialKey();
+    const QString material = currentMaterialKey();
+    const QString key = material.isEmpty() ? QString()
+                                           : maskKeyFor(material, brushTargetNode());
     const auto state = key.isEmpty() ? m_masks.constEnd() : m_masks.constFind(key);
     // Only while the brush is armed. A permanent tint would sit over every
     // material the queue walks through and make the preview a liar about what
@@ -1748,24 +1790,54 @@ void ConvertWorkspace::saveMask()
 {
     const QString key = currentMaterialKey();
     if (key.isEmpty()) { m_maskStatus->setText(tr("Select a material first.")); return; }
-    const auto state = m_masks.constFind(key);
-    if (state == m_masks.constEnd() || state->mask.isNull()) {
-        m_maskStatus->setText(tr("Nothing to save — load a mesh and pick fills first."));
-        return;
-    }
     const QString outputRoot = QDir::fromNativeSeparators(m_outputEdit->text().trimmed());
     if (outputRoot.isEmpty()) { m_maskStatus->setText(tr("Choose an output mod folder first.")); return; }
     const int row = currentEntryIndex();
     if (row < 0) { m_maskStatus->setText(tr("Select a material first.")); return; }
     const QString baseName = QFileInfo(m_entries[row].materialPath).completeBaseName();
-    const QString maskPath = outputRoot + QStringLiteral("/Masks/") + baseName + QStringLiteral("_correction.png");
-    QDir().mkpath(QFileInfo(maskPath).absolutePath());
-    if (!state->mask.save(maskPath)) {
-        m_maskStatus->setText(tr("Could not write %1").arg(QDir::toNativeSeparators(maskPath)));
+    const QString maskDirectory = outputRoot + QStringLiteral("/Masks");
+    // The legacy single sidecar still gets written: it is what tells the
+    // orchestrator this material HAS corrections (JobOptions::correctionMaskPath
+    // is also where runGraph learns the mask directory), and it is what the
+    // non-graph batch path reads.
+    const QString legacyPath = maskDirectory + QLatin1Char('/') + baseName
+        + QStringLiteral("_correction.png");
+    QDir().mkpath(maskDirectory);
+
+    // Every node's mask for this material, each to its own file, through the
+    // same helper the node reads with.
+    int written = 0;
+    QString firstError;
+    for (const NodeGraph::Node& node : m_canvas->graph().nodes) {
+        if (node.typeId != QStringLiteral("source.paintMask")) continue;
+        const auto painted = m_masks.constFind(maskKeyFor(key, node.id));
+        if (painted == m_masks.constEnd() || painted->mask.isNull()) continue;
+        const QString path = ConverterNodes::paintMaskPath(maskDirectory, baseName, node.id,
+            node.params.value(QStringLiteral("scope")).toInt() == 1);
+        if (path.isEmpty()) continue;
+        if (painted->mask.save(path)) ++written;
+        else if (firstError.isEmpty()) firstError = path;
+    }
+    // The fill tools still write the material-wide mask under the bare key.
+    const auto legacy = m_masks.constFind(key);
+    const bool haveLegacy = legacy != m_masks.constEnd() && !legacy->mask.isNull();
+    if (haveLegacy && !legacy->mask.save(legacyPath) && firstError.isEmpty())
+        firstError = legacyPath;
+    else if (!haveLegacy && written > 0 && !QFileInfo::exists(legacyPath))
+        MaskPaint::neutralMask().save(legacyPath);
+
+    if (!firstError.isEmpty()) {
+        m_maskStatus->setText(tr("Could not write %1").arg(QDir::toNativeSeparators(firstError)));
         return;
     }
-    m_overrides[key].maskPath = maskPath;
-    m_maskStatus->setText(tr("Saved — reconvert to apply (%1)").arg(QDir::toNativeSeparators(maskPath)));
+    if (written == 0 && !haveLegacy) {
+        m_maskStatus->setText(tr("Nothing to save."));
+        return;
+    }
+    m_overrides[key].maskPath = legacyPath;
+    m_maskStatus->setText(written > 0
+        ? tr("Saved %n mask(s) — reconvert to apply", nullptr, written)
+        : tr("Saved — reconvert to apply (%1)").arg(QDir::toNativeSeparators(legacyPath)));
 }
 
 int ConvertWorkspace::checkedCount() const

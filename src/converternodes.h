@@ -50,6 +50,20 @@ int materialMaxResolution(const Bgsm::Material& material, const QString& texture
 // data rather than an implementation detail, and because it is worth testing.
 QImage normaliseReflectanceToSrgbScale(const QImage& image, bool sourceIsSrgb);
 
+// Where a Paint Mask node's pixels live. Each node owns its own mask, keyed by
+// its node id, so several in one graph are several independent masks; `shared`
+// lifts a mask out of the per-material scoping for the cases that really are
+// graph-wide. Empty when the context has nowhere to keep masks yet.
+//
+// Shared by the node and by whatever paints into it, deliberately: two places
+// composing the same filename by hand is two places to get it wrong, and the
+// failure mode is silent — the brush writes one file and the graph reads
+// another, so a stroke simply never appears.
+QString paintMaskPath(const NodeGraph::EvalContext& context, const QString& nodeId, bool shared);
+// The same path from the parts the workspace has to hand, without a context.
+QString paintMaskPath(const QString& maskDirectory, const QString& materialKey,
+    const QString& nodeId, bool shared);
+
 // Loads a .pbrgraph; returns an empty graph and sets error when unreadable.
 NodeGraph::Graph loadGraphFile(const QString& path, QString* error = nullptr);
 bool saveGraphFile(const NodeGraph::Graph& graph, const QString& path, QString* error = nullptr);
