@@ -315,6 +315,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         converted.rmaos = options.supplied.rmaos;
         converted.emissive = options.supplied.emissive;
         converted.subsurface = options.supplied.subsurface;
+        converted.specularColor = options.supplied.specularColor;
         converted.metalCoverage = options.supplied.metalCoverage;
         result.notes.append(options.supplied.notes);
     } else if (fallout76) {
@@ -487,6 +488,15 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
             QImage(), options, cache, cache->emissiveBySignature, &result.notes, &result.errors);
         recordTexture(subsurfacePortable);
     }
+    QString specularColorPortable;
+    if (!converted.specularColor.isNull()) {
+        // sRGB like every other color map, so the runtime's sRGB SRV decodes it
+        // and the tint multiplies a linear F0.
+        specularColorPortable = writeConverted(converted.specularColor, pairSignature + QStringLiteral("#sc"),
+            portableDirectory, baseName, QStringLiteral("_SC.dds"), TextureWriter::DdsFormat::Bc7Srgb,
+            QImage(), options, cache, cache->emissiveBySignature, &result.notes, &result.errors);
+        recordTexture(specularColorPortable);
+    }
     if (options.writeMetallicDiagnostic && !converted.metallic.isNull())
         recordTexture(writeConverted(converted.metallic, pairSignature + QStringLiteral("#m"), portableDirectory, baseName,
             QStringLiteral("_MetalMask.dds"), TextureWriter::DdsFormat::Bc4, QImage(), options, cache,
@@ -524,6 +534,13 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
                                  std::clamp(scatter.y(), 0.0f, 1.0f),
                                  std::clamp(scatter.z(), 0.0f, 1.0f)).name()},
                 {QStringLiteral("weight"), 1.0}});
+    }
+
+    if (!specularColorPortable.isEmpty()) {
+        // The map is the whole input: RGB tints the dielectric F0 and A weighs
+        // the tint in. The slot has no constants, so there is nothing else to
+        // write and nothing that can disagree with the runtime.
+        wireSlot(&document, QStringLiteral("primarySpecularColor"), specularColorPortable, QJsonObject{});
     }
 
     // Review flags for the workspace queue.

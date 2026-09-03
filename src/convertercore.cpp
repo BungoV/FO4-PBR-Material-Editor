@@ -201,11 +201,82 @@ bool channelIsFlat(const QImage& image, int channel, int tolerance)
     return highest - lowest < tolerance;
 }
 
+QImage constantSpecularTint(const QVector3D& specularColor)
+{
+    const auto byte = [](float value) {
+        return uchar(std::clamp<long>(std::lround(value * 255.0f), 0L, 255L));
+    };
+    const uchar r = byte(specularColor.x()), g = byte(specularColor.y()), b = byte(specularColor.z());
+    // White is the identity. Emitting it would cost a texture to multiply by 1.
+    if (r == 255 && g == 255 && b == 255) return {};
+    // Four texels rather than one: the value is constant, the size is only
+    // about surviving a block-compressed writer and its mip chain.
+    QImage tint(4, 4, QImage::Format_RGBA8888);
+    tint.fill(QColor(r, g, b, 255));
+    return tint;
+}
+
+QImage reflectanceSpecularTint(const QImage& reflectance)
+{
+    const QImage source = toRgba(reflectance);
+    if (source.isNull()) return {};
+    QImage tint(source.width(), source.height(), QImage::Format_RGBA8888);
+    qint64 chromaSum = 0, stronglyColored = 0;
+    for (int y = 0; y < source.height(); ++y) {
+        const uchar* line = source.constScanLine(y);
+        uchar* tintLine = tint.scanLine(y);
+        for (int x = 0; x < source.width(); ++x) {
+            // FO76 authors _r as BC1_UNORM_SRGB and the load path does not act
+            // on the declared color space, so decode it here exactly as the F0
+            // luminance path a few lines below does.
+            const QVector3D linear = srgbToLinear(QVector3D(line[x * 4] / 255.0f,
+                line[x * 4 + 1] / 255.0f, line[x * 4 + 2] / 255.0f));
+            const float luma = luminance(linear);
+            // The LEVEL belongs to RMAOS.A. Dividing it out leaves the hue, and
+            // a texel with no light in it has no hue worth keeping.
+            const QVector3D hue = luma > 1e-4f
+                ? QVector3D(std::clamp(linear.x() / luma, 0.0f, 1.0f),
+                      std::clamp(linear.y() / luma, 0.0f, 1.0f),
+                      std::clamp(linear.z() / luma, 0.0f, 1.0f))
+                : QVector3D(1.0f, 1.0f, 1.0f);
+            const QVector3D encoded = linearToSrgb(hue);
+            const uchar r = uchar(std::lround(std::clamp(encoded.x(), 0.0f, 1.0f) * 255.0f));
+            const uchar g = uchar(std::lround(std::clamp(encoded.y(), 0.0f, 1.0f) * 255.0f));
+            const uchar b = uchar(std::lround(std::clamp(encoded.z(), 0.0f, 1.0f) * 255.0f));
+            const int chroma = int(std::max({ r, g, b })) - int(std::min({ r, g, b }));
+            chromaSum += chroma;
+            if (chroma > 24) ++stronglyColored;
+            tintLine[x * 4] = r;
+            tintLine[x * 4 + 1] = g;
+            tintLine[x * 4 + 2] = b;
+            tintLine[x * 4 + 3] = 255;
+        }
+    }
+    // An achromatic reflectance map holds nothing the F0 scalar did not already
+    // carry, so it earns no texture. Same discipline as the _l alpha check:
+    // measure the data before consuming it — and the threshold is measured too.
+    // Vanilla FO76 ships _r as BC1, whose block ends leave a few stray
+    // chromatic texels on a map that is grey by intent: ProtectronArmor_r
+    // (1024², channel means 0.265/0.265/0.268) has some, and letting one texel
+    // decide shipped a megabyte of white. Gold on the same model
+    // (ProtectronArmorGold_r, 0.725/0.655/0.483) is what a real tint looks
+    // like. So: the tint ships when the surface is tinted ON AVERAGE, or when a
+    // real share of it is strongly colored (an emblem on a grey body).
+    const double texels = std::max<double>(1.0, double(source.width()) * source.height());
+    const bool tinted = double(chromaSum) / texels > 4.0
+        || double(stronglyColored) / texels > 0.02;
+    return tinted ? tint : QImage();
+}
+
 ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& material, const Options& options)
 {
     ConvertedImages result;
     const QImage diffuse = toRgba(sources.diffuse);
     if (diffuse.isNull()) return result;
+    // FO4 has no specular COLOR map to take: _s is BC5, R specular strength and
+    // G gloss. The color it does author is the material's own cSpecularColor,
+    // which vanilla's deferred path drops entirely.
+    result.specularColor = constantSpecularTint(material.specularColor);
     const int width = diffuse.width(), height = diffuse.height();
     const ScaledReader specular(sources.specular, width, height);
     const ScaledReader correction(sources.correctionMask, width, height);
@@ -446,6 +517,11 @@ ConvertedImages convertFo76(const Fo76Sources& sources, const Bgsm::Material& ma
             }
         }
     }
+    // The F0 above is luminance(_r), which discards the hue of a map that
+    // genuinely has one — FO76 authors true RGB reflectance. The level stays
+    // where it was; the hue becomes the specular tint.
+    result.specularColor = reflectanceSpecularTint(sources.reflectance);
+
     // Only materials that actually scatter get a subsurface map; every other
     // FO76 material would otherwise gain a meaningless extra texture.
     if ((material.translucency || material.subsurfaceLighting) && !lightingRgba.isNull()) {

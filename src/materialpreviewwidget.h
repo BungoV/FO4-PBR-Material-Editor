@@ -189,6 +189,10 @@ public:
     void setShadows(bool enabled, float intensity);
     void setDerivedEnvironmentShadow(bool enabled, float directionalWeight);
     float effectiveKeyIntensity() const { return m_derivedEnvironmentShadow ? 0.0f : m_keyIntensity; }
+    // Whether the current document's specular-color map reached the shader as a
+    // resolved special layer. Needs no GL context, so a host test can pin the
+    // document -> shader-input wiring the F0 lerp depends on.
+    bool specularColorLayerBound() const;
     void setComparisonEnabled(bool enabled);
     void setEnvironmentCubemap(const QString& path, const QString& textureRoot);
     static EnvironmentLight deriveEnvironmentLight(const QVector<QImage>& faces, float environmentYaw = 0);

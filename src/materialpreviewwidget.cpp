@@ -136,6 +136,7 @@ enum SpecialLayer {
     StateMasksLayer,
     MotionVectorsLayer,
     DetailNormalLayer,
+    SpecularColorLayer,
     SpecialLayerCount
 };
 
@@ -803,6 +804,12 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
             QVector4D(useNormal,useNormal,used(state.values,"overrideConeOcclusion"),used(state.values,"overrideMask")));
     }
     {
+        // Specular color has no constants by design, so its fallback is a zero
+        // weight: an enabled-but-unresolved slot samples (0,0,0,0) and the
+        // shader's lerp collapses onto the scalar F0 it always used.
+        addSpecial(SpecularColorLayer,QStringLiteral("SpecularColor"),QVector4D(0,0,0,0),QVector4D(1,1,1,1));
+    }
+    {
         const auto state=stateFor(QStringLiteral("DetailNormal"));const QVector3D normalColor=jsonColor(state.values,"normal","#8080FF");const float useNormal=used(state.values,"overrideNormal");
         addSpecial(DetailNormalLayer,QStringLiteral("DetailNormal"),
             QVector4D(normalColor.x(),normalColor.y(),.5f,numberValue(state.values,"mask",1)),
@@ -1295,6 +1302,7 @@ QImage PbrPreviewGL::captureScreenshot()
 void PbrPreviewGL::setBloom(bool enabled, float strength) { m_bloomEnabled = enabled; m_bloomStrength = std::clamp(strength, 0.0f, 3.0f); update(); }
 void PbrPreviewGL::setSsao(bool enabled, float strength) { m_ssaoEnabled = enabled; m_ssaoStrength = std::clamp(strength, 0.0f, 1.0f); update(); }
 void PbrPreviewGL::setGroundEnabled(bool value) { m_groundEnabled = value; update(); }
+bool PbrPreviewGL::specularColorLayerBound() const { return (m_specialMask&(1<<SpecularColorLayer))!=0; }
 void PbrPreviewGL::setShadows(bool enabled, float intensity) { m_shadowsEnabled=enabled;m_shadowIntensity=std::clamp(intensity,0.0f,1.0f);update(); }
 void PbrPreviewGL::setDerivedEnvironmentShadow(bool enabled, float directionalWeight) { m_derivedEnvironmentShadow=enabled;m_derivedEnvironmentShadowWeight=std::clamp(directionalWeight,0.0f,1.0f);update(); }
 void PbrPreviewGL::setComparisonEnabled(bool value) { m_comparisonEnabled = value; update(); }
@@ -1614,7 +1622,7 @@ void PbrPreviewGL::initializeGL()
         uniform float uParticleAge,uParticleSeed;
         uniform int uSixWayALayer,uSixWayBLayer;
         uniform float uSixWayAmbient,uSixWayIntensity,uSixWayFireIntensity;
-        uniform int uMotionVectorsLayer,uDetailNormalLayer;
+        uniform int uMotionVectorsLayer,uDetailNormalLayer,uSpecularColorLayer;
         uniform float uMotionStrength,uDetailNormalStrength,uDetailNormalScale,uDetailRoughVariation;
         uniform float uStateEdgeShedding[8];
         uniform bool uLandscapeUsePorosityTexture;
@@ -2460,6 +2468,23 @@ void PbrPreviewGL::initializeGL()
             float resolvedHeight=defaults?.5:uHeightFallback;
             if(!defaults&&uHasHeight&&!uOverrideHeight){vec4 heightSample=texture(uHeight,heightUv);resolvedHeight=uHeightBlue?heightSample.b:heightSample.r;}
             if(!defaults&&uHeightInvert)resolvedHeight=1.0-resolvedHeight;resolvedHeight=clamp(resolvedHeight+uHeightBias,0.0,1.0);
+            // Dielectric F0 becomes a color here. The specular map TINTS it
+            // (OpenPBR specular_color): RGB multiplies the level RMAOS alpha
+            // owns, so it can only darken or hue-shift, and A weighs the tint
+            // in. White RGB and zero weight are both exactly 1.0, so a material
+            // without the map keeps the scalar path untouched. The 0.16 ceiling
+            // is the runtime's dielectric clamp, mirrored here so the preview
+            // and the game agree on the level as well as the hue.
+            // DIVERGENCE, deliberate: the runtime samples this map through an
+            // sRGB SRV (the exact piecewise transfer); the preview decodes with
+            // pow(2.2), the same approximation it uses for every other sRGB
+            // input, so very dark tints differ slightly between the two.
+            vec3 specularTint=vec3(1.0);
+            if(hasSpecial(uSpecularColorLayer)&&!defaults){
+                vec4 specularColorSample=specialSample(uSpecularColorLayer,uv);
+                specularTint=mix(vec3(1.0),clamp(pow(specularColorSample.rgb,vec3(2.2)),0.0,1.0),clamp(specularColorSample.a,0.0,1.0));
+            }
+            vec3 dielectricF0=vec3(min(dielectric,0.16))*specularTint;
             // Debug split view: left of the divider renders uDebugViewLeft
             // (default Shaded), the right the inspected map (uDebugSplit 0 =
             // map fills the view). Any A|B channel pairing works.
@@ -2475,7 +2500,7 @@ void PbrPreviewGL::initializeGL()
             if(dbgView==3){fragColor=vec4(vec3(rough),1);return;}
             if(dbgView==4){fragColor=vec4(vec3(metal),1);return;}
             if(dbgView==5){fragColor=vec4(vec3(ao),1);return;}
-            if(dbgView==6){fragColor=vec4(vec3(dielectric),1);return;}
+            if(dbgView==6){fragColor=vec4(dielectricF0,1);return;}
             if(dbgView==7){fragColor=vec4(tonemap(emission),1);return;}
             if(dbgView==8){vec2 q=floor(uv*16.0);float c=mod(q.x+q.y,2.0);fragColor=vec4(mix(vec3(.04,.12,.7),vec3(.95,.95,.95),c),1);return;}
             if(dbgView==10){fragColor=vec4(T*.5+.5,1);return;}
@@ -2555,7 +2580,7 @@ void PbrPreviewGL::initializeGL()
             }
             vec3 H=normalize(V+L);
             float NoL=max(dot(N,L),0.0),NoV=max(dot(N,V),.001),NoH=max(dot(N,H),0.0),VoH=max(dot(V,H),0.0);
-            vec3 f0=mix(vec3(dielectric),base,metal),F=fresnel(VoH,f0);
+            vec3 f0=mix(dielectricF0,base,metal),F=fresnel(VoH,f0);
             float alpha=rough*rough,k=(rough+1.0)*(rough+1.0)/8.0;
             vec2 brdf=texture(uBrdfLut,vec2(NoV,rough)).rg;
             // Kulla-Conty multi-scatter energy compensation: single-scatter GGX
@@ -5136,6 +5161,7 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uBentNormalLayer",int(BentNormalLayer));m_program->setUniformValue("uBentNormalStrength",numberValue(slot(QStringLiteral("BentNormal")).values,QStringLiteral("strength"),1));
     const auto detailNormal=slot(QStringLiteral("DetailNormal"));
     m_program->setUniformValue("uDetailNormalLayer",int(DetailNormalLayer));
+    m_program->setUniformValue("uSpecularColorLayer",int(SpecularColorLayer));
     m_program->setUniformValue("uDetailNormalStrength",numberValue(detailNormal.values,QStringLiteral("strength"),1));
     m_program->setUniformValue("uDetailNormalScale",numberValue(detailNormal.values,QStringLiteral("uvScale"),4));
     m_program->setUniformValue("uDetailRoughVariation",numberValue(detailNormal.values,QStringLiteral("roughVariation"),.5f));

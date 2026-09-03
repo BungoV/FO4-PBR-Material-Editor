@@ -193,6 +193,20 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 toggleField("overridePorosity", "Porosity constant", false, "Checked pins porosity to the constant. Unchecked samples alpha when it carries porosity, otherwise derives saturate(roughness × (1 − metallic)) — the standard engine heuristic, so most materials need no porosity authoring at all."),
                 numberField("porosity", "Porosity override", 0.5, 0.0, 1.0, 0.005, "How much fluid soaks in: 1 darkens like cloth, 0 beads like sealed metal.")
             }));
+        // The dielectric F0 that RMAOS alpha carries is one grey number, so a
+        // painted specular color is the only way to author a tinted dielectric
+        // reflection (a green bottle's own sheen, a tarnish film, colored
+        // lacquer). It TINTS, following OpenPBR's specular_color: it modulates
+        // the Fresnel term and can only darken or hue-shift it, never raise
+        // reflectivity, and the level stays owned by RMAOS alpha. Map-driven on
+        // purpose: with no constants, a material without the map is bit-exact
+        // the scalar path it has always been, in the preview and the runtime
+        // alike.
+        add(slot(prefix + "SpecularColor", secondary ? tr("%1 Specular Color").arg(layerName) : tr("Specular Color"),
+            "SPEC", "sRGB • RGB specular tint / A tint weight", QColor(128, 130, 156), false,
+            QString(),
+            "Tints the dielectric specular reflection. RGB multiplies the F0 that RMAOS alpha carries, so white is no change and a color can only darken or shift the hue — the reflectance level stays with RMAOS. Alpha weighs the tint in: 1 applies the painted color, 0 leaves the surface exactly as it was. Metals are untouched: their F0 is the base color, and their 82-degree edge tint is an angular effect this shading model does not carry. A texture with no alpha channel weighs 1 everywhere, which is what a plain specular color map means.",
+            {}));
     }
 
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || all) {

@@ -2317,11 +2317,12 @@ void registerAll(Registry& registry)
             imagePort("curvature", "Curvature", true),
             imagePort("roughness", "Roughness", true), imagePort("metallic", "Metallic", true),
             imagePort("ao", "Ambient Occlusion", true), imagePort("specular", "Specular F0 / Porosity", true),
-            imagePort("emissive", "Emissive", true), imagePort("subsurface", "Subsurface", true)};
+            imagePort("emissive", "Emissive", true), imagePort("subsurface", "Subsurface", true),
+            imagePort("specularColor", "Specular Tint", true)};
         spec.outputs = {packedPort("baseColor", "BC", kBaseColorChannels),
             packedPort("normal", "N", kNormalChannels),
             packedPort("rmaos", "RMAOS", kRmaosChannels), imagePort("emissive", "Emissive"),
-            imagePort("subsurface", "Subsurface")};
+            imagePort("subsurface", "Subsurface"), imagePort("specularColor", "Specular Tint")};
         // The assembled PBR material: preview it shaded, or one shipped texture
         // at a time. Its packed maps are what the terminal writes out.
         spec.materialPreview = QStringLiteral("output");
@@ -2381,6 +2382,10 @@ void registerAll(Registry& registry)
             output->outputs.insert(QStringLiteral("rmaos"), Value::fromImage(rmaos));
             output->outputs.insert(QStringLiteral("emissive"), Value::fromImage(in("emissive")));
             output->outputs.insert(QStringLiteral("subsurface"), Value::fromImage(in("subsurface")));
+            // The specular tint is its own shipped texture, not a packed
+            // channel: it passes through so a graph has one route to the
+            // terminal for every map, packed or not.
+            output->outputs.insert(QStringLiteral("specularColor"), Value::fromImage(in("specularColor")));
 
             QStringList packed;
             packed << QStringLiteral("BC");
@@ -2408,7 +2413,8 @@ void registerAll(Registry& registry)
         spec.inputs = {packedPort("baseColor", "BC", kBaseColorChannels),
             packedPort("normal", "N", kNormalChannels, true),
             packedPort("rmaos", "RMAOS", kRmaosChannels, true),
-            imagePort("emissive", "Emissive", true), imagePort("subsurface", "Subsurface", true)};
+            imagePort("emissive", "Emissive", true), imagePort("subsurface", "Subsurface", true),
+            imagePort("specularColor", "Specular Tint", true)};
         // No outputs: this is where a material stops. Nothing downstream can
         // consume it, so ports here would only invite wiring past the end of
         // the graph. Previewing it reads the textures that ARRIVE — the same
@@ -2442,6 +2448,7 @@ void registerAll(Registry& registry)
             if (!rmaos.isNull()) written << QStringLiteral("RMAOS");
             if (!emissive.isNull()) written << QStringLiteral("E");
             if (!subsurface.isNull()) written << QStringLiteral("SSS");
+            if (!in("specularColor").isNull()) written << QStringLiteral("SC");
             output->status = QStringLiteral("%1×%2 · %3")
                 .arg(base.width()).arg(base.height()).arg(written.join(QStringLiteral(" ")));
         };
@@ -2665,6 +2672,7 @@ Converter::SuppliedImages runGraph(const Graph& graph, const QString& materialPa
             supplied.rmaos = arriving("rmaos");
             supplied.emissive = arriving("emissive");
             supplied.subsurface = arriving("subsurface");
+            supplied.specularColor = arriving("specularColor");
             continue;
         }
         if (node.typeId != QStringLiteral("output.texture")) continue;
@@ -3042,6 +3050,20 @@ Graph defaultFo76Graph()
     // base colour and the metallic mask instead. Leaving the packer's slot
     // unwired holds F0 at the 0.04 constant. Wire something into Combine Maps
     // (PBR) -> Specular F0 for the rare material that needs otherwise.
+    // The HUE of _r, which the F0 above cannot carry whatever it is set to: a
+    // scalar has no colour. Dividing the linear reflectance by its own
+    // luminance leaves the colour alone at unit brightness, so this tints the
+    // dielectric reflection without touching its level. Encoded back to sRGB
+    // because that is how the runtime samples the map.
+    const QString reflHueLuma = builder.add("image.luminance", 700, 140,
+        {{QStringLiteral("linearize"), false}});
+    const QString reflHue = builder.add("math.op", 920, 140, {{QStringLiteral("operation"), 3}});
+    const QString specularTint = builder.add("color.linearToSrgb", 1140, 140);
+    builder.link(reflectanceLinear, "image", reflHueLuma, "image");
+    builder.link(reflectanceLinear, "image", reflHue, "a");
+    builder.link(reflHueLuma, "image", reflHue, "b");
+    builder.link(reflHue, "image", specularTint, "image");
+
     const QString baseMix = builder.add("image.mix", 1140, 100);
     const QString baseColor = builder.add("color.linearToSrgb", 1360, 100);
     builder.link(diffuseLinear, "image", baseMix, "a");
@@ -3070,6 +3092,7 @@ Graph defaultFo76Graph()
     builder.link(unpack, "ao", channels, "ao"); // FO76 ships baked AO in _l.G
     builder.link(emissive, "image", channels, "emissive");
     builder.link(unpack, "subsurface", channels, "subsurface");
+    builder.link(specularTint, "image", channels, "specularColor");
 
     const QString pbr = builder.add("output.pbrMaterial", 1580, 200);
     builder.link(channels, "baseColor", pbr, "baseColor");
@@ -3077,6 +3100,7 @@ Graph defaultFo76Graph()
     builder.link(channels, "rmaos", pbr, "rmaos");
     builder.link(channels, "emissive", pbr, "emissive");
     builder.link(channels, "subsurface", pbr, "subsurface");
+    builder.link(channels, "specularColor", pbr, "specularColor");
 
     NodeGraph::layoutGraph(builder.graph, defaultRegistry());
     // Wrap the inference in a container, sized after layout so it actually

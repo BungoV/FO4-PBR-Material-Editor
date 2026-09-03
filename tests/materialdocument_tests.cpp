@@ -319,6 +319,62 @@ int main(int argc, char* argv[])
     }
 
     {
+        // SPECULAR COLOR. RMAOS alpha carries one grey dielectric F0, so a
+        // painted color is the only way to author a tinted dielectric
+        // reflection. It is map-driven with NO constants on purpose: the
+        // runtime needs one texture binding and no constant-buffer space, and
+        // a material that paints nothing is bit-exact the scalar path.
+        MainWindow specularWindow;
+        const TextureSlotWidget* specularSlot = nullptr;
+        for (const TextureSlotWidget* candidate : specularWindow.findChildren<TextureSlotWidget*>())
+            if (candidate->key() == QStringLiteral("primarySpecularColor")) { specularSlot = candidate; break; }
+        check(specularSlot != nullptr,
+            QStringLiteral("the primary layer offers a specular color map"));
+        check(specularSlot && specularSlot->state().values.isEmpty(),
+            QStringLiteral("the specular color map has no constants: it is authored or it is absent"));
+
+        QTemporaryDir specularDirectory;
+        const QString specularTexture = QStringLiteral("plate_specular_color.png");
+        QImage specularImage(2, 2, QImage::Format_RGBA8888);
+        specularImage.fill(QColor(64, 96, 40, 255));
+        check(specularImage.save(specularDirectory.filePath(specularTexture)),
+            QStringLiteral("specular color fixture can be created"));
+
+        Pbr::MaterialDocument plainMaterial;
+        check(!plainMaterial.toJson().value(QStringLiteral("resources")).toObject()
+                .value(QStringLiteral("UV0")).toObject()
+                .contains(QStringLiteral("primarySpecularColor")),
+            QStringLiteral("a material that never paints a specular color carries no such socket"));
+
+        Pbr::TextureSlotState paintedSpecular;
+        paintedSpecular.enabled = true;
+        paintedSpecular.path = specularTexture;
+        Pbr::MaterialDocument authoredSpecular;
+        authoredSpecular.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor"), paintedSpecular);
+        QString specularError;
+        const QString specularFile = specularDirectory.filePath(QStringLiteral("speccolor.pbrm"));
+        check(authoredSpecular.save(specularFile, &specularError),
+            QStringLiteral("a specular color material saves: %1").arg(specularError));
+        Pbr::MaterialDocument reloadedSpecular;
+        check(reloadedSpecular.load(specularFile, &specularError)
+                && reloadedSpecular.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor")).enabled
+                && reloadedSpecular.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor")).path == specularTexture,
+            QStringLiteral("the specular color socket round-trips through the envelope"));
+
+        // The preview's F0 lerp reads this map as a special layer, so the layer
+        // being bound is the wiring the shading term depends on. Both
+        // directions are asserted: a preview that never binds fails the second
+        // check, one that always binds fails the first.
+        PbrPreviewGL specularPreview;
+        specularPreview.setMaterial(plainMaterial, specularDirectory.path());
+        check(!specularPreview.specularColorLayerBound(),
+            QStringLiteral("without the map the preview keeps the scalar F0 path"));
+        specularPreview.setMaterial(authoredSpecular, specularDirectory.path());
+        check(specularPreview.specularColorLayerBound(),
+            QStringLiteral("with the map the preview resolves it into the F0 term"));
+    }
+
+    {
         PbrPreviewGL preview;
         preview.setLighting(8.0f,Qt::white,30.0f,25.0f,1.0f,0.0f,0.0f);
         check(qAbs(preview.effectiveKeyIntensity()-8.0f)<.001f,
@@ -1455,6 +1511,15 @@ int main(int argc, char* argv[])
             QStringLiteral("FO4 metallic channel splits the halves"));
         check(metalRmaos.redF() < plasticRmaos.redF(),
             QStringLiteral("FO4 glossy metal converts smoother than dull plastic"));
+        // FO4's _s is BC5 — R specular strength, G gloss — so there is no color
+        // in it to take. The color an FO4 material does author is
+        // cSpecularColor, and the default white one must add nothing.
+        check(fo4Out.specularColor.isNull(),
+            QStringLiteral("a white FO4 specular constant leaves the material exactly as it was"));
+        Bgsm::Material tintedFo4 = fo4Material;
+        tintedFo4.specularColor = QVector3D(0.945f, 0.220f, 0.012f); // vanilla BloodBugFur
+        check(!Converter::convertFo4(fo4Sources, tintedFo4, options).specularColor.isNull(),
+            QStringLiteral("an authored FO4 specular color becomes the material's specular tint"));
 
         // The mask is what removes metal the stencil got wrong — the brick-wall
         // case. Painting black over the metal half collapses it.
@@ -1539,6 +1604,34 @@ int main(int argc, char* argv[])
         check(goldRmaos.greenF() > 0.95 && std::abs(goldRmaos.blueF() - 200.0 / 255.0) < 0.02
             && std::abs(goldRmaos.redF() - (1.0 - 160.0 / 255.0)) < 0.02,
             QStringLiteral("FO76 RMAOS carries metallic, the shipped AO, and inverted smoothness"));
+
+        // SPECULAR TINT. The F0 above is a luminance, and a scalar cannot hold
+        // the hue of an RGB reflectance map. The tint keeps that hue at unit
+        // brightness so the level stays with RMAOS.A.
+        check(!fo76Out.specularColor.isNull(),
+            QStringLiteral("a colored FO76 reflectance map yields a specular tint"));
+        if (!fo76Out.specularColor.isNull()) {
+            const QColor tint = fo76Out.specularColor.pixelColor(2, 2);
+            check(tint.red() > tint.green() && tint.green() > tint.blue() && tint.alpha() == 255,
+                QStringLiteral("the tint keeps the reflectance hue, warm for gold, at full weight"));
+            // The LEVEL must not move: RMAOS.A is what it was before the tint
+            // existed, so the tint can only redistribute, never brighten.
+            Converter::Fo76Sources greySources = fo76Sources;
+            QImage greyReflectance(4, 4, QImage::Format_RGBA8888);
+            greyReflectance.fill(QColor(160, 160, 160));
+            greySources.reflectance = greyReflectance;
+            const Converter::ConvertedImages greyOut =
+                Converter::convertFo76(greySources, fo76Material, options);
+            check(greyOut.specularColor.isNull(),
+                QStringLiteral("an achromatic reflectance map earns no tint texture"));
+        }
+        // The two identity paths, on the constant form: white is no tint at all.
+        check(Converter::constantSpecularTint(QVector3D(1, 1, 1)).isNull(),
+            QStringLiteral("a white specular constant produces no tint texture"));
+        const QImage blueTint = Converter::constantSpecularTint(QVector3D(0.506f, 0.659f, 1.0f));
+        check(!blueTint.isNull() && QColor(blueTint.pixel(0, 0)).blue() == 255
+                && QColor(blueTint.pixel(0, 0)).red() < 140 && qAlpha(blueTint.pixel(0, 0)) == 255,
+            QStringLiteral("a colored specular constant becomes a flat full-weight tint"));
 
         // Encoding: FO76 authors _r as BC1_UNORM_SRGB, so a dielectric sitting at
         // linear F0 0.04 arrives as byte 56 (sRGB 0.22). Measured without

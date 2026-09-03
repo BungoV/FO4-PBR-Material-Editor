@@ -211,6 +211,27 @@ and these Primary UV socket keys:
 | `primaryNormal` | linear RG tangent normal, optional B height, A signed curvature | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `curvatureInAlpha=false`, `cavitySpecOcclusion=1.0` |
 | `primaryRmaos` | linear R roughness, G metallic, B AO, A dielectric F0 or porosity | `override*` channel fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, F0 `0.04`; `alphaCarries="Dielectric F0"`, `overridePorosity=false`, porosity `0.5` |
 | `primaryEmissive` | sRGB RGB radiance, A intensity mask | color `#FFFFFF`, intensity `0.0` |
+| `primarySpecularColor` | linear RGB dielectric F0 color, A color weight | no constants and no `override*` fields; an absent, disabled, or unresolvable slot means weight `0` |
+
+`primarySpecularColor` is additive extension data: it changes no existing
+socket's meaning, so it does not move `schemaVersion`. A document written
+before this row parses unchanged, and a consumer that ignores the socket
+renders exactly what it rendered before.
+
+The socket resolves the dielectric F0 that RMAOS alpha carries as one grey
+number into a color:
+
+    dielectricF0 = lerp(scalarF0.rgb, specularColor.rgb, specularColor.a)
+
+with `scalarF0` the existing RMAOS-alpha-or-constant value and the result
+subject to the same per-channel clamp the consumer already applies to the
+scalar. Weight `0` is therefore the pre-existing scalar path bit for bit, and
+weight `1` makes the painted color the dielectric F0 outright. Metals are
+untouched: their F0 is the base color, mixed in by metallic, exactly as
+before. The socket deliberately has no constants — a material either paints
+this or does not have it — so a consumer needs one texture binding and no new
+constant-buffer space. A texture with no alpha channel decodes A as `1.0`,
+which is the intended reading of a plain specular color map.
 
 A texture is sampled only when its slot has `enabled=true`, a non-empty valid
 runtime path, and the corresponding positive `override*` flag is false.
@@ -238,6 +259,15 @@ assignments are:
 | 8 | `EmissiveTexture` | enabled, valid `primaryEmissive` path |
 | 9 | `NormalCurvature` | bit 1 and `curvatureInAlpha=true` |
 | 10 | `RmaosPorosity` | bit 3 and `alphaCarries="Porosity"` |
+
+Bits 11-24 were taken by later runtime slices for per-channel base/normal/
+emissive sampling, composition, and the subsurface bindings; the runtime
+header `src/Materials/PBRM.h` is authoritative for those. The next assignment
+is:
+
+| Bit | Name | Condition |
+| ---: | --- | --- |
+| 25 | `SpecularColorTexture` | enabled, valid `primarySpecularColor` path |
 
 These are parser/cache feature bits, not the older BGSM CB2 sentinel. Secondary
 UV, specialized shaders, and other sockets remain parseable authoring data but

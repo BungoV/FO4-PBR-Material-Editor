@@ -163,9 +163,28 @@ struct ConvertedImages {
     QImage rmaos;          // linear: R rough, G metal, B AO (1.0 until derivations), A dielectric F0
     QImage emissive;       // sRGB tinted emission + A mask; null when the material does not emit
     QImage subsurface;     // FO76 _l.B scatter mask; null unless the material scatters
+    // Specular TINT (sRGB RGB, A = weight): multiplies the dielectric F0 that
+    // RMAOS.A carries, never raises it. FO76 fills it with the HUE of _r, which
+    // the F0 luminance throws away; FO4 fills it from the material's
+    // cSpecularColor constant, because an FO4 _s map is BC5 (R spec strength,
+    // G gloss) and carries no color at all. Null wherever the tint is white,
+    // which is most materials — a white tint is the identity and would only
+    // cost a texture.
+    QImage specularColor;
     QImage metallic;       // grayscale metallic confidence (diagnostics / masking UI)
     float metalCoverage = 0; // fraction of texels with metallic > 0.5 (report)
 };
+
+// The specular tint an FO4/FO76 material's own constant asks for, as a small
+// flat sRGB image with weight 1 — or a null image when the constant is white
+// (the identity). Vanilla FO4's deferred path drops cSpecularColor entirely,
+// so this is authored intent being recovered, not vanilla being reproduced.
+QImage constantSpecularTint(const QVector3D& specularColor);
+
+// The hue of an FO76 reflectance map, normalized so its luminance stays with
+// RMAOS.A: tint = saturate(reflectanceLinear / luminance). Null when the map
+// is achromatic, in which case the F0 scalar already carries everything it had.
+QImage reflectanceSpecularTint(const QImage& reflectance);
 
 ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& material, const Options& options);
 ConvertedImages convertFo76(const Fo76Sources& sources, const Bgsm::Material& material, const Options& options);

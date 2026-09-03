@@ -26,6 +26,7 @@ struct SuppliedImages {
     QImage emissive;
     QImage normal;          // already packed (curvature in A, optional height in B)
     QImage subsurface;      // FO76 scatter mask; null unless the material scatters
+    QImage specularColor;   // sRGB specular tint + weight; null while the tint is white
     float metalCoverage = 0;
     QString signature;      // graph identity; joins the incremental options signature
     QStringList notes;

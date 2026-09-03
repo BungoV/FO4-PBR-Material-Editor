@@ -279,6 +279,33 @@ runtime integration.
 
 ## Changelog
 
+### 2026-09-03 — A specular color map
+
+- **Specular Color slot** - a new texture input, `primarySpecularColor`: RGB is
+  a specular tint and alpha is how much of it applies. RMAOS alpha carries the
+  dielectric F0 as a single grey number, so until now a material had no way to
+  say that its own specular reflection is colored — a green bottle, a tarnish
+  film, colored lacquer. Following OpenPBR's `specular_color`, the map **tints**:
+  it multiplies the reflectance level RMAOS still owns, so it can darken or
+  shift the hue and can never raise reflectivity. White RGB and zero weight are
+  both the exact identity, and a material without the map renders exactly as it
+  did before. Metals are untouched — their F0 is the base color, and a metal's
+  82-degree edge tint is an angular effect this shading model does not carry.
+  The slot has no constants by design: the map is the whole input, which is what
+  lets the preview and the runtime agree by construction. The "Specular F0"
+  render mode now shows the resolved color, and the preview clamps the
+  dielectric level to 0.16 the way the runtime always has.
+- **Converter** - Fallout 76 materials get the hue of their `_r` reflectance
+  map, which the F0 luminance used to throw away (the level still goes to RMAOS
+  alpha, so only the color is new), and only where the map is genuinely colored.
+  Fallout 4 materials get their own `cSpecularColor` constant, which the game's
+  deferred renderer discards and which 15% of vanilla materials actually author
+  — a Fallout 4 `_s` map is BC5, specular strength and gloss, with no color in
+  it to take. Both write `<name>_SC.dds` beside the other converted textures.
+- **Format** - `docs/PBRM-v5.md` gained the socket as an additive row. No schema
+  version change: a document written before this parses unchanged, and a
+  consumer that ignores the socket renders what it always rendered.
+
 ### 2026-09-03 — The Material Converter is experimental and opt-in
 
 - **Converter gated behind an option** - Settings > Preview Cubemaps… (the
