@@ -38,7 +38,9 @@ public:
     void restoreLastSession();
     // Opens straight into the converter. Used by --converter so UI changes
     // there can be captured without driving the workspace combo by hand.
-    void showConverter() { setWorkspaceMode(true); }
+    // Force-enables the experimental gate for this session only, so the
+    // verification harnesses keep working without touching the user's option.
+    void showConverter();
     void scanConverterSources();
     // One trained model per map role, chosen once instead of guessed per node.
     void showUpscaleModelsDialog();
@@ -62,6 +64,9 @@ private:
 
     void buildWindow();
     void buildMenus();
+    // The converter is experimental and opt-in. When it is off the mode
+    // dropdown must not merely disable it — it must not offer it at all.
+    void setConverterAvailable(bool available);
     void setWorkspaceMode(bool convert);
     void rebuildWorkspace(const QString& preferredPage = QStringLiteral("Primary UV Textures"));
     void rebuildNavigation();
@@ -142,6 +147,8 @@ private:
     QStackedWidget* m_workspaceStack = nullptr;
     ConvertWorkspace* m_convertWorkspace = nullptr;
     QComboBox* m_workspaceModeCombo = nullptr;
+    QWidget* m_workspaceModeSeparator = nullptr;
+    bool m_converterAvailable = false;
     QMap<QString, QWidget*> m_pageByName;
     QMap<QString, QPair<QString, QString>> m_searchTargets;
     QString m_currentPage;

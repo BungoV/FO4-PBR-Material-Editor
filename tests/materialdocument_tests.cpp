@@ -255,6 +255,15 @@ int main(int argc, char* argv[])
             previewSettings->setChecked(true);
             converterSettings->setChecked(false);
         }
+        // The Material Converter is experimental and opt-in. With the option
+        // off it must be ABSENT from the switcher rather than disabled, and a
+        // switcher left with one destination hides itself.
+        auto* modeCombo = window.findChild<QComboBox*>(QStringLiteral("WorkspaceModeCombo"));
+        check(modeCombo && modeCombo->count() == 1
+                && modeCombo->itemText(0) == QStringLiteral("Material Editor"),
+            QStringLiteral("the experimental converter is absent from the mode switcher by default"));
+        check(modeCombo && modeCombo->isHidden(),
+            QStringLiteral("a mode switcher with one destination hides itself"));
         auto* previewTabs = window.findChild<QTabWidget*>(QStringLiteral("PreviewSettingsTabs"));
         check(previewTabs && previewTabs->count() == 4
                 && previewTabs->tabText(0) == QStringLiteral("Scene")
@@ -284,6 +293,29 @@ int main(int argc, char* argv[])
         check(renderModes.contains(QStringLiteral("Opacity"))&&renderModes.contains(QStringLiteral("Height"))
                 && renderModes.contains(QStringLiteral("Emissive Mask"))&&renderModes.contains(QStringLiteral("Layer Coverage")),
             QStringLiteral("render-mode inspector exposes the remaining resolved material channels"));
+    }
+
+    {
+        // Turning the experimental option ON puts the converter in the
+        // switcher; the --converter harness flag reaches it either way but
+        // must never write the stored option on the user's behalf.
+        QSettings().setValue(QStringLiteral("Interface/experimentalConverter"), true);
+        MainWindow optedIn;
+        auto* optedInCombo = optedIn.findChild<QComboBox*>(QStringLiteral("WorkspaceModeCombo"));
+        check(optedInCombo && optedInCombo->count() == 2
+                && optedInCombo->itemText(1) == QStringLiteral("Material Converter")
+                && !optedInCombo->isHidden(),
+            QStringLiteral("the experimental option puts the converter back in the mode switcher"));
+        QSettings().remove(QStringLiteral("Interface/experimentalConverter"));
+
+        MainWindow gatedOff;
+        auto* gatedCombo = gatedOff.findChild<QComboBox*>(QStringLiteral("WorkspaceModeCombo"));
+        gatedOff.showConverter();
+        check(gatedCombo && gatedCombo->count() == 2 && gatedCombo->currentIndex() == 1
+                && !gatedCombo->isHidden(),
+            QStringLiteral("--converter still opens the converter while the option is off"));
+        check(!QSettings().contains(QStringLiteral("Interface/experimentalConverter")),
+            QStringLiteral("opening the converter by flag never writes the experimental option"));
     }
 
     {

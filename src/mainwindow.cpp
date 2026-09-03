@@ -180,11 +180,12 @@ void MainWindow::buildWindow()
     top->setContentsMargins(9, 5, 9, 5);
     // Workspace switcher: the Material Editor edits one .pbrm; the Material
     // Converter runs the FO4/FO76 batch pipeline (docs/FO4-Conversion.md).
+    // The converter row is added by setConverterAvailable() only while the
+    // experimental option is on, so a gated-off converter has no entry here.
     m_workspaceModeCombo = new QComboBox(topBar);
+    m_workspaceModeCombo->setObjectName(QStringLiteral("WorkspaceModeCombo"));
     m_workspaceModeCombo->addItem(tr("Material Editor"));
-    m_workspaceModeCombo->addItem(tr("Material Converter"));
     m_workspaceModeCombo->setItemData(0, tr("Edit the open .pbrm material."), Qt::ToolTipRole);
-    m_workspaceModeCombo->setItemData(1, tr("Batch-convert FO4/FO76 .bgsm/.bgem materials and textures to PBR siblings."), Qt::ToolTipRole);
     m_workspaceModeCombo->setToolTip(tr("Switch between authoring a material and the batch converter."));
     connect(m_workspaceModeCombo, &QComboBox::currentIndexChanged, this, [this](int index) {
         setWorkspaceMode(index == 1);
@@ -194,6 +195,7 @@ void MainWindow::buildWindow()
     modeSeparator->setFrameShape(QFrame::VLine);
     modeSeparator->setFrameShadow(QFrame::Sunken);
     top->addWidget(modeSeparator);
+    m_workspaceModeSeparator = modeSeparator;
     top->addWidget(new QLabel(tr("Shader"), topBar));
     m_shaderCombo = new QComboBox(topBar);
     m_shaderCombo->addItems(Pbr::shaderModeNames());
@@ -277,10 +279,42 @@ void MainWindow::buildWindow()
             if (it.key().contains(query, Qt::CaseInsensitive)) { openSearchResult(it.key()); return; }
         }
     });
+
+    // Read last so the stack the fallback switches to already exists.
+    setConverterAvailable(QSettings().value(QStringLiteral("Interface/experimentalConverter"), false).toBool());
+}
+
+void MainWindow::setConverterAvailable(bool available)
+{
+    m_converterAvailable = available;
+    const bool listed = m_workspaceModeCombo->count() > 1;
+    if (available && !listed) {
+        const QSignalBlocker blocker(m_workspaceModeCombo);
+        m_workspaceModeCombo->addItem(tr("Material Converter"));
+        m_workspaceModeCombo->setItemData(1, tr("Batch-convert FO4/FO76 .bgsm/.bgem materials and textures to PBR siblings."), Qt::ToolTipRole);
+    } else if (!available && listed) {
+        // Leave the converter BEFORE the row disappears: removing the current
+        // item would otherwise leave the stack and the window title behind on
+        // a workspace the switcher can no longer name.
+        if (m_workspaceModeCombo->currentIndex() == 1) setWorkspaceMode(false);
+        const QSignalBlocker blocker(m_workspaceModeCombo);
+        m_workspaceModeCombo->removeItem(1);
+    }
+    // A switcher with one destination is dead UI, so the whole control goes
+    // away with it and the converter has no visible entry point at all.
+    m_workspaceModeCombo->setVisible(available);
+    if (m_workspaceModeSeparator) m_workspaceModeSeparator->setVisible(available);
+}
+
+void MainWindow::showConverter()
+{
+    setConverterAvailable(true);
+    setWorkspaceMode(true);
 }
 
 void MainWindow::setWorkspaceMode(bool convert)
 {
+    if (convert && !m_converterAvailable) convert = false;
     if (m_workspaceModeCombo->currentIndex() != (convert ? 1 : 0)) {
         const QSignalBlocker blocker(m_workspaceModeCombo);
         m_workspaceModeCombo->setCurrentIndex(convert ? 1 : 0);
@@ -606,6 +640,13 @@ void MainWindow::showEditorSettings()
     jsonSidecar->setChecked(appSettings.value(QStringLiteral("Interface/jsonSidecar"), false).toBool());
     jsonSidecar->setToolTip(tr("Writes a readable JSON mirror next to the material so version-control diffs are reviewable. The .pbrm stays authoritative; the sidecar is never read back."));
     form->addRow(tr("Version control"), jsonSidecar);
+    // Opt-in gate for the FO4/FO76 batch converter. Off by default: the
+    // workspace is unfinished, so it stays out of the interface entirely
+    // until someone asks for it here.
+    auto* experimentalConverter = new QCheckBox(tr("Experimental: Material Converter"), &dialog);
+    experimentalConverter->setChecked(appSettings.value(QStringLiteral("Interface/experimentalConverter"), false).toBool());
+    experimentalConverter->setToolTip(tr("EXPERIMENTAL and unfinished. Adds the Material Converter — the FO4/FO76 .bgsm/.bgem batch pipeline and its node graph — to the workspace dropdown. While this is off the converter is not offered anywhere in the interface, and turning it off returns the window to the Material Editor."));
+    form->addRow(tr("Experimental"), experimentalConverter);
     outer->addLayout(form);
 
     auto* customLabel = new QLabel(tr("Custom preview cubemaps"), &dialog);
@@ -657,6 +698,8 @@ void MainWindow::showEditorSettings()
     appSettings.setValue(QStringLiteral("Interface/autosaveEnabled"), autosaveEnabled->isChecked());
     appSettings.setValue(QStringLiteral("Interface/autosaveMinutes"), autosaveMinutes->value());
     appSettings.setValue(QStringLiteral("Interface/jsonSidecar"), jsonSidecar->isChecked());
+    appSettings.setValue(QStringLiteral("Interface/experimentalConverter"), experimentalConverter->isChecked());
+    setConverterAvailable(experimentalConverter->isChecked());
     applyAutosaveSettings();
     m_preview->reloadPreviewCubemaps();
 }

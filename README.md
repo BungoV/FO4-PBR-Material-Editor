@@ -277,6 +277,22 @@ Normal alpha — and v4 files load through an in-memory migration. The
 prototype-format license continues: breaking changes remain possible before
 runtime integration.
 
+## Changelog
+
+### 2026-09-03 — The Material Converter is experimental and opt-in
+
+- **Converter gated behind an option** - Settings > Preview Cubemaps… (the
+  Editor Settings dialog) gained an **Experimental: Material Converter**
+  checkbox, off by default and stored as `Interface/experimentalConverter`.
+  While it is off the converter is not merely disabled: the "Material
+  Converter" row is never added to the workspace dropdown, and the switcher
+  itself is hidden, because a one-destination dropdown is dead UI. Turning the
+  option off while the converter is open returns the window to the Material
+  Editor first, so the workspace stack and the window title never point at a
+  mode the switcher can no longer name. The `--converter` / `--converter-scan`
+  verification flags still open it, enabling the gate for that session only and
+  never writing the stored setting.
+
 ## License
 
 Copyright (C) 2026 Bungo (BungoV)
