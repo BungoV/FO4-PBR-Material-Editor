@@ -3913,6 +3913,121 @@ int main(int argc, char* argv[])
             QStringLiteral("%1 node types expose an image output to copy from").arg(withImageOutputs));
     }
 
+    // ---------------------------------------------------------------------
+    // LANE OPENPBR1 (2026-09-03) -- the OpenPBR Surface v1.1.1 alignment's
+    // editor half. bungo's ruling: "Okay, so we match what's in the
+    // whitepaper".
+    //
+    // These are SOURCE PINS on the preview ubershader rather than rendered
+    // comparisons, and that is a deliberate limit: this suite builds no GL
+    // context, so it cannot execute the shader. What it CAN hold is that the
+    // two lines the alignment named are present, in the form the rule
+    // requires, and that the identity case is written as an identity.
+    // ---------------------------------------------------------------------
+    {
+        const auto repoFile = [](const QString& relative) -> QString {
+            QDir dir = QDir::current();
+            for (int up = 0; up < 6; ++up) {
+                const QString candidate = dir.filePath(relative);
+                if (QFileInfo::exists(candidate)) return QDir::cleanPath(candidate);
+                if (!dir.cdUp()) break;
+            }
+            return {};
+        };
+        const auto readRepoFile = [&](const QString& relative) -> QString {
+            const QString path = repoFile(relative);
+            if (path.isEmpty()) return {};
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly)) return {};
+            QString text = QString::fromUtf8(file.readAll());
+            text.remove(QLatin1Char('\r'));
+            return text;
+        };
+
+        const QString preview =
+            readRepoFile(QStringLiteral("src/materialpreviewwidget.cpp"));
+        check(preview.size() > 10000,
+            QStringLiteral("OPENPBR1: the preview source was found and read"));
+
+        // ---- A4: the preview must not lie about the reflectivity LEVEL ----
+        //
+        // res/Lighting/deferred_prepass.hlsl:863 writes
+        //     const float3 f4fxDielectricF0 = min(f4fxF0Scalar, 0.16).xxx;
+        // so a material authored at F0 0.5 RENDERS at 0.16. The preview used
+        // to clamp only to [0,1] and show 0.5 -- three times the truth at the
+        // top of the range. Calibrating anything against that preview inherits
+        // the lie, which is why this is pinned rather than left to the eye.
+        check(preview.contains(QStringLiteral(
+                  "float dielectric=defaults?.04:min(clamp(uUseF0?channelData.a:uF0,0.0,1.0),0.16);")),
+            QStringLiteral("OPENPBR1 A4: the preview applies the runtime's 0.16 conductor guard"));
+        check(preview.contains(QStringLiteral("deferred_prepass.hlsl:863")),
+            QStringLiteral("OPENPBR1 A4: the guard cites the runtime line it mirrors"));
+        // The guard is on the AUTHORED SCALAR, where the runtime has it
+        // (deferred_prepass.hlsl clamps f4fxF0Scalar, not the blended F0), and
+        // therefore ABOVE both the surface-state blend and the metal mix. A
+        // metal's F0 is its base colour and must never meet this clamp, or
+        // every metal in the editor turns to plastic.
+        const int guardAt = preview.indexOf(QStringLiteral("float dielectric=defaults?.04:min("));
+        // The BLEND, not the uniform declaration -- the uniform block sits far
+        // above the guard and a bare name would make this pin pass on nothing.
+        const int stateBlendAt =
+            preview.indexOf(QStringLiteral("dielectric=mix(dielectric,uStateF0Target[i]"));
+        const int metalMixAt = preview.indexOf(QStringLiteral(",base,metal),F=fresnel(VoH,f0);"));
+        check(guardAt >= 0 && stateBlendAt > guardAt,
+            QStringLiteral("OPENPBR1 A4: the guard sits above the surface-state F0 blend"));
+        check(guardAt >= 0 && metalMixAt > guardAt,
+            QStringLiteral("OPENPBR1 A4: the guard sits above the metal mix, so metals keep their F0"));
+        // COEXISTENCE WITH THE SPECULAR-COLOUR LANE. That lane clamps again
+        // where it builds the tinted dielectric F0. min() is idempotent, so the
+        // two guards compose to exactly one bound; this pin records that the
+        // duplication is known and harmless rather than an accident.
+        check(preview.contains(QStringLiteral("min(dielectric,0.16)"))
+                  || preview.contains(QStringLiteral("min(vec3(dielectric),vec3(0.16))")),
+            QStringLiteral("OPENPBR1 A4: the specular-colour lane's own 0.16 guard is present and idempotent with this one"));
+
+        // ---- A5: emission is BELOW the coat ----
+        //
+        // OpenPBR spec line 1136 puts the emission slab under the coat and
+        // lines 1357-1358 give L_e = lerp(1, T_coat, C) * E. The preview's coat
+        // multiply ran before the emission add, so coat_color never tinted the
+        // glow: a red lacquer over a white lamp previewed with a white glow.
+        check(preview.contains(QStringLiteral("vec3 coatEmissionTransmittance=vec3(1.0);")),
+            QStringLiteral("OPENPBR1 A5: the coat transmittance is accumulated for emission"));
+        check(preview.contains(QStringLiteral("coatEmissionTransmittance*=coatTransmittance;")),
+            QStringLiteral("OPENPBR1 A5: every coat layer contributes its transmittance"));
+        check(preview.contains(QStringLiteral("color+=emission*coatEmissionTransmittance;")),
+            QStringLiteral("OPENPBR1 A5: the emission add is tinted by the coat"));
+        check(!preview.contains(QStringLiteral("\n            color+=emission;")),
+            QStringLiteral("OPENPBR1 A5: the untinted emission add is gone"));
+        // THE IDENTITY. The accumulator is declared OUTSIDE the coat loop and
+        // initialised to vec3(1.0), and the loop `continue`s on a material with
+        // no coat layer -- so a material without a coat multiplies emission by
+        // exactly 1.0 and is bit-identical to the previous build.
+        check(preview.indexOf(QStringLiteral("vec3 coatEmissionTransmittance=vec3(1.0);")) <
+                  preview.indexOf(QStringLiteral("if(defaults||!hasSpecial(uCoatSpecialLayer[ci]))continue;")),
+            QStringLiteral("OPENPBR1 A5: the accumulator is declared above the coat loop (identity when no coat)"));
+
+        // ---- A6: the thin-film unit, and the mapping table ----
+        const QString formatDoc = readRepoFile(QStringLiteral("docs/PBRM-v5.md"));
+        check(formatDoc.size() > 5000,
+            QStringLiteral("OPENPBR1: the PBRM v5 format doc was found and read"));
+        check(formatDoc.contains(QStringLiteral("thin-film thickness\nin MICROMETRES"))
+                  || formatDoc.contains(QStringLiteral("MICROMETRES")),
+            QStringLiteral("OPENPBR1 A6: thin-film thickness is documented as micrometres"));
+        check(formatDoc.contains(QStringLiteral("## OpenPBR Surface v1.1.1 mapping")),
+            QStringLiteral("OPENPBR1 A6: the doc carries an OpenPBR mapping section"));
+        // The table must cover the slots the alignment mapped, with a verdict
+        // apiece. Spot-checked on the rows a mistaken importer would trip on.
+        for (const char* row : { "base_metalness", "specular_ior", "specular_color",
+                 "subsurface_radius", "fuzz_weight", "coat_color",
+                 "thin_film_thickness", "emission_luminance", "geometry_opacity" }) {
+            check(formatDoc.contains(QString::fromLatin1(row)),
+                QStringLiteral("OPENPBR1 A6: the mapping table carries %1").arg(QString::fromLatin1(row)));
+        }
+        check(formatDoc.contains(QStringLiteral("`F0 = ((1−η)/(1+η))²`")),
+            QStringLiteral("OPENPBR1 A6: the IOR->F0 conversion an importer needs is written down"));
+    }
+
     QTextStream(stdout) << "Failures: " << failures << Qt::endl;
     return failures == 0 ? 0 : 1;
 }

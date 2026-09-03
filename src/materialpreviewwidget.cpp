@@ -2300,7 +2300,21 @@ void PbrPreviewGL::initializeGL()
             float rough=defaults?.5:clamp(uUseRoughness?channelData.r:uRoughness,.035,1.0);
             float metal=defaults?0:clamp(uUseMetallic?channelData.g:uMetallic,0.0,1.0);
             float ao=defaults?1:clamp(uUseAo?channelData.b:uAo,0.0,1.0);
-            float dielectric=defaults?.04:clamp(uUseF0?channelData.a:uF0,0.0,1.0);
+            // THE CONDUCTOR GUARD, matching the runtime (lane OPENPBR1, item
+            // A4, 2026-09-03). res/Lighting/deferred_prepass.hlsl:863 writes
+            //     const float3 f4fxDielectricF0 = min(f4fxF0Scalar, 0.16).xxx;
+            // so a material authored at F0 0.5 RENDERS at 0.16. Until now this
+            // preview clamped only to [0,1] and showed 0.5, i.e. it lied to the
+            // author about how reflective the surface actually is -- by a
+            // factor of three at the top of the range. 0.16 is the ceiling for
+            // a DIELECTRIC (an IOR around 3, past every ordinary insulator);
+            // above it a surface is a conductor and belongs on the metal side
+            // of the mix, which is why the guard is on the authored scalar and
+            // not on the blended F0. OpenPBR's own level is specular_ior with
+            // the default 1.5 -> F0 0.04 (spec [unmodulated_fresnel]); ours is
+            // an authored F0 standing in for that IOR, so the guard is where
+            // the two parametrizations are reconciled.
+            float dielectric=defaults?.04:min(clamp(uUseF0?channelData.a:uF0,0.0,1.0),0.16);
             if(uDecalEnabled&&!defaults){if(!uDecalRoughness)rough=.5;if(!uDecalMetallic)metal=0.0;if(!uDecalAo)ao=1.0;}
             if(uShaderMode==7&&hasSpecial(15)&&!defaults)rough=clamp(rough+(landscapeMacro.a-.5)*2.0*uLandscapeMacroRoughnessStrength,.035,1.0);
             if(uSecondaryLayerActive&&layerCoverage>0.0&&!defaults){
@@ -2716,6 +2730,24 @@ void PbrPreviewGL::initializeGL()
                 color+=scatterTint*(uHairScatter*directionData.a+.5*uHairBacklight*scatterData.a*max(dot(-N,L),0.0))*base;
             }
 
+            // EMISSION BELOW THE COAT (lane OPENPBR1, item A5, 2026-09-03).
+            // OpenPBR Surface v1.1.1 puts the emission slab UNDER the coat
+            // (spec line 1136) and gives the emitted radiance as
+            //     L_e = lerp(1, T_coat, C) * E
+            // (spec lines 1357-1358), so a tinted coat colours the glow that
+            // comes through it. Until now the coat multiply ran here and the
+            // emission add ran at the end of main(), i.e. ABOVE the coat, so
+            // coat_color never touched emission at all -- a red lacquer over a
+            // white lamp previewed with a white glow.
+            // The transmittance is ACCUMULATED rather than the emission add
+            // being moved up, and that is deliberate: between the coat loop and
+            // the emission add sit the cornea, transmission, distortion and
+            // decal-blend stages, and moving the add above them would put
+            // emission through four unrelated operators -- a far larger change
+            // than the rule asks for, on materials that have no coat at all.
+            // With no coat layer the loop body never runs, this stays exactly
+            // vec3(1.0), and `emission * 1.0` is bit-identical to today.
+            vec3 coatEmissionTransmittance=vec3(1.0);
             for(int ci=0;ci<3;++ci){
                 if(defaults||!hasSpecial(uCoatSpecialLayer[ci]))continue;
                 vec2 coatUv=ci==0?uv0:(ci==1?uv1:uv2);
@@ -2726,7 +2758,9 @@ void PbrPreviewGL::initializeGL()
                 vec3 coatDirect=D_GGX(coatNoH,coatAlpha)*G1(coatNoL,coatK)*G1(coatNoV,coatK)*coatF/max(4.0*coatNoL*coatNoV,.001)*coatNoL*uKeyColor*uKeyIntensity;
                 vec3 coatR=environmentDirection(reflect(-V,coatN));vec3 coatEnv=textureLod(uPrefilteredEnvironment,coatR,coatRough*uPrefilteredEnvironmentMaxLod).rgb;vec2 coatBrdf=texture(uBrdfLut,vec2(coatNoV,coatRough)).rg;
                 vec3 coatTint=pow(max(uCoatTint[ci],vec3(.001)),vec3(2.2));
-                color*=mix(vec3(1.0),coatTint,clamp(uCoatAbsorption[ci]*coatCoverage,0.0,1.0));
+                vec3 coatTransmittance=mix(vec3(1.0),coatTint,clamp(uCoatAbsorption[ci]*coatCoverage,0.0,1.0));
+                color*=coatTransmittance;
+                coatEmissionTransmittance*=coatTransmittance;
                 color=mix(color*(1.0-coatF0*coatCoverage),color+coatDirect*coatCoverage+coatEnv*(coatF0*coatBrdf.x+coatBrdf.y)*coatCoverage*uEnvironmentIntensity,clamp(coatCoverage,0.0,1.0));
             }
 
@@ -2784,7 +2818,11 @@ void PbrPreviewGL::initializeGL()
                 color=mix(color,distorted*uEnvironmentIntensity,clamp(abs(amount),0.0,1.0));
             }
             if(uDecalEnabled&&!defaults){if(uDecalBlend==1)color*=mix(vec3(1.0),base,opacity);else if(uDecalBlend==2)color+=base*opacity;}
-            color+=emission;
+            // OPENPBR ITEM A5: the emission slab is BELOW the coat, so what
+            // reaches the eye is lerp(1, T_coat, C) * E (spec lines 1136 and
+            // 1357-1358). With no coat layer the factor is exactly vec3(1.0)
+            // and this line is bit-identical to the plain add it replaces.
+            color+=emission*coatEmissionTransmittance;
             vec3 mapped=tonemap(color);if(uCompositionMode==3)mapped*=opacity;
             fragColor=vec4(mapped,opacity);
         }

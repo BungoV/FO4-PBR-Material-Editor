@@ -128,7 +128,12 @@ optional B carries micro roughness variation (`overrideRoughVariation` /
 `roughVariation`, centered at 0.5 — BC5 textures simply skip it) and whose
 optional A masks where detail applies; the `InteriorMap` cubemap's alpha is
 a lit-window mask whose areas self-illuminate at the slot's
-`windowEmissive` intensity.
+`windowEmissive` intensity;
+`SurfaceEffects` R is the sheen/fuzz weight, B is the **thin-film thickness
+in MICROMETRES (µm)** and A is the thin-film weight. The unit on B is
+normative and matches OpenPBR Surface v1.1.1's `thin_film_thickness`, whose
+range is `[0, ∞)` µm with a default of `0.5`; it is stated here because an
+unstated unit makes every import mapping a guess.
 
 `UV0/Oscillation`, `UV1/Oscillation`, and `UV2/Oscillation` are additive
 per-layer oscillator groups for non-linear ("breathing") animation: a
@@ -179,6 +184,90 @@ Unknown root keys, collection members, texture slots, and nested values are
 additive extension data. Consumers ignore data they do not understand. The
 editor preserves unknown root members and unknown members inside the four
 collection objects across load/save for every shader family it can edit.
+
+## OpenPBR Surface v1.1.1 mapping
+
+PBRM is being aligned to the [OpenPBR Surface v1.1.1
+specification](https://academysoftwarefoundation.github.io/OpenPBR/). This
+table is the *reference* half of that alignment: it says, for every OpenPBR
+parameter, what PBRM calls it, what unit it is in, and whether the two agree.
+It is a mapping table, **not** a rename plan — the identifier alignment pass is
+scheduled separately, and until it lands the PBRM names in the middle column
+are the authoritative ones.
+
+Three verdicts are used and they mean different things. **Present** = same
+quantity, same units, name aside. **Different** = the same *idea* under a
+different parametrization or in different units, so an importer must convert.
+**Absent** = PBRM has no equivalent. A fourth annotation, **editor-only**,
+marks parameters the editor authors and previews but that the FO4 runtime does
+not yet consume.
+
+| OpenPBR parameter | Unit / range | PBRM equivalent | Verdict |
+| --- | --- | --- | --- |
+| `base_weight` | float `[0,1]`, default 1 | `primaryBaseColor` `colorScale` | Present, different name |
+| `base_color` | color3 `[0,1]³`, default 0.8 grey | `primaryBaseColor` RGB (sRGB) | Present; OpenPBR additionally constrains it by `E_diffuse = (1 − E_spec)·C` |
+| `base_metalness` | float `[0,1]`, default 0 | `RMAOS` G | Present |
+| `base_diffuse_roughness` | float `[0,1]`, default 0 | — | Absent (no Oren-Nayar σ on either side) |
+| `specular_weight` | float `[0,∞)`, norm `[0,1]`, default 1 | folded into the authored F0 scalar | Different parametrization |
+| `specular_color` | color3 `[0,1]³`, default white | (the specular-colour slot; dielectric-only) | Different: OpenPBR uses it as the 82° **edge tint** on metals (the F82 model), which PBRM does not implement |
+| `specular_roughness` | float `[0,1]`, default 0.3 | `RMAOS` R | Present, same convention (α = r²) |
+| `specular_roughness_anisotropy` | float `[0,1]`, default 0 | `Anisotropy` slot | Editor-only, and a bent-reflection approximation rather than OpenPBR's αt/αb split |
+| `specular_ior` | float `(0,∞)`, norm `[1,3]`, default 1.5 | `RMAOS` A as an authored F0 (default 0.04) | Different parametrization, same default point; convert with `F0 = ((1−η)/(1+η))²` |
+| `transmission_weight` | float `[0,1]`, default 0 | `CompositionMode::PhysicalTransmission` | Different: a composition mode, not a mix weight |
+| `transmission_color` | color3 `[0,1]³`, default white | `TransmissionAbsorption` RGB | Editor-only |
+| `transmission_depth` | length, default 0 | `TransmissionAbsorption` A | Different: a thickness, with no Beer-law `μt = −ln T / λ` |
+| `transmission_scatter`, `transmission_scatter_anisotropy` | — | — | Absent |
+| `transmission_dispersion_scale`, `transmission_dispersion_abbe_number` | — | — | Absent by design (a deferred G-buffer has no wavelength dimension) |
+| `subsurface_weight` | float `[0,1]`, default 0 | `primarySubsurfaceScatter` W × thickness × scale | Present |
+| `subsurface_color` | color3 `[0,1]³`, default 0.8 grey | `primarySubsurface` RGB | Different meaning: OpenPBR constrains it as a single-scatter albedo, ours tints a screen-space blur |
+| `subsurface_radius` × `subsurface_radius_scale` | length per channel, default (1, 0.5, 0.25) | per-profile blur radius **in pixels** | Different: a global screen-space radius, not a per-material world-space mean free path |
+| `subsurface_scatter_anisotropy` | float `[−1,1]` | — | Absent by design (a Gaussian-sum blur has no phase function) |
+| — | — | `subsurfaceTransmission` / `subsurfaceTransmissionTint` | PBRM extension: OpenPBR has this only in thin-walled mode |
+| `fuzz_weight` | float `[0,1]`, default 0 | `SurfaceEffects` R ("sheen") | Editor-only |
+| `fuzz_color` | color3 `[0,1]³`, default white | — | Absent (the preview reuses the base colour) |
+| `fuzz_roughness` | float `[0,1]`, default 0.5 | `uSheenRoughness` | Different: OpenPBR mandates the Zeltner-2022 SGGX microflake LTC model; ours is a Fresnel-rim add |
+| `coat_weight` | float `[0,1]`, default 0 | `Clearcoat` A × coat strength | Editor-only |
+| `coat_color` | color3 `[0,1]³` — the **square** of normal-incidence transmittance | coat tint × coat absorption | Different units: ours is a straight multiply, OpenPBR's is T² and view-dependent |
+| `coat_roughness` | float `[0,1]`, default 0 | `Clearcoat` B | Present |
+| `coat_roughness_anisotropy` | float `[0,1]`, default 0 | — | Absent |
+| `coat_ior` | float `(0,∞)`, default 1.6 | coat IOR (`F0 = ((η−1)/(η+1))²`) | Present |
+| `coat_darkening` | float `[0,1]`, default 1 | — | Absent |
+| — | — | `Clearcoat` RG (coat normal) | Matches `geometry_coat_normal` |
+| `thin_film_weight` | float `[0,1]`, default 0 | `SurfaceEffects` A × iridescence strength | Present in spirit |
+| `thin_film_thickness` | **micrometres (µm)**, `[0,∞)`, default 0.5 | `SurfaceEffects` B | **Present, and the unit is µm** — see the channel-semantics note above |
+| `thin_film_ior` | float `(0,∞)`, default 1.4 | film IOR | Present |
+| — (placement) | between coat and base, folded into the Fresnel factor, energy-neutral (spec lines 867/873) | an additive post-shade term above the coat | Different, and known-wrong; scheduled, not fixed here |
+| `emission_luminance` | cd/m² (nits), `[0,∞)`, norm `[0,1000]`, default 0 | `primaryEmissive` intensity × the class-based emissive radiance ladder | Different units: ours is a dimensionless authored intensity times a per-class multiplier calibrated against a measured frame, deliberately not nits |
+| `emission_color` | color3 `[0,∞)³`, default white | `primaryEmissive` RGB (sRGB) | Present; OpenPBR permits values above 1 for HDR textures, ours caps at 1 and puts the headroom in the intensity scalar |
+| `geometry_opacity` | float `[0,1]`, default 1 | `primaryBaseColor` A + global opacity + alpha threshold | Present, richer |
+| `geometry_thin_walled` | bool | — | Absent by design |
+| `geometry_normal` | vector | `primaryNormal` RG (+B height, +A curvature) | Present, richer |
+| `geometry_tangent` | vector | `Anisotropy` RG | Editor-only |
+| `geometry_coat_normal` | vector | `Clearcoat` RG | Editor-only |
+| `geometry_coat_tangent` | vector | — | Absent |
+
+PBRM slots with no OpenPBR counterpart are FO4-specific or effect-pipeline
+data rather than gaps: `TintMask`, `StateMasks`, `BentNormal`, `DetailNormal`,
+`SeparateHeight`, `DynamicNormal`, `SubsurfaceDetail`, `HairDirection`,
+`HairScatter`, `InteriorMap`, `Imperfections`, `WaterFlow`, `Foam`,
+`IrisMasks`, `Cornea`, `Gradient`, `LayerCoverage`, `ScreenDistortion`,
+`ParticleGradient`, `SixWayA`/`SixWayB`, `MotionVectors`.
+
+### Energy rules
+
+Independently of the parameter table, OpenPBR imposes layering rules that a
+conforming implementation must obey. Two are relevant to how PBRM materials
+are authored:
+
+- **Glossy-diffuse split** (spec line 671): `f_gd ≈ f_dielectric +
+  (1 − E_dielectric(ω_o)) · f_diffuse`, so `base_color` is constrained by
+  `E_diffuse = (1 − E_spec) · C`. A material authored to look right *without*
+  this split will read slightly dark once it is applied. The FO4 runtime
+  obeys it on the sky-ambient path and, since the `bIndirectEnergySplit` key,
+  on the screen-space-GI path as well; the editor preview has always obeyed
+  it.
+- **Multiple-scattering compensation** (spec line 425) is required, and both
+  the runtime and the preview implement it.
 
 ## Runtime requirements
 
