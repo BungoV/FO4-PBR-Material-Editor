@@ -288,7 +288,14 @@ runtime integration.
   old Shading group, move it on load; a lit strength enables the slot.
 - **Sheen is fuzz** - the Surface Effects sheen keys and labels are now fuzz
   (OpenPBR's term): `overrideFuzz`, `fuzzFallback`, `fuzzStrength`,
-  `fuzzRoughness`. Sheen-keyed documents migrate on load.
+  `fuzzRoughness`, plus a `fuzzColor` tint (OpenPBR `fuzz_color`, white = no
+  change). Sheen-keyed documents migrate on load.
+- **Every channel has its override** - the six-way lightmaps' RGB directions,
+  the four surface state masks and the interior map's lit-window alpha gained
+  the editor-wide override toggle + constant. Documents authored before the
+  toggles existed keep reading their maps (the loader writes the toggles off
+  for a pathed slot). The RMAOS subtitle now says "A specular weight" (it
+  still said F0 after v6).
 
 ### 2026-09-16 — PBRM v6, feature parameters on their inputs, specular color override (v0.5.0)
 

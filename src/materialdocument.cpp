@@ -187,9 +187,26 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
         // The tint's RGB override follows the editor-wide pattern too. A map
         // authored before the override existed is read, not replaced by the
         // toggle's default (checked = the constant, white).
-        if (key.endsWith(QStringLiteral("SpecularColor")) && enabledWithPath && !values.contains(QStringLiteral("overrideColor"))) {
-            values.insert(QStringLiteral("overrideColor"), false);
-            changed = true;
+        // Channel overrides added after a slot shipped (2026-09-16 specular
+        // colour RGB; 2026-09-17 six-way RGB, state masks, the interior map's
+        // lit-window alpha). A map authored before the override existed is
+        // read, not replaced by the toggle's default (checked = the constant).
+        struct LateOverride { const char* suffix; std::initializer_list<const char*> keys; };
+        static const LateOverride lateOverrides[] = {
+            {"SpecularColor", {"overrideColor"}},
+            {"SixWayA", {"overrideRight", "overrideTop", "overrideFront"}},
+            {"SixWayB", {"overrideLeft", "overrideBottom", "overrideBack"}},
+            {"StateMasks", {"overrideMaskR", "overrideMaskG", "overrideMaskB", "overrideMaskA"}},
+            {"InteriorMap", {"overrideWindowMask"}},
+        };
+        for (const auto& late : lateOverrides) {
+            if (!enabledWithPath || !key.endsWith(QLatin1String(late.suffix))) continue;
+            for (const char* overrideKey : late.keys) {
+                const QString k = QString::fromLatin1(overrideKey);
+                if (values.contains(k)) continue;
+                values.insert(k, false);
+                changed = true;
+            }
         }
         // 2026-09-17: sheen is fuzz (OpenPBR's term), and retroreflection is
         // its own input. A first-cut v6 SurfaceEffects slot renames its sheen

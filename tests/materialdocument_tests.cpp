@@ -595,6 +595,31 @@ int main(int argc, char* argv[])
                 QStringLiteral("v6: Specular/ior + iorMax move onto the specular colour input and iorInAlpha=true becomes overrideIor=false"));
             check(spec.contains(QStringLiteral("overrideColor")) && !spec.value(QStringLiteral("overrideColor")).toBool(true),
                 QStringLiteral("v6: an authored specular colour map without the RGB override key is read (overrideColor=false written on load)"));
+            {
+                // 2026-09-17 override audit: channels that gained the editor-wide
+                // override after their slot shipped keep reading authored maps.
+                QJsonObject lateRoot = v5Root(6, QJsonObject{{QStringLiteral("specularWeight"), 1.0}}, QJsonObject(), true);
+                QJsonObject latePrimary = lateRoot.value(QStringLiteral("primaryUv")).toObject();
+                for (const char* key : {"primarySixWayA", "primarySixWayB", "primaryStateMasks", "primaryInteriorMap"}) {
+                    latePrimary.insert(QLatin1String(key), QJsonObject{{QStringLiteral("enabled"), true}, {QStringLiteral("expanded"), true},
+                        {QStringLiteral("path"), QStringLiteral("textures/test/%1.dds").arg(QLatin1String(key))}, {QStringLiteral("values"), QJsonObject()}});
+                }
+                lateRoot.insert(QStringLiteral("primaryUv"), latePrimary);
+                Pbr::MaterialDocument late;
+                QString lateError;
+                check(late.fromJson(lateRoot, &lateError), QStringLiteral("late-override document loads: %1").arg(lateError));
+                const auto sixA = late.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySixWayA")).values;
+                const auto sixB = late.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySixWayB")).values;
+                const auto masks = late.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryStateMasks")).values;
+                const auto room = late.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryInteriorMap")).values;
+                check(sixA.contains(QStringLiteral("overrideRight")) && !sixA.value(QStringLiteral("overrideRight")).toBool(true)
+                        && !sixA.value(QStringLiteral("overrideFront")).toBool(true) && !sixB.value(QStringLiteral("overrideBack")).toBool(true),
+                    QStringLiteral("an authored six-way map without the RGB override keys keeps sampling RGB (overrides written false on load)"));
+                check(masks.contains(QStringLiteral("overrideMaskA")) && !masks.value(QStringLiteral("overrideMaskR")).toBool(true),
+                    QStringLiteral("an authored state-mask map without override keys keeps sampling all four channels"));
+                check(room.contains(QStringLiteral("overrideWindowMask")) && !room.value(QStringLiteral("overrideWindowMask")).toBool(true),
+                    QStringLiteral("an authored interior cubemap without the window-mask override key keeps reading its alpha"));
+            }
             const auto sss = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"));
             check(sss.enabled && sss.values.value(QStringLiteral("mode")).toString() == QLatin1String("Combined")
                     && sss.values.value(QStringLiteral("profile")).toString() == QLatin1String("Custom")

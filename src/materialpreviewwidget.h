@@ -357,6 +357,7 @@ private:
     bool m_interiorEnabled = false;
     float m_interiorRoomsU = 1, m_interiorRoomsV = 1, m_interiorDepth = 1, m_interiorBrightness = 1;
     float m_interiorEmissive = 0;
+    QVector2D m_interiorWindowMask{1, 0};
     GLuint m_shadowFramebuffer = 0;
     GLuint m_shadowDepthTexture = 0;
     QMatrix4x4 m_shadowMatrix;

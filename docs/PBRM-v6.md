@@ -165,7 +165,7 @@ hold its channel overrides and the parameters of the lobe or effect that
 input drives: `primarySpecularColor` (`overrideColor`, `color`, `ior`, `iorMax`, `overrideIor`),
 `primarySubsurface` (`mode`, `profile`, `customScatterColor`,
 `customRadiusR/G/B`, `weight`, `transmission`, `transmissionTint`,
-`thickness`), `primarySurfaceEffects` (`fuzzStrength`, `fuzzRoughness`,
+`thickness`), `primarySurfaceEffects` (`fuzzStrength`, `fuzzRoughness`, `fuzzColor`,
 `glintIntensity`, `glintScale`, `filmIor`, `iridescenceStrength`),
 `primaryRetroreflection` (`retroStrength`, `retroWidth`; R masks the lobe,
 `overrideRetro` / `retroFallback` like every channel), `primaryHairDirection` (`direction`, the
@@ -257,7 +257,7 @@ not yet consume.
 | `subsurface_scatter_anisotropy` | float `[−1,1]` | — | Absent by design (a Gaussian-sum blur has no phase function) |
 | — | — | `subsurfaceTransmission` / `subsurfaceTransmissionTint` | PBRM extension: OpenPBR has this only in thin-walled mode |
 | `fuzz_weight` | float `[0,1]`, default 0 | `SurfaceEffects` R ("fuzz") | Editor-only |
-| `fuzz_color` | color3 `[0,1]³`, default white | — | Absent (the preview reuses the base colour) |
+| `fuzz_color` | color3 `[0,1]³`, default white | `primarySurfaceEffects` `fuzzColor` (sRGB, default white) | Different: ours tints the base colour the lobe reflects; OpenPBR's is the fuzz albedo on its own |
 | `fuzz_roughness` | float `[0,1]`, default 0.5 | `fuzzRoughness` | Different: OpenPBR mandates the Zeltner-2022 SGGX microflake LTC model; ours is a Fresnel-rim add |
 | `coat_weight` | float `[0,1]`, default 0 | `Clearcoat` A × coat strength | Editor-only |
 | `coat_color` | color3 `[0,1]³` — the **square** of normal-incidence transmittance | coat tint × coat absorption | Different units: ours is a straight multiply, OpenPBR's is T² and view-dependent |

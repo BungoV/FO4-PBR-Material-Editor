@@ -122,6 +122,12 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
         if (mode != Pbr::ShaderMode::UnlitEffect) {
             add(slot(prefix + "SixWayA", tr("Six-Way Lightmap • Right / Top / Front"), "6WAY", "Linear • R right / G top / B front / A opacity", QColor(126, 138, 156), false, {},
                 "First half of a six-way lightmap flipbook: per-frame lighting baked from the right, top, and front directions. Scene lights relight the smoke through the six-direction basis; alpha carries opacity.", {
+                    toggleField("overrideRight", "R • Right", true, "Checked uses the constant right-lit response override."),
+                    numberField("rightFallback", "Right override", 1.0, 0.0, 1.0, 0.005, "Constant right-lit response when the texture channel is overridden or absent."),
+                    toggleField("overrideTop", "G • Top", true, "Checked uses the constant top-lit response override."),
+                    numberField("topFallback", "Top override", 1.0, 0.0, 1.0, 0.005, "Constant top-lit response when the texture channel is overridden or absent."),
+                    toggleField("overrideFront", "B • Front", true, "Checked uses the constant front-lit response override."),
+                    numberField("frontFallback", "Front override", 1.0, 0.0, 1.0, 0.005, "Constant front-lit response when the texture channel is overridden or absent."),
                     toggleField("overrideOpacity", "A • Opacity", false, "Checked replaces the sampled opacity with a constant — use for RGB-only sheets or opaque smoke cards whose alpha should be ignored."),
                     numberField("opacity", "Opacity override", 1.0, 0.0, 1.0, 0.005, "Constant opacity when texture A is overridden."),
                     numberField("ambient", "Ambient response", 1.0, 0.0, 8.0, 0.01, "How strongly the averaged six directions respond to environment light."),
@@ -129,6 +135,12 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 }));
             add(slot(prefix + "SixWayB", tr("Six-Way Lightmap • Left / Bottom / Back"), "6WAY", "Linear • R left / G bottom / B back / A fire mask", QColor(126, 138, 156), false, {},
                 "Second half of the six-way lightmap: lighting baked from the left, bottom, and back directions. Alpha is an emissive fire mask — burning regions self-illuminate through a blackbody ramp. Both halves share this layer's flipbook layout.", {
+                    toggleField("overrideLeft", "R • Left", true, "Checked uses the constant left-lit response override."),
+                    numberField("leftFallback", "Left override", 1.0, 0.0, 1.0, 0.005, "Constant left-lit response when the texture channel is overridden or absent."),
+                    toggleField("overrideBottom", "G • Bottom", true, "Checked uses the constant bottom-lit response override."),
+                    numberField("bottomFallback", "Bottom override", 1.0, 0.0, 1.0, 0.005, "Constant bottom-lit response when the texture channel is overridden or absent."),
+                    toggleField("overrideBack", "B • Back", true, "Checked uses the constant back-lit response override."),
+                    numberField("backFallback", "Back override", 1.0, 0.0, 1.0, 0.005, "Constant back-lit response when the texture channel is overridden or absent."),
                     toggleField("overrideEmissive", "A • Fire mask", true, "Checked replaces the sampled fire mask with a constant."),
                     numberField("emissive", "Fire mask override", 0.0, 0.0, 1.0, 0.005, "Constant fire mask when texture A is overridden or absent."),
                     numberField("fireIntensity", "Fire intensity", 0.0, 0.0, 64.0, 0.05, "Peak emissive energy of the blackbody fire ramp; zero disables the fire pass.")
@@ -139,7 +151,7 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 }, {QStringLiteral("R"), QStringLiteral("G")}));
         }
         if (mode == Pbr::ShaderMode::PhysicallyLitEffect) {
-            add(slot(prefix + "Rmaos", tr("Roughness + Metallic + Ambient Occlusion + Specular"), "RMAOS", "Linear • R roughness / G metallic / B AO / A F0", QColor(108, 136, 111), false, {},
+            add(slot(prefix + "Rmaos", tr("Roughness + Metallic + Ambient Occlusion + Specular"), "RMAOS", "Linear • R roughness / G metallic / B AO / A specular weight", QColor(108, 136, 111), false, {},
                 "Packed physical surface properties for a physically lit effect.", {
                     toggleField("overrideRoughness", "R • Roughness", true, "Checked uses the constant roughness override."),
                     numberField("roughness", "Roughness override", 0.5, 0.0, 1.0, 0.005, "Constant roughness."),
@@ -246,7 +258,16 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
         // contributes physical maps (porosity in RMAOS.A, curvature in
         // Normal.A) plus these optional hand-authored placement masks.
         add(slot(prefix + "StateMasks", tr("Surface State Masks"), "SMASK", "Linear • R/G/B/A dedicated per-state masks", QColor(96, 148, 154), false, {},
-            "Optional hand-authored placement masks. A runtime surface state bound to one of these channels on the Surface Response page uses it instead of map-guided accumulation — e.g. authored blood splatter or hero-asset snow.", {}));
+            "Optional hand-authored placement masks. A runtime surface state bound to one of these channels on the Surface Response page uses it instead of map-guided accumulation — e.g. authored blood splatter or hero-asset snow.", {
+                toggleField("overrideMaskR", "R • State mask 1", true, "Checked uses the constant state mask override."),
+                numberField("maskRFallback", "State mask 1 override", 0.0, 0.0, 1.0, 0.005, "Constant state mask when the texture channel is overridden or absent."),
+                toggleField("overrideMaskG", "G • State mask 2", true, "Checked uses the constant state mask override."),
+                numberField("maskGFallback", "State mask 2 override", 0.0, 0.0, 1.0, 0.005, "Constant state mask when the texture channel is overridden or absent."),
+                toggleField("overrideMaskB", "B • State mask 3", true, "Checked uses the constant state mask override."),
+                numberField("maskBFallback", "State mask 3 override", 0.0, 0.0, 1.0, 0.005, "Constant state mask when the texture channel is overridden or absent."),
+                toggleField("overrideMaskA", "A • State mask 4", true, "Checked uses the constant state mask override."),
+                numberField("maskAFallback", "State mask 4 override", 0.0, 0.0, 1.0, 0.005, "Constant state mask when the texture channel is overridden or absent.")
+            }));
     }
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || all) {
         add(slot(prefix + "BentNormal", tr("Bent Normal"), "BENT", "Linear • RG bent normal / B occlusion cone / A mask", QColor(104, 128, 158), false, {},
@@ -298,6 +319,7 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 numberField("iridescenceFallback", "Iridescence override", 0.0, 0.0, 1.0, 0.005, "Iridescence mask when texture A is overridden or absent."),
                 numberField("fuzzStrength", "Fuzz strength", 0.0, 0.0, 8.0, 0.01, "Grazing fabric fuzz (sheen) reflection masked by R."),
                 numberField("fuzzRoughness", "Fuzz roughness", 0.6, 0.0, 1.0, 0.005, "Width of the fuzz lobe."),
+                colorField("fuzzColor", "Fuzz color", "#FFFFFF", "sRGB tint of the fuzz lobe over the base color; white is no change (OpenPBR fuzz_color)."),
                 numberField("glintIntensity", "Glint intensity", 0.0, 0.0, 100.0, 0.01, "Sparse microfacet sparkle masked by G."),
                 numberField("glintScale", "Glint scale", 1.0, 0.001, 10000.0, 0.01, "Spatial frequency of procedural glints."),
                 numberField("filmIor", "Thin-film IOR", 1.5, 1.0, 3.0, 0.001, "IOR of the iridescent thin film."),
@@ -392,6 +414,8 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
             }));
         add(slot(prefix + "InteriorMap", tr("Interior Map"), "ROOM", "sRGB • Room cubemap RGB / A lit-window mask (DDS)", QColor(94, 118, 96), false, {},
             "Parallax cubemap rooms rendered behind the glass (building windows). The runtime projects a fake interior per window pane; the preview evaluates the same ray-box lookup. The cubemap's alpha marks self-lit interior areas that glow independently of scene lighting.", {
+                toggleField("overrideWindowMask", "A • Lit-window mask", true, "Checked uses the constant lit-window mask instead of the cubemap alpha."),
+                numberField("windowMaskFallback", "Lit-window mask override", 0.0, 0.0, 1.0, 0.005, "Constant lit-window mask when the cubemap alpha is overridden or absent."),
                 numberField("roomsU", "Rooms across U", 1.0, 0.25, 64.0, 0.25, "Window panes per UV tile horizontally.", 2),
                 numberField("roomsV", "Rooms across V", 1.0, 0.25, 64.0, 0.25, "Window panes per UV tile vertically.", 2),
                 numberField("depth", "Room depth", 1.0, 0.05, 8.0, 0.01, "Apparent depth of the room relative to its width."),
@@ -548,7 +572,7 @@ QVector<TextureSlotSpec> MainWindow::landscapeSlots() const
                 toggleField("heightInBlue", "B • Height", true, "Uses blue for height-aware blending and optional parallax."),
                 numberField("normalStrength", "Normal strength", 1.0, 0.0, 8.0, 0.01, "Landscape normal multiplier.")
             }),
-        slot("rmaosArray", tr("Landscape Roughness + Metallic + AO + Specular Array"), "L-RMAOS", "Linear texture array • R roughness / G metallic / B AO / A F0",
+        slot("rmaosArray", tr("Landscape Roughness + Metallic + AO + Specular Array"), "L-RMAOS", "Linear texture array • R roughness / G metallic / B AO / A specular weight",
             QColor(101, 132, 106), true, {}, "Packed physical-property slices for every landscape material.", {
                 toggleField("overrideRoughness", "R • Roughness", true, "Checked uses constant roughness for the array."),
                 numberField("roughness", "Roughness override", 0.5, 0.0, 1.0, 0.005, "Constant landscape roughness."),

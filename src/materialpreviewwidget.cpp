@@ -841,7 +841,10 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     }
     {
         // Dedicated per-state masks are per-material and live on the primary set.
-        addSpecial(StateMasksLayer,QStringLiteral("StateMasks"),QVector4D(0,0,0,0),QVector4D(1,1,1,1),QStringLiteral("UV0"),QStringLiteral("primary"));
+        const auto masks=stateFor(QStringLiteral("StateMasks"),QStringLiteral("UV0"),QStringLiteral("primary"));
+        addSpecial(StateMasksLayer,QStringLiteral("StateMasks"),
+            QVector4D(numberValue(masks.values,"maskRFallback",0),numberValue(masks.values,"maskGFallback",0),numberValue(masks.values,"maskBFallback",0),numberValue(masks.values,"maskAFallback",0)),
+            QVector4D(used(masks.values,"overrideMaskR"),used(masks.values,"overrideMaskG"),used(masks.values,"overrideMaskB"),used(masks.values,"overrideMaskA")),QStringLiteral("UV0"),QStringLiteral("primary"));
         // v5: state behavior comes from the runtime-owned definitions, never
         // the material. The material contributes only the SurfaceResponse
         // bindings: adhesion constant, shelter vertex channel, and StateMasks
@@ -868,13 +871,13 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
         // (or opaque smoke cards) ignore the texture channel. Unlike other
         // overrides it defaults OFF so existing materials keep sampling alpha.
         addSpecial(SixWayALayer,QStringLiteral("SixWayA"),
-            QVector4D(0,0,0,numberValue(stateA.values,"opacity",1)),
-            QVector4D(1,1,1,boolValue(stateA.values,QStringLiteral("overrideOpacity"),false)?0.0f:1.0f));
+            QVector4D(numberValue(stateA.values,"rightFallback",1),numberValue(stateA.values,"topFallback",1),numberValue(stateA.values,"frontFallback",1),numberValue(stateA.values,"opacity",1)),
+            QVector4D(used(stateA.values,"overrideRight"),used(stateA.values,"overrideTop"),used(stateA.values,"overrideFront"),boolValue(stateA.values,QStringLiteral("overrideOpacity"),false)?0.0f:1.0f));
         const auto stateB=stateFor(QStringLiteral("SixWayB"));
         // B alpha is the fire/emissive mask; defaults to the constant override (0).
         addSpecial(SixWayBLayer,QStringLiteral("SixWayB"),
-            QVector4D(0,0,0,numberValue(stateB.values,"emissive",0)),
-            QVector4D(1,1,1,used(stateB.values,"overrideEmissive")));
+            QVector4D(numberValue(stateB.values,"leftFallback",1),numberValue(stateB.values,"bottomFallback",1),numberValue(stateB.values,"backFallback",1),numberValue(stateB.values,"emissive",0)),
+            QVector4D(used(stateB.values,"overrideLeft"),used(stateB.values,"overrideBottom"),used(stateB.values,"overrideBack"),used(stateB.values,"overrideEmissive")));
         addSpecial(MotionVectorsLayer,QStringLiteral("MotionVectors"),QVector4D(.5f,.5f,0,0),QVector4D(1,1,0,0));
         Q_UNUSED(stateA);
     }
@@ -892,6 +895,8 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
         m_interiorDepth=numberValue(state.values,QStringLiteral("depth"),1.0f);
         m_interiorBrightness=numberValue(state.values,QStringLiteral("brightness"),1.0f);
         m_interiorEmissive=numberValue(state.values,QStringLiteral("windowEmissive"),0.0f);
+        // The cubemap's alpha (lit-window mask) has the editor-wide override: x = use the texture, y = the constant.
+        m_interiorWindowMask=QVector2D(used(state.values,"overrideWindowMask"),numberValue(state.values,QStringLiteral("windowMaskFallback"),0.0f));
     }
     {
         const auto state=document.textureSlot(QStringLiteral("Landscape"),QStringLiteral("macroVariation"));const QVector3D color=jsonColor(state.values,"color","#808080");const float useColor=used(state.values,"overrideColor");
@@ -1135,6 +1140,7 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
     m_program->setUniformValue("uStateAdhesion", 1.0f);
     m_program->setUniformValue("uShelterChannel", -1);
     m_program->setUniformValue("uSheenStrength", 0.0f);
+    m_program->setUniformValue("uFuzzColor", QVector3D(1, 1, 1));
     m_program->setUniformValue("uGlintIntensity", 0.0f);
     m_program->setUniformValue("uIridescenceStrength", 0.0f);
     m_program->setUniformValue("uRetroStrength", 0.0f);
@@ -1636,6 +1642,7 @@ void PbrPreviewGL::initializeGL()
         uniform bool uInteriorEnabled;
         uniform vec2 uInteriorRooms;
         uniform float uInteriorDepth,uInteriorBrightness,uInteriorEmissive;
+        uniform vec2 uInteriorWindowMask;
         uniform bool uParticleActive;
         uniform int uFlipbookEnabled[3],uFlipbookDriver[3],uFlipbookLoop[3],uFlipbookBlendOn[3],uPolarUvOn[3];
         uniform vec2 uFlipbookGrid[3];
@@ -1696,6 +1703,7 @@ void PbrPreviewGL::initializeGL()
         uniform float uDynamicStrength,uDynamicDriverValue,uDynamicInputMin,uDynamicInputMax;
         uniform float uSubsurfaceWeight,uSubsurfaceTransmission,uSubsurfaceThickness;
         uniform float uSheenStrength,uSheenRoughness,uGlintIntensity,uGlintScale,uFilmIor,uIridescenceStrength;
+        uniform vec3 uFuzzColor;
         uniform float uHairPrimaryStrength,uHairPrimaryRoughness,uHairPrimaryShift,uHairSecondaryStrength,uHairSecondaryRoughness,uHairSecondaryShift,uHairScatter,uHairBacklight,uHairDirectionStrength;
         uniform float uGlassIor,uGlassAbsorptionDistance,uGlassRefractionRoughness,uGlassThickness;
         uniform float uWaterIor,uWaterAbsorptionDistance,uWaterScattering,uWaterReflectionStrength,uWaterFlowSpeed,uWaterFlowStrength;
@@ -2715,7 +2723,7 @@ void PbrPreviewGL::initializeGL()
             if(hasSpecial(1)&&!defaults){
                 vec4 surface=specialSample(1,uv);
                 float sheenMask=surface.r*uSheenStrength,glintMask=surface.g*uGlintIntensity;
-                color+=base*sheenMask*pow(1.0-NoV,max(.25,4.0*(1.0-uSheenRoughness)))*(envDiffuse+uKeyColor*uKeyIntensity*.15);
+                color+=base*pow(max(uFuzzColor,vec3(0.0)),vec3(2.2))*sheenMask*pow(1.0-NoV,max(.25,4.0*(1.0-uSheenRoughness)))*(envDiffuse+uKeyColor*uKeyIntensity*.15);
                 float glint=step(1.0-clamp(glintMask*.01,0.0,.98),hash13(vWorldPosition*max(uGlintScale,.001)+N*17.0))*pow(NoH,256.0);
                 color+=uKeyColor*uKeyIntensity*glint*NoL;
                 float iri=surface.a*uIridescenceStrength;vec3 film=thinFilmColor(NoV,surface.b,uFilmIor);
@@ -2816,7 +2824,7 @@ void PbrPreviewGL::initializeGL()
                     transmitted=interiorLinear*uInteriorBrightness/max(uEnvironmentIntensity,.05);
                     // Cubemap alpha marks self-lit interior areas: those windows
                     // glow on their own, independent of scene lighting.
-                    interiorGlow=interiorLinear*interiorSample.a*uInteriorEmissive;
+                    interiorGlow=interiorLinear*mix(uInteriorWindowMask.y,interiorSample.a,uInteriorWindowMask.x)*uInteriorEmissive;
                 }else{
                     transmitted=textureLod(uPrefilteredEnvironment,environmentDirection(refracted),refractionRough*uPrefilteredEnvironmentMaxLod).rgb;
                 }
@@ -5086,7 +5094,7 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uNativeEnvScale",m_nativeMaterial.envMapScale);
     m_program->setUniformValue("uNativeEmitColor",m_nativeMaterial.emittanceColor);
     m_program->setUniformValue("uNativeEmitMult",m_nativeMaterial.emitEnabled?m_nativeMaterial.emittanceMult:0.0f);
-    m_program->setUniformValue("uInteriorEnabled",m_interiorEnabled);m_program->setUniformValue("uInteriorRooms",QVector2D(m_interiorRoomsU,m_interiorRoomsV));m_program->setUniformValue("uInteriorDepth",m_interiorDepth);m_program->setUniformValue("uInteriorBrightness",m_interiorBrightness);m_program->setUniformValue("uInteriorEmissive",m_interiorEmissive);
+    m_program->setUniformValue("uInteriorEnabled",m_interiorEnabled);m_program->setUniformValue("uInteriorRooms",QVector2D(m_interiorRoomsU,m_interiorRoomsV));m_program->setUniformValue("uInteriorDepth",m_interiorDepth);m_program->setUniformValue("uInteriorBrightness",m_interiorBrightness);m_program->setUniformValue("uInteriorEmissive",m_interiorEmissive);m_program->setUniformValue("uInteriorWindowMask",m_interiorWindowMask);
     m_program->setUniformValue("uBase",0);m_program->setUniformValue("uNormal",1);m_program->setUniformValue("uRmaos",2);m_program->setUniformValue("uEmissive",3);m_program->setUniformValue("uHeight",4);m_program->setUniformValue("uEnvironment",5);
     glActiveTexture(GL_TEXTURE15);glBindTexture(GL_TEXTURE_2D,m_shadowDepthTexture);m_program->setUniformValue("uShadowMap",15);m_program->setUniformValue("uShadowMatrix",m_shadowMatrix);m_program->setUniformValue("uShadowsEnabled",m_shadowsEnabled);m_program->setUniformValue("uShadowIntensity",m_shadowIntensity);m_program->setUniformValue("uDerivedEnvironmentShadow",m_derivedEnvironmentShadow);m_program->setUniformValue("uDerivedEnvironmentShadowWeight",m_derivedEnvironmentShadowWeight);
     m_program->setUniformValue("uPrefilteredEnvironment",12);m_program->setUniformValue("uBrdfLut",13);m_program->setUniformValue("uSpecial",14);m_program->setUniformValue("uEnvironmentSourceMaxLod",float(qMax(0,m_environmentTexture->mipLevels()-1)));m_program->setUniformValue("uPrefilteredEnvironmentMaxLod",m_prefilteredEnvironmentMaxLod);
@@ -5197,7 +5205,7 @@ void PbrPreviewGL::paintGL()
     const QString profile=subsurface.value(QStringLiteral("profile")).toString(QStringLiteral("Skin"));QVector3D profileColor=profile==QStringLiteral("Wax")?QVector3D(1,.72,.4):(profile==QStringLiteral("Flesh")?QVector3D(1,.3,.22):(profile==QStringLiteral("Plant")?QVector3D(.42,.8,.28):(profile==QStringLiteral("Custom")?jsonColor(subsurface,QStringLiteral("customScatterColor"),QStringLiteral("#FFB39D")):QVector3D(1,.55,.42))));m_program->setUniformValue("uSubsurfaceProfileColor",profileColor);
     m_program->setUniformValue("uSubsurfaceWeight",float(subsurface.value(QStringLiteral("weight")).toDouble(1.0)));m_program->setUniformValue("uSubsurfaceTransmission",float(subsurface.value(QStringLiteral("transmission")).toDouble(0.0)));m_program->setUniformValue("uTransmissionTint",jsonColor(subsurface,QStringLiteral("transmissionTint"),QStringLiteral("#FFFFFF")));m_program->setUniformValue("uSubsurfaceThickness",numberValue(subsurface,QStringLiteral("thickness"),1.0f));
     const auto fxState=slot(QStringLiteral("SurfaceEffects"));const float fxOn=fxState.enabled?1.0f:0.0f;
-    m_program->setUniformValue("uSheenStrength",fxOn*numberValue(fxState.values,QStringLiteral("fuzzStrength"),0));m_program->setUniformValue("uSheenRoughness",numberValue(fxState.values,QStringLiteral("fuzzRoughness"),.6f));m_program->setUniformValue("uGlintIntensity",fxOn*numberValue(fxState.values,QStringLiteral("glintIntensity"),0));m_program->setUniformValue("uGlintScale",numberValue(fxState.values,QStringLiteral("glintScale"),1));m_program->setUniformValue("uFilmIor",numberValue(fxState.values,QStringLiteral("filmIor"),1.5f));m_program->setUniformValue("uIridescenceStrength",fxOn*numberValue(fxState.values,QStringLiteral("iridescenceStrength"),0));
+    m_program->setUniformValue("uSheenStrength",fxOn*numberValue(fxState.values,QStringLiteral("fuzzStrength"),0));m_program->setUniformValue("uSheenRoughness",numberValue(fxState.values,QStringLiteral("fuzzRoughness"),.6f));m_program->setUniformValue("uFuzzColor",jsonColor(fxState.values,QStringLiteral("fuzzColor"),QStringLiteral("#FFFFFF")));m_program->setUniformValue("uGlintIntensity",fxOn*numberValue(fxState.values,QStringLiteral("glintIntensity"),0));m_program->setUniformValue("uGlintScale",numberValue(fxState.values,QStringLiteral("glintScale"),1));m_program->setUniformValue("uFilmIor",numberValue(fxState.values,QStringLiteral("filmIor"),1.5f));m_program->setUniformValue("uIridescenceStrength",fxOn*numberValue(fxState.values,QStringLiteral("iridescenceStrength"),0));
     const QJsonObject hair=slot(QStringLiteral("HairDirection")).values;const QJsonObject hairScatter=slot(QStringLiteral("HairScatter")).values;m_program->setUniformValue("uHairPrimaryStrength",float(hair.value("primaryStrength").toDouble(1)));m_program->setUniformValue("uHairPrimaryRoughness",float(hair.value("primaryRoughness").toDouble(.25)));m_program->setUniformValue("uHairPrimaryShift",float(hair.value("primaryShift").toDouble(-.08)));m_program->setUniformValue("uHairSecondaryStrength",float(hair.value("secondaryStrength").toDouble(.5)));m_program->setUniformValue("uHairSecondaryRoughness",float(hair.value("secondaryRoughness").toDouble(.45)));m_program->setUniformValue("uHairSecondaryShift",float(hair.value("secondaryShift").toDouble(.12)));m_program->setUniformValue("uHairScatter",float(hairScatter.value("scatterStrength").toDouble(.5)));m_program->setUniformValue("uHairBacklight",float(hairScatter.value("backlightStrength").toDouble(.5)));m_program->setUniformValue("uHairDirectionStrength",numberValue(slot(QStringLiteral("HairDirection")).values,QStringLiteral("strength"),1));
     const auto transmissionState=slot(QStringLiteral("TransmissionAbsorption"));m_program->setUniformValue("uGlassIor",numberValue(transmissionState.values,QStringLiteral("ior"),1.5f));m_program->setUniformValue("uGlassAbsorptionDistance",numberValue(transmissionState.values,QStringLiteral("absorptionDistance"),1));m_program->setUniformValue("uGlassRefractionRoughness",numberValue(transmissionState.values,QStringLiteral("refractionRoughness"),0));m_program->setUniformValue("uGlassThinWalled",boolValue(transmissionState.values,QStringLiteral("thinWalled"),false));m_program->setUniformValue("uGlassThickness",numberValue(transmissionState.values,QStringLiteral("thickness"),1));
     const auto waterFlow=slot(QStringLiteral("WaterFlow"));m_program->setUniformValue("uWaterIor",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("ior"),1.333f));m_program->setUniformValue("uWaterAbsorptionDistance",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("absorptionDistance"),300));m_program->setUniformValue("uWaterScattering",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("scattering"),.25f));m_program->setUniformValue("uWaterReflectionStrength",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("reflectionStrength"),1));m_program->setUniformValue("uWaterShoreFoam",settingBool(QStringLiteral("Shading/Water"),QStringLiteral("shoreFoam"),true));m_program->setUniformValue("uWaterFlowSpeed",numberValue(waterFlow.values,QStringLiteral("speed"),.05f));m_program->setUniformValue("uWaterFlowStrength",numberValue(waterFlow.values,QStringLiteral("strength"),1));
