@@ -572,8 +572,10 @@ void mapParameters(const Bgsm::Material& material, Pbr::MaterialDocument* docume
             ? Pbr::ShaderMode::SimpleLitEffect : Pbr::ShaderMode::UnlitEffect);
     } else if (material.hair) {
         document->setShaderMode(Pbr::ShaderMode::HairSurface);
-        document->setSetting(QStringLiteral("Shading/Hair"), QStringLiteral("tint"),
+        Pbr::TextureSlotState hairScatter = document->textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryHairScatter"));
+        hairScatter.values.insert(QStringLiteral("tint"),
             QColor::fromRgbF(material.hairTintColor.x(), material.hairTintColor.y(), material.hairTintColor.z()).name());
+        document->setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primaryHairScatter"), hairScatter);
     } else if (material.skinTint || material.facegen || material.translucency || material.subsurfaceLighting) {
         document->setShaderMode(Pbr::ShaderMode::AdvancedSubsurface);
     } else {
@@ -585,22 +587,26 @@ void mapParameters(const Bgsm::Material& material, Pbr::MaterialDocument* docume
     // which selected a subsurface material and then shipped it with default
     // scattering — every authored value was dropped.
     if (material.translucency || material.subsurfaceLighting) {
-        const QString subsurface = QStringLiteral("Shading/Subsurface");
+        // v6: the parameters live on the subsurface input, which is enabled
+        // to switch the feature on (no map: constants drive it).
+        Pbr::TextureSlotState subsurfaceSlot = document->textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"));
+        subsurfaceSlot.enabled = true;
+        const auto setSubsurface = [&](const QString& key, const QJsonValue& value) { subsurfaceSlot.values.insert(key, value); };
         if (material.translucency) {
             // Thick objects scatter through a volume, thin ones transmit
             // through a sheet; the transmissive scale is authored either way.
-            document->setSetting(subsurface, QStringLiteral("mode"),
+            setSubsurface(QStringLiteral("mode"),
                 material.translucencyThickObject ? QStringLiteral("Combined")
                                                  : QStringLiteral("Thin Transmission"));
-            document->setSetting(subsurface, QStringLiteral("transmission"),
+            setSubsurface(QStringLiteral("transmission"),
                 double(std::clamp(material.translucencyTransmissiveScale, 0.0f, 4.0f)));
             // The authored subsurface colour is a wavelength tint, which is
             // exactly what a Custom diffusion profile expresses. A default
             // white one carries no information, so the stock profile stays.
             const QVector3D scatter = material.translucencySubsurfaceColor;
             if (!qFuzzyCompare(scatter, QVector3D(1, 1, 1))) {
-                document->setSetting(subsurface, QStringLiteral("profile"), QStringLiteral("Custom"));
-                document->setSetting(subsurface, QStringLiteral("customScatterColor"),
+                setSubsurface(QStringLiteral("profile"), QStringLiteral("Custom"));
+                setSubsurface(QStringLiteral("customScatterColor"),
                     QColor::fromRgbF(std::clamp(scatter.x(), 0.0f, 1.0f),
                         std::clamp(scatter.y(), 0.0f, 1.0f),
                         std::clamp(scatter.z(), 0.0f, 1.0f)).name());
@@ -614,10 +620,11 @@ void mapParameters(const Bgsm::Material& material, Pbr::MaterialDocument* docume
             // FO4's rolloff is normalised against its own default, so a
             // material that left it alone lands on the editor's neutral weight
             // and one that raised it scatters further.
-            document->setSetting(subsurface, QStringLiteral("mode"), QStringLiteral("Diffusion Profile"));
-            document->setSetting(subsurface, QStringLiteral("weight"),
+            setSubsurface(QStringLiteral("mode"), QStringLiteral("Diffusion Profile"));
+            setSubsurface(QStringLiteral("weight"),
                 double(std::clamp(material.subsurfaceLightingRolloff / 0.3f, 0.0f, 4.0f)));
         }
+        document->setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"), subsurfaceSlot);
     }
 
     // Transparency composition.

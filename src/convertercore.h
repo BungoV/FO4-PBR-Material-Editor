@@ -185,7 +185,7 @@ struct ConvertedImages {
     QImage specularColor;
     QImage metallic;       // grayscale metallic confidence (diagnostics / masking UI)
     float metalCoverage = 0; // fraction of texels with metallic > 0.5 (report)
-    // v6: the material's specular IOR scalar (Specular/ior). The converter
+    // v6: the specular IOR scalar (primarySpecularColor.ior). The converter
     // anchors the reflectance LEVEL here and writes only the weight per texel.
     float specularIor = 1.5f;
 };

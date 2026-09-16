@@ -160,6 +160,31 @@ mesh directory when possible. Runtimes that want per-shape material binding
 read material paths from the NIF itself; the sidecar only drives the editor's
 multi-material preview.
 
+Feature parameters live on the feature's texture input. A slot's `values`
+hold its channel overrides and the parameters of the lobe or effect that
+input drives: `primarySpecularColor` (`ior`, `iorMax`, `overrideIor`),
+`primarySubsurface` (`mode`, `profile`, `customScatterColor`,
+`customRadiusR/G/B`, `weight`, `transmission`, `transmissionTint`,
+`thickness`), `primarySurfaceEffects` (`sheenStrength`, `sheenRoughness`,
+`glintIntensity`, `glintScale`, `filmIor`, `iridescenceStrength`,
+`retroStrength`, `retroWidth`), `primaryHairDirection` (`direction`, the
+`primary*` and `secondary*` lobe constants), `primaryHairScatter`
+(`scatterStrength`, `backlightStrength`), `primaryTransmissionAbsorption`
+(glass `ior`, `absorptionDistance`, `refractionRoughness`, `thinWalled`),
+`primaryCornea` (`ior`, `wetness`) and `primaryIrisMasks` (`irisDepth`,
+`limbalStrength`, `pupilScale`). Subsurface and surface effects are on while
+their input is enabled, with or without a map (there is no `Disabled`
+subsurface mode); hair, glass and eye read their input's constants
+regardless, as does the specular IOR. The `settings` object keeps only
+groups that have no texture input (`Shading/Core`, `Shading/Water`,
+`Shading/BottleLiquid`, `Shading/Unlit`, transparency, geometry, vegetation,
+environment and advanced groups). The retired groups `Specular`,
+`Shading/Subsurface`, `Shading/SurfaceEffects`, `Shading/Hair`,
+`Shading/Glass` and `Shading/Eye` migrate into the primary slot on load
+(subsurface `thicknessScale` multiplies into the slot `thickness`, mode
+`Disabled` disables the input, hair `scatter`/`backlight` become
+`scatterStrength`/`backlightStrength`, `corneaIor` becomes `ior`).
+
 `Shading/BottleLiquid` is an additive setting group for the glass families
 describing a contained liquid volume (fill level, liquid and meniscus colors,
 absorption, surface brightness, and wobble spring constants). The liquid is
@@ -219,7 +244,7 @@ not yet consume.
 | `specular_color` | color3 `[0,1]³`, default white | `primarySpecularColor` RGB (sRGB; dielectric-only) | Different: OpenPBR uses it as the 82° **edge tint** on metals (the F82 model), which PBRM does not implement |
 | `specular_roughness` | float `[0,1]`, default 0.3 | `RMAOS` R | Present, same convention (α = r²) |
 | `specular_roughness_anisotropy` | float `[0,1]`, default 0 | `Anisotropy` slot | Editor-only, and a bent-reflection approximation rather than OpenPBR's αt/αb split |
-| `specular_ior` | float `(0,∞)`, norm `[1,3]`, default 1.5 | material `Specular/ior` scalar (default 1.5, no ceiling), or `primarySpecularColor` A over `[0, Specular/iorMax]` (ceiling default 4.25) when `iorInAlpha=true` | Present; `F0 = ((η−1)/(η+1))²`, IOR 0 makes the tint the F0 outright |
+| `specular_ior` | float `(0,∞)`, norm `[1,3]`, default 1.5 | `primarySpecularColor` constant `ior` (default 1.5, no ceiling), or its A over `[0, iorMax]` (ceiling default 4.25) while `overrideIor=false` | Present; `F0 = ((η−1)/(η+1))²`, IOR 0 makes the tint the F0 outright |
 | `transmission_weight` | float `[0,1]`, default 0 | `CompositionMode::PhysicalTransmission` | Different: a composition mode, not a mix weight |
 | `transmission_color` | color3 `[0,1]³`, default white | `TransmissionAbsorption` RGB | Editor-only |
 | `transmission_depth` | length, default 0 | `TransmissionAbsorption` A | Different: a thickness, with no Beer-law `μt = −ln T / λ` |
@@ -307,14 +332,14 @@ and these Primary UV socket keys:
 | `primaryNormal` | linear RG tangent normal, optional B height, A signed curvature or cone map per `alphaCarries` | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `alphaCarries="None"`, `cavitySpecOcclusion=1.0` |
 | `primaryRmaos` | linear R roughness, G metallic, B AO, A specular weight or porosity | `override*` channel fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, specular weight `1.0`; `alphaCarries="Specular Weight"`, `overridePorosity=false`, porosity `0.5` |
 | `primaryEmissive` | sRGB RGB radiance, A intensity mask | color `#FFFFFF`, intensity `0.0` |
-| `primarySpecularColor` | sRGB RGB specular tint, A specular IOR map (read only when `iorInAlpha=true`) | no constants and no `override*` fields; `iorInAlpha=false`; an absent, disabled, or unresolvable slot means a white tint and the material IOR |
+| `primarySpecularColor` | sRGB RGB specular tint, A specular IOR map (read only while `overrideIor=false`) | `overrideIor=true`, `ior=1.5`, `iorMax=4.25`; the constants are read whether or not the slot is enabled; an absent, disabled, or unresolvable slot means a white tint and the constant IOR |
 
 `primarySpecularColor` RGB is the OpenPBR `specular_color` tint on the
-dielectric Fresnel, and its alpha, when `iorInAlpha=true`, is the
+dielectric Fresnel, and its alpha, while `overrideIor=false`, is the
 `specular_ior` map. The dielectric F0 resolves as
 
     F0_ior = ((ior − 1) / (ior + 1))²
-    ior    = iorInAlpha ? specularColor.a × Specular/iorMax : Specular/ior
+    ior    = overrideIor ? ior : specularColor.a × iorMax     (ior, iorMax, overrideIor on the slot)
     F0     = specularWeight × specularColor.rgb × F0_ior
 
 with `specularWeight` the RMAOS alpha (while `alphaCarries="Specular Weight"`
@@ -326,7 +351,8 @@ clamps the dielectric F0 to 0.16: the weight can only lower the level and the
 IOR owns it. Surface states blend the resolved dielectric F0 (after weight,
 tint and IOR, before the metal mix, as in v5). An opaque colour map decodes
 A as `1.0`, which would read as the IOR ceiling; that is why the alpha is
-read only behind `iorInAlpha`.
+read only behind `overrideIor=false` (the override defaults to true, and the
+editor forces it while the texture has no alpha channel).
 
 A texture is sampled only when its slot has `enabled=true`, a non-empty valid
 runtime path, and the corresponding positive `override*` flag is false.
@@ -354,7 +380,7 @@ assignments are:
 | 8 | `EmissiveTexture` | enabled, valid `primaryEmissive` path |
 | 9 | `NormalCurvature` | bit 1 and `alphaCarries="Curvature"` |
 | 10 | `RmaosPorosity` | bit 3 and `alphaCarries="Porosity"` |
-| 26 | `SpecularIorTexture` | enabled, valid `primarySpecularColor` path, and `iorInAlpha=true` |
+| 26 | `SpecularIorTexture` | enabled, valid `primarySpecularColor` path, and `overrideIor=false` |
 | 27 | `NormalConeMap` | bit 1 and `alphaCarries="Cone Map"` (reserved; no consumer yet) |
 
 Bits 11-24 were taken by later runtime slices for per-channel base/normal/
@@ -400,7 +426,7 @@ runtime-unsupported.
 
 v4 and v5 read through in-memory migrations and save as v6. v5 constants
 migrate exactly (`specularWeight = min(f0 / 0.04, 1)`; an F0 above 0.04 moves
-its level into `Specular/ior`), while texture alphas authored as F0 or tint
+its level into `primarySpecularColor.ior`), while texture alphas authored as F0 or tint
 weight cannot: the loader marks them (`legacyF0Alpha`, `legacyTintAlpha`) for
 the editor's validation quick-fix or `pbrm migrate`, which rewrite the
 textures beside a `.v5.bak` (PBRM-v6-Specular.md section 4).

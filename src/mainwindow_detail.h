@@ -49,6 +49,12 @@ inline FieldSpec choiceField(const QString& key, const QString& label, const QSt
     return field;
 }
 
+inline FieldSpec enabledWhen(FieldSpec field, const QString& key, const QStringList& values)
+{
+    field.enabledByKey = key; field.enabledByValues = values;
+    return field;
+}
+
 inline FieldSpec textField(const QString& key, const QString& label, const QString& value, const QString& tooltip)
 {
     FieldSpec field;

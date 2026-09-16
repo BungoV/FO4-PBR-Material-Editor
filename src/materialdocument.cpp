@@ -127,6 +127,8 @@ double specularIorForF0(double f0)
 void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersion, bool primarySet)
 {
     if (!set) return;
+    Q_UNUSED(settings);
+    double pendingIor = 0.0; // v5 constant F0 above 0.04: its level becomes the slot's IOR
     for (auto it = set->begin(); it != set->end(); ++it) {
         if (!it.value().isObject()) continue;
         QJsonObject slot = it.value().toObject();
@@ -143,12 +145,8 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
                 const double f0 = values.value(QStringLiteral("f0")).toDouble(0.04);
                 values.remove(QStringLiteral("f0"));
                 values.insert(QStringLiteral("specularWeight"), std::min(f0 / 0.04, 1.0));
-                if (f0 > 0.04 && primarySet && key == QLatin1String("primaryRmaos") && settings) {
-                    QJsonObject specular = settings->value(QStringLiteral("Specular")).toObject();
-                    if (!specular.contains(QStringLiteral("ior")))
-                        specular.insert(QStringLiteral("ior"), specularIorForF0(f0));
-                    settings->insert(QStringLiteral("Specular"), specular);
-                }
+                if (f0 > 0.04 && primarySet && key == QLatin1String("primaryRmaos"))
+                    pendingIor = specularIorForF0(f0);
                 changed = true;
             }
             if (hadOverrideF0) {
@@ -174,8 +172,15 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
             changed = true;
         }
         if (key.endsWith(QStringLiteral("SpecularColor")) && schemaVersion < 6 && enabledWithPath
-            && !values.contains(QStringLiteral("iorInAlpha"))) {
+            && !values.contains(QStringLiteral("iorInAlpha")) && !values.contains(QStringLiteral("overrideIor"))) {
             values.insert(QStringLiteral("legacyTintAlpha"), true);
+            changed = true;
+        }
+        // First v6 cut declared the IOR map with iorInAlpha; the slot now uses
+        // the editor-wide override pattern (overrideIor, checked = constant).
+        if (key.endsWith(QStringLiteral("SpecularColor")) && values.contains(QStringLiteral("iorInAlpha"))) {
+            values.insert(QStringLiteral("overrideIor"), !values.value(QStringLiteral("iorInAlpha")).toBool(false));
+            values.remove(QStringLiteral("iorInAlpha"));
             changed = true;
         }
         if (changed) {
@@ -183,6 +188,122 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
             it.value() = slot;
         }
     }
+    if (pendingIor > 0.0) {
+        QJsonObject slot = set->value(QStringLiteral("primarySpecularColor")).toObject();
+        QJsonObject values = slot.value(QStringLiteral("values")).toObject();
+        if (!values.contains(QStringLiteral("ior"))) {
+            values.insert(QStringLiteral("ior"), pendingIor);
+            if (!slot.contains(QStringLiteral("enabled"))) slot.insert(QStringLiteral("enabled"), false);
+            if (!slot.contains(QStringLiteral("expanded"))) slot.insert(QStringLiteral("expanded"), true);
+            if (!slot.contains(QStringLiteral("path"))) slot.insert(QStringLiteral("path"), QString());
+            slot.insert(QStringLiteral("values"), values);
+            set->insert(QStringLiteral("primarySpecularColor"), slot);
+        }
+    }
+}
+
+// v6 feature parameters live on the feature's texture slot (bungo 2026-09-16:
+// one place per feature, the texture that drives it). The Shading-page
+// setting groups of the v5 era and the first v6 cut move into the primary
+// slot's values. Idempotent: a document without a legacy group is untouched,
+// so slot-form documents round-trip exactly (golden fixtures).
+void migrateV6FeatureParams(QJsonObject* uv0, QJsonObject* settings, ShaderMode shaderMode)
+{
+    if (!uv0 || !settings) return;
+    struct Move { const char* group; const char* from; const char* slot; const char* to; };
+    static const Move moves[] = {
+        {"Specular", "ior", "primarySpecularColor", "ior"},
+        {"Specular", "iorMax", "primarySpecularColor", "iorMax"},
+        {"Shading/Subsurface", "mode", "primarySubsurface", "mode"},
+        {"Shading/Subsurface", "profile", "primarySubsurface", "profile"},
+        {"Shading/Subsurface", "customScatterColor", "primarySubsurface", "customScatterColor"},
+        {"Shading/Subsurface", "customRadiusR", "primarySubsurface", "customRadiusR"},
+        {"Shading/Subsurface", "customRadiusG", "primarySubsurface", "customRadiusG"},
+        {"Shading/Subsurface", "customRadiusB", "primarySubsurface", "customRadiusB"},
+        {"Shading/Subsurface", "weight", "primarySubsurface", "weight"},
+        {"Shading/Subsurface", "transmission", "primarySubsurface", "transmission"},
+        {"Shading/Subsurface", "transmissionTint", "primarySubsurface", "transmissionTint"},
+        {"Shading/SurfaceEffects", "sheenStrength", "primarySurfaceEffects", "sheenStrength"},
+        {"Shading/SurfaceEffects", "sheenRoughness", "primarySurfaceEffects", "sheenRoughness"},
+        {"Shading/SurfaceEffects", "glintIntensity", "primarySurfaceEffects", "glintIntensity"},
+        {"Shading/SurfaceEffects", "glintScale", "primarySurfaceEffects", "glintScale"},
+        {"Shading/SurfaceEffects", "filmIor", "primarySurfaceEffects", "filmIor"},
+        {"Shading/SurfaceEffects", "iridescenceStrength", "primarySurfaceEffects", "iridescenceStrength"},
+        {"Shading/SurfaceEffects", "retroStrength", "primarySurfaceEffects", "retroStrength"},
+        {"Shading/SurfaceEffects", "retroWidth", "primarySurfaceEffects", "retroWidth"},
+        {"Shading/Hair", "direction", "primaryHairDirection", "direction"},
+        {"Shading/Hair", "primaryStrength", "primaryHairDirection", "primaryStrength"},
+        {"Shading/Hair", "primaryRoughness", "primaryHairDirection", "primaryRoughness"},
+        {"Shading/Hair", "primaryShift", "primaryHairDirection", "primaryShift"},
+        {"Shading/Hair", "secondaryStrength", "primaryHairDirection", "secondaryStrength"},
+        {"Shading/Hair", "secondaryRoughness", "primaryHairDirection", "secondaryRoughness"},
+        {"Shading/Hair", "secondaryShift", "primaryHairDirection", "secondaryShift"},
+        {"Shading/Hair", "scatter", "primaryHairScatter", "scatterStrength"},
+        {"Shading/Hair", "backlight", "primaryHairScatter", "backlightStrength"},
+        {"Shading/Hair", "tint", "primaryHairScatter", "tint"},
+        {"Shading/Glass", "ior", "primaryTransmissionAbsorption", "ior"},
+        {"Shading/Glass", "absorptionDistance", "primaryTransmissionAbsorption", "absorptionDistance"},
+        {"Shading/Glass", "refractionRoughness", "primaryTransmissionAbsorption", "refractionRoughness"},
+        {"Shading/Glass", "thinWalled", "primaryTransmissionAbsorption", "thinWalled"},
+        {"Shading/Eye", "corneaIor", "primaryCornea", "ior"},
+        {"Shading/Eye", "wetness", "primaryCornea", "wetness"},
+        {"Shading/Eye", "irisDepth", "primaryIrisMasks", "irisDepth"},
+        {"Shading/Eye", "limbalStrength", "primaryIrisMasks", "limbalStrength"},
+        {"Shading/Eye", "pupilScale", "primaryIrisMasks", "pupilScale"},
+    };
+    const auto slotObject = [&](const QString& slotKey) {
+        QJsonObject slot = uv0->value(slotKey).toObject();
+        if (!slot.contains(QStringLiteral("enabled"))) slot.insert(QStringLiteral("enabled"), false);
+        if (!slot.contains(QStringLiteral("expanded"))) slot.insert(QStringLiteral("expanded"), true);
+        if (!slot.contains(QStringLiteral("path"))) slot.insert(QStringLiteral("path"), QString());
+        if (!slot.contains(QStringLiteral("values"))) slot.insert(QStringLiteral("values"), QJsonObject());
+        return slot;
+    };
+    for (const Move& move : moves) {
+        const QString group = QString::fromLatin1(move.group);
+        if (!settings->contains(group)) continue;
+        const QJsonObject values = settings->value(group).toObject();
+        const QString from = QString::fromLatin1(move.from);
+        if (!values.contains(from)) continue;
+        QJsonObject slot = slotObject(QString::fromLatin1(move.slot));
+        QJsonObject slotValues = slot.value(QStringLiteral("values")).toObject();
+        slotValues.insert(QString::fromLatin1(move.to), values.value(from));
+        slot.insert(QStringLiteral("values"), slotValues);
+        uv0->insert(QString::fromLatin1(move.slot), slot);
+    }
+    if (settings->contains(QStringLiteral("Shading/Subsurface"))) {
+        const QJsonObject group = settings->value(QStringLiteral("Shading/Subsurface")).toObject();
+        QJsonObject slot = slotObject(QStringLiteral("primarySubsurface"));
+        QJsonObject values = slot.value(QStringLiteral("values")).toObject();
+        // The v5 slot "thickness" and the page "thicknessScale" multiplied
+        // each other in the preview; the slot keeps the product.
+        if (group.contains(QStringLiteral("thicknessScale")))
+            values.insert(QStringLiteral("thickness"), group.value(QStringLiteral("thicknessScale")).toDouble(1.0)
+                * values.value(QStringLiteral("thickness")).toDouble(1.0));
+        // The mode's "Disabled" choice is now the slot checkbox.
+        const QString mode = group.value(QStringLiteral("mode")).toString();
+        if (mode == QLatin1String("Disabled")) {
+            values.remove(QStringLiteral("mode"));
+            slot.insert(QStringLiteral("enabled"), false);
+        } else if (shaderMode == ShaderMode::AdvancedSubsurface || shaderMode == ShaderMode::VegetationSurface) {
+            slot.insert(QStringLiteral("enabled"), true);
+        }
+        slot.insert(QStringLiteral("values"), values);
+        uv0->insert(QStringLiteral("primarySubsurface"), slot);
+    }
+    if (settings->contains(QStringLiteral("Shading/SurfaceEffects"))) {
+        const QJsonObject group = settings->value(QStringLiteral("Shading/SurfaceEffects")).toObject();
+        bool lit = false;
+        for (const char* key : {"sheenStrength", "glintIntensity", "iridescenceStrength", "retroStrength"})
+            lit = lit || group.value(QString::fromLatin1(key)).toDouble(0.0) > 0.0;
+        if (lit) {
+            QJsonObject slot = slotObject(QStringLiteral("primarySurfaceEffects"));
+            slot.insert(QStringLiteral("enabled"), true);
+            uv0->insert(QStringLiteral("primarySurfaceEffects"), slot);
+        }
+    }
+    for (const char* group : {"Specular", "Shading/Subsurface", "Shading/SurfaceEffects", "Shading/Hair", "Shading/Glass", "Shading/Eye"})
+        settings->remove(QString::fromLatin1(group));
 }
 
 void migrateV4SurfaceData(QJsonObject* uv0, QJsonObject* uv1, QJsonObject* uv2, QJsonObject* settings)
@@ -610,6 +731,7 @@ bool MaterialDocument::fromJson(const QJsonObject& object, QString* error)
         migrateV5Specular(&landscape, &m_settings, schemaVersion, false);
         m_resources.insert(QStringLiteral("Landscape"), landscape);
     }
+    migrateV6FeatureParams(&m_uv0, &m_settings, m_shaderMode);
 	m_unknownRoot = object;
 	for (const QString& known : {
 	         QStringLiteral("schema"), QStringLiteral("schemaVersion"), QStringLiteral("shader"),

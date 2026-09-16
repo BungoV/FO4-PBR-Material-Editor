@@ -581,6 +581,21 @@ void TextureSlotWidget::updateChannelControls()
         m_channelMaster->setCheckState(overrideCount == 0 ? Qt::Unchecked
             : (overrideCount == channelCount ? Qt::Checked : Qt::PartiallyChecked));
     }
+    for (const FieldSpec& field : m_spec.fields) {
+        if (field.enabledByKey.isEmpty()) continue;
+        const FieldSpec* gate = nullptr;
+        for (const FieldSpec& candidate : m_spec.fields)
+            if (candidate.key == field.enabledByKey) { gate = &candidate; break; }
+        QString current = m_state.values.value(field.enabledByKey).toVariant().toString();
+        if (!m_state.values.contains(field.enabledByKey) && gate) current = gate->defaultValue.toVariant().toString();
+        const bool on = field.enabledByValues.contains(current);
+        if (QWidget* editor = m_fieldEditors.value(field.key)) {
+            editor->setEnabled(on);
+            editor->setToolTip(on ? field.tooltip
+                : tr("Inactive: %1 is not %2.").arg(gate ? gate->label : field.enabledByKey, field.enabledByValues.join(QStringLiteral(" / "))));
+        }
+        if (QLabel* label = m_fieldLabels.value(field.key)) label->setEnabled(on);
+    }
     if (auto* height = qobject_cast<QCheckBox*>(m_fieldEditors.value(QStringLiteral("heightInBlue")))) {
         const TextureImage::Diagnostics info = TextureImage::inspect(m_state.path, m_textureRoot);
         const bool hasTexture = !m_state.path.trimmed().isEmpty();
@@ -690,6 +705,7 @@ QWidget* TextureSlotWidget::createFieldEditor(const FieldSpec& field, const QJso
         editor->setCurrentIndex(index);
         connect(editor, &QComboBox::currentTextChanged, this, [this, key = field.key](const QString& text) {
             m_state.values.insert(key, text);
+            updateChannelControls();
             emitStateChanged();
         });
         return editor;

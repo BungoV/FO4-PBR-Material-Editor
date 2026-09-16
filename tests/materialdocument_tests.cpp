@@ -320,19 +320,25 @@ int main(int argc, char* argv[])
     }
 
     {
-        // SPECULAR COLOR. RMAOS alpha carries one grey dielectric F0, so a
-        // painted color is the only way to author a tinted dielectric
-        // reflection. It is map-driven with NO constants on purpose: the
-        // runtime needs one texture binding and no constant-buffer space, and
-        // a material that paints nothing is bit-exact the scalar path.
+        // SPECULAR COLOR + SPECULAR IOR. RMAOS alpha carries the specular
+        // weight, so a painted color is the only way to author a tinted
+        // dielectric reflection. The tint itself has no constants; the only
+        // values on the slot are the v6 specular IOR (bungo 2026-09-16: a
+        // feature's parameters sit on its texture input): the A override
+        // toggle, the IOR constant and the map ceiling. Values are sparse
+        // (defaults implicit), so an untouched slot with no map carries only
+        // the override toggle, forced on because no texture provides A.
         MainWindow specularWindow;
         const TextureSlotWidget* specularSlot = nullptr;
         for (const TextureSlotWidget* candidate : specularWindow.findChildren<TextureSlotWidget*>())
             if (candidate->key() == QStringLiteral("primarySpecularColor")) { specularSlot = candidate; break; }
         check(specularSlot != nullptr,
             QStringLiteral("the primary layer offers a specular color map"));
-        check(specularSlot && specularSlot->state().values.isEmpty(),
-            QStringLiteral("the specular color map has no constants: it is authored or it is absent"));
+        const QJsonObject specularValues = specularSlot ? specularSlot->state().values : QJsonObject();
+        check(specularSlot && specularValues.keys() == QStringList{QStringLiteral("overrideIor")}
+                && specularValues.value(QStringLiteral("overrideIor")).toBool(),
+            QStringLiteral("an untouched specular color input carries only the forced-on IOR override; the tint has no constants (%1)")
+                .arg(specularValues.keys().join(QLatin1Char(','))));
 
         QTemporaryDir specularDirectory;
         const QString specularTexture = QStringLiteral("plate_specular_color.png");
@@ -542,8 +548,9 @@ int main(int argc, char* argv[])
                 && !lowValues.contains(QStringLiteral("f0")) && !lowValues.contains(QStringLiteral("overrideF0"))
                 && !lowValues.contains(QStringLiteral("legacyF0Alpha")),
             QStringLiteral("v6: constant F0 0.02 becomes specular weight 0.5 at IOR 1.5 (exact)"));
-        check(!low.settingGroup(QStringLiteral("Specular")).contains(QStringLiteral("ior")),
-            QStringLiteral("v6: an F0 at or under 0.04 writes no material IOR"));
+        check(!low.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor")).values.contains(QStringLiteral("ior"))
+                && !low.settingGroup(QStringLiteral("Specular")).contains(QStringLiteral("ior")),
+            QStringLiteral("v6: an F0 at or under 0.04 writes no specular IOR"));
         check(low.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.value(QStringLiteral("alphaCarries")).toString() == QLatin1String("Curvature")
                 && !low.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.contains(QStringLiteral("curvatureInAlpha")),
             QStringLiteral("v6: curvatureInAlpha=true becomes the Curvature selector and the bool is gone"));
@@ -552,8 +559,67 @@ int main(int argc, char* argv[])
         Pbr::MaterialDocument high;
         check(high.fromJson(v5Root(5, constantHigh, QJsonObject(), false), &v6Error), QStringLiteral("v6: high constant loads"));
         check(qFuzzyCompare(high.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values.value(QStringLiteral("specularWeight")).toDouble(), 1.0)
-                && qFuzzyCompare(high.setting(QStringLiteral("Specular"), QStringLiteral("ior")).toDouble(), (1.0 + 0.4) / (1.0 - 0.4)),
-            QStringLiteral("v6: constant F0 0.16 becomes weight 1 at IOR 2.333 (exact)"));
+                && qFuzzyCompare(high.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor")).values.value(QStringLiteral("ior")).toDouble(), (1.0 + 0.4) / (1.0 - 0.4))
+                && high.settingGroup(QStringLiteral("Specular")).isEmpty(),
+            QStringLiteral("v6: constant F0 0.16 becomes weight 1 at IOR 2.333 on the specular colour input (exact)"));
+
+        // Feature parameters live on the feature's input (bungo 2026-09-16).
+        // The first v6 cut and v5 kept them in Shading-page setting groups;
+        // the loader moves them onto the primary slot and the groups vanish.
+        {
+            QJsonObject legacy = v5Root(6, QJsonObject{{QStringLiteral("specularWeight"), 1.0}}, QJsonObject(), true);
+            QJsonObject primary = legacy.value(QStringLiteral("primaryUv")).toObject();
+            QJsonObject specColor = primary.value(QStringLiteral("primarySpecularColor")).toObject();
+            specColor.insert(QStringLiteral("values"), QJsonObject{{QStringLiteral("iorInAlpha"), true}});
+            primary.insert(QStringLiteral("primarySpecularColor"), specColor);
+            primary.insert(QStringLiteral("primarySubsurface"), QJsonObject{{QStringLiteral("enabled"), false}, {QStringLiteral("expanded"), true},
+                {QStringLiteral("path"), QString()}, {QStringLiteral("values"), QJsonObject{{QStringLiteral("thickness"), 2.0}, {QStringLiteral("weight"), 0.25}}}});
+            legacy.insert(QStringLiteral("primaryUv"), primary);
+            legacy.insert(QStringLiteral("shader"), QStringLiteral("Advanced Subsurface"));
+            legacy.insert(QStringLiteral("settings"), QJsonObject{
+                {QStringLiteral("Specular"), QJsonObject{{QStringLiteral("ior"), 1.8}, {QStringLiteral("iorMax"), 5.0}}},
+                {QStringLiteral("Shading/Subsurface"), QJsonObject{{QStringLiteral("mode"), QStringLiteral("Combined")}, {QStringLiteral("profile"), QStringLiteral("Custom")},
+                    {QStringLiteral("weight"), 1.5}, {QStringLiteral("thicknessScale"), 3.0}}},
+                {QStringLiteral("Shading/SurfaceEffects"), QJsonObject{{QStringLiteral("sheenStrength"), 0.7}}},
+                {QStringLiteral("Shading/Hair"), QJsonObject{{QStringLiteral("scatter"), 1.25}, {QStringLiteral("primaryShift"), -0.1}}},
+                {QStringLiteral("Shading/Glass"), QJsonObject{{QStringLiteral("ior"), 1.52}, {QStringLiteral("thinWalled"), true}}},
+                {QStringLiteral("Shading/Eye"), QJsonObject{{QStringLiteral("corneaIor"), 1.4}, {QStringLiteral("pupilScale"), 1.3}}}});
+            Pbr::MaterialDocument moved;
+            check(moved.fromJson(legacy, &v6Error), QStringLiteral("v6: a document with Shading-page feature groups loads: %1").arg(v6Error));
+            const auto spec = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor")).values;
+            check(qFuzzyCompare(spec.value(QStringLiteral("ior")).toDouble(), 1.8) && qFuzzyCompare(spec.value(QStringLiteral("iorMax")).toDouble(), 5.0)
+                    && spec.contains(QStringLiteral("overrideIor")) && !spec.value(QStringLiteral("overrideIor")).toBool(true) && !spec.contains(QStringLiteral("iorInAlpha")),
+                QStringLiteral("v6: Specular/ior + iorMax move onto the specular colour input and iorInAlpha=true becomes overrideIor=false"));
+            const auto sss = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"));
+            check(sss.enabled && sss.values.value(QStringLiteral("mode")).toString() == QLatin1String("Combined")
+                    && sss.values.value(QStringLiteral("profile")).toString() == QLatin1String("Custom")
+                    && qFuzzyCompare(sss.values.value(QStringLiteral("weight")).toDouble(), 1.5)
+                    && qFuzzyCompare(sss.values.value(QStringLiteral("thickness")).toDouble(), 6.0),
+                QStringLiteral("v6: subsurface parameters move onto the input (page weight wins, thickness = scale x slot), and the input is enabled for a subsurface family"));
+            const auto fx = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySurfaceEffects"));
+            check(fx.enabled && qFuzzyCompare(fx.values.value(QStringLiteral("sheenStrength")).toDouble(), 0.7),
+                QStringLiteral("v6: a lit surface-effect strength enables the surface effects input"));
+            check(qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryHairScatter")).values.value(QStringLiteral("scatterStrength")).toDouble(), 1.25)
+                    && qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryHairDirection")).values.value(QStringLiteral("primaryShift")).toDouble(), -0.1)
+                    && qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryTransmissionAbsorption")).values.value(QStringLiteral("ior")).toDouble(), 1.52)
+                    && moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryTransmissionAbsorption")).values.value(QStringLiteral("thinWalled")).toBool(false)
+                    && qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryCornea")).values.value(QStringLiteral("ior")).toDouble(), 1.4)
+                    && qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryIrisMasks")).values.value(QStringLiteral("pupilScale")).toDouble(), 1.3),
+                QStringLiteral("v6: hair, glass and eye parameters land on their inputs (scatter/backlight renamed *Strength, corneaIor -> ior)"));
+            const QJsonObject settingsLeft = moved.toJson().value(QStringLiteral("settings")).toObject();
+            check(!settingsLeft.contains(QStringLiteral("Specular")) && !settingsLeft.contains(QStringLiteral("Shading/Subsurface"))
+                    && !settingsLeft.contains(QStringLiteral("Shading/SurfaceEffects")) && !settingsLeft.contains(QStringLiteral("Shading/Hair"))
+                    && !settingsLeft.contains(QStringLiteral("Shading/Glass")) && !settingsLeft.contains(QStringLiteral("Shading/Eye")),
+                QStringLiteral("v6: the retired setting groups are gone after the move"));
+            QJsonObject disabledSss = legacy;
+            QJsonObject disabledSettings = disabledSss.value(QStringLiteral("settings")).toObject();
+            disabledSettings.insert(QStringLiteral("Shading/Subsurface"), QJsonObject{{QStringLiteral("mode"), QStringLiteral("Disabled")}});
+            disabledSss.insert(QStringLiteral("settings"), disabledSettings);
+            Pbr::MaterialDocument off;
+            check(off.fromJson(disabledSss, &v6Error) && !off.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface")).enabled
+                    && !off.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface")).values.contains(QStringLiteral("mode")),
+                QStringLiteral("v6: subsurface mode Disabled becomes a disabled input"));
+        }
         check(high.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("None")) == QLatin1String("None"),
             QStringLiteral("v6: a normal without curvature gets the None selector"));
 
@@ -674,7 +740,11 @@ int main(int argc, char* argv[])
     document.setSetting(QStringLiteral("UV1/Composition"), QStringLiteral("constantCoverage"), 0.75);
     document.setSetting(QStringLiteral("Transparency/Composition"), QStringLiteral("mode"), QStringLiteral("Alpha Test"));
     document.setSetting(QStringLiteral("Transparency/Composition"), QStringLiteral("threshold"), 0.375);
-    document.setSetting(QStringLiteral("Shading/Subsurface"), QStringLiteral("customRadiusR"), 1.25);
+    {
+        Pbr::TextureSlotState subsurfaceSlot = document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"));
+        subsurfaceSlot.values.insert(QStringLiteral("customRadiusR"), 1.25);
+        document.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"), subsurfaceSlot);
+    }
     document.setSetting(QStringLiteral("Shading/BottleLiquid"), QStringLiteral("enabled"), true);
     document.setSetting(QStringLiteral("Shading/BottleLiquid"), QStringLiteral("fillLevel"), 0.55);
     document.setSetting(QStringLiteral("DynamicNormals/Primary"), QStringLiteral("constantValue"), 0.625);
@@ -732,7 +802,7 @@ int main(int argc, char* argv[])
     check(loaded.setting(QStringLiteral("Transparency/Composition"), QStringLiteral("mode")).toString() == QStringLiteral("Alpha Test")
         && loaded.setting(QStringLiteral("Transparency/Composition"), QStringLiteral("threshold")).toDouble() == 0.375,
         QStringLiteral("transparency preview settings survive save/load"));
-    check(loaded.setting(QStringLiteral("Shading/Subsurface"), QStringLiteral("customRadiusR")).toDouble() == 1.25
+    check(loaded.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface")).values.value(QStringLiteral("customRadiusR")).toDouble() == 1.25
         && loaded.setting(QStringLiteral("DynamicNormals/Primary"), QStringLiteral("constantValue")).toDouble() == 0.625,
         QStringLiteral("custom profile and constant-driver values survive save/load"));
     check(loaded.setting(QStringLiteral("Shading/BottleLiquid"), QStringLiteral("enabled")).toBool()
@@ -1836,7 +1906,11 @@ int main(int argc, char* argv[])
         // enough: the authored scatter colour and transmissive scale have to
         // land in the document, or the conversion picks a subsurface material
         // and then ships it with default scattering.
-        const QString subsurfaceGroup = QStringLiteral("Shading/Subsurface");
+        // v6: the values live on the primarySubsurface input, which the
+        // conversion enables so the feature is on without a map.
+        const auto sssValue = [](const Pbr::MaterialDocument& doc, const QString& key) {
+            return doc.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface")).values.value(key);
+        };
         Bgsm::Material thin;
         thin.version = 20;
         thin.translucency = true;
@@ -1848,13 +1922,15 @@ int main(int argc, char* argv[])
         QStringList thinUnhonored;
         Converter::mapParameters(thin, &thinConverted, &thinUnhonored);
         check(thinConverted.shaderMode() == Pbr::ShaderMode::AdvancedSubsurface
-                && thinConverted.setting(subsurfaceGroup, QStringLiteral("mode")).toString()
+                && sssValue(thinConverted, QStringLiteral("mode")).toString()
                     == QStringLiteral("Thin Transmission"),
             QStringLiteral("a thin FO76 translucency maps to Thin Transmission"));
-        check(std::abs(thinConverted.setting(subsurfaceGroup, QStringLiteral("transmission")).toDouble() - 1.75) < 1e-6,
+        check(thinConverted.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface")).enabled,
+            QStringLiteral("the conversion enables the subsurface input so the feature is on (v6: slot on = feature on)"));
+        check(std::abs(sssValue(thinConverted, QStringLiteral("transmission")).toDouble() - 1.75) < 1e-6,
             QStringLiteral("the authored transmissive scale reaches the document"));
-        check(thinConverted.setting(subsurfaceGroup, QStringLiteral("profile")).toString() == QStringLiteral("Custom")
-                && QColor(thinConverted.setting(subsurfaceGroup, QStringLiteral("customScatterColor")).toString()).isValid(),
+        check(sssValue(thinConverted, QStringLiteral("profile")).toString() == QStringLiteral("Custom")
+                && QColor(sssValue(thinConverted, QStringLiteral("customScatterColor")).toString()).isValid(),
             QStringLiteral("an authored subsurface colour becomes a Custom diffusion profile"));
         check(thinUnhonored.join(QStringLiteral(";")).contains(QStringLiteral("Turbulence")),
             QStringLiteral("turbulence has no equivalent and is recorded as unhonored"));
@@ -1865,9 +1941,9 @@ int main(int argc, char* argv[])
         thick.translucencyThickObject = true;
         Pbr::MaterialDocument thickConverted;
         Converter::mapParameters(thick, &thickConverted, nullptr);
-        check(thickConverted.setting(subsurfaceGroup, QStringLiteral("mode")).toString() == QStringLiteral("Combined"),
+        check(sssValue(thickConverted, QStringLiteral("mode")).toString() == QStringLiteral("Combined"),
             QStringLiteral("a thick FO76 translucency scatters through the volume too"));
-        check(thickConverted.setting(subsurfaceGroup, QStringLiteral("profile"), QStringLiteral("Skin")).toString()
+        check(sssValue(thickConverted, QStringLiteral("profile")).toString(QStringLiteral("Skin"))
                 == QStringLiteral("Skin"),
             QStringLiteral("a default white subsurface colour leaves the stock profile alone"));
 
@@ -1879,9 +1955,9 @@ int main(int argc, char* argv[])
         fo4Sss.subsurfaceLightingRolloff = 0.3f;
         Pbr::MaterialDocument fo4SssConverted;
         Converter::mapParameters(fo4Sss, &fo4SssConverted, nullptr);
-        check(fo4SssConverted.setting(subsurfaceGroup, QStringLiteral("mode")).toString()
+        check(sssValue(fo4SssConverted, QStringLiteral("mode")).toString()
                     == QStringLiteral("Diffusion Profile")
-                && std::abs(fo4SssConverted.setting(subsurfaceGroup, QStringLiteral("weight")).toDouble() - 1.0) < 1e-6,
+                && std::abs(sssValue(fo4SssConverted, QStringLiteral("weight")).toDouble() - 1.0) < 1e-6,
             QStringLiteral("FO4 subsurface lighting maps to a diffusion profile at neutral weight"));
 
         // FO76 packs a subsurface mask into _l.B and a glow mask into _l.A.
@@ -1946,7 +2022,7 @@ int main(int argc, char* argv[])
         plain.version = 20;
         Pbr::MaterialDocument plainConverted;
         Converter::mapParameters(plain, &plainConverted, nullptr);
-        check(plainConverted.setting(subsurfaceGroup, QStringLiteral("mode"), QString()).toString().isEmpty(),
+        check(sssValue(plainConverted, QStringLiteral("mode")).toString().isEmpty(),
             QStringLiteral("a material without subsurface data gets no subsurface settings"));
     }
 

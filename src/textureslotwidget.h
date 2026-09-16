@@ -36,6 +36,11 @@ struct FieldSpec {
     // Settings-card fields only: editing this field rebuilds the workspace so
     // gated/compact cards and derived titles refresh (queued, scroll-preserving).
     bool rebuildOnChange = false;
+    // Slot fields only: the editor is enabled while the sibling field
+    // `enabledByKey` holds one of `enabledByValues` (e.g. custom diffusion
+    // radii behind Profile = Custom). Empty = always enabled.
+    QString enabledByKey;
+    QStringList enabledByValues;
 };
 
 inline FieldSpec withRebuild(FieldSpec field) { field.rebuildOnChange = true; return field; }

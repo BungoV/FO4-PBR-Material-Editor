@@ -60,7 +60,10 @@
         "overrideScatterTint": false,
         "scatterTint": "#C46A5A",
         "weight": 0.6,
-        "thickness": 2.0
+        "thickness": 2.0,
+        "mode": "Combined",
+        "profile": "Skin",
+        "transmission": 1.5
       }
     },
     "primarySurfaceEffects": {
@@ -71,7 +74,9 @@
         "overrideSheen": true,
         "sheenFallback": 0.2,
         "overrideGlints": true,
-        "glintsFallback": 0.0
+        "glintsFallback": 0.0,
+        "sheenStrength": 0.75,
+        "sheenRoughness": 0.6
       }
     }
   },
@@ -92,15 +97,5 @@
     }
   },
   "resources": {},
-  "settings": {
-    "Shading/Subsurface": {
-      "mode": "Combined",
-      "profile": "Skin",
-      "transmission": 1.5
-    },
-    "Shading/SurfaceEffects": {
-      "sheenStrength": 0.75,
-      "sheenRoughness": 0.6
-    }
-  }
+  "settings": {}
 }

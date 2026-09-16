@@ -564,7 +564,6 @@ QWidget* MainWindow::createSettingEditor(const QString& section, const FieldSpec
                 || (section == QStringLiteral("Geometry/Source") && key == QStringLiteral("source"))
                 || section == QStringLiteral("Transparency/Composition")
                 || (section == QStringLiteral("Transparency/Depth") && key == QStringLiteral("sort"))
-                || section == QStringLiteral("Shading/Subsurface")
                 || section.startsWith(QStringLiteral("DynamicNormals/"))
                 || section == QStringLiteral("Vegetation/Profile")
                 || section == QStringLiteral("UV1/Composition")
@@ -609,13 +608,6 @@ QWidget* MainWindow::createShadingPage()
             toggleField("exposure", "Apply scene exposure", true, "Passes the unlit result through scene exposure and tone mapping.")
         });
     } else {
-        // v6 specular model: the IOR scalar is the fallback when no IOR map is
-        // declared on the specular colour slot; the ceiling is what texel 255
-        // of such a map means. Raising the ceiling rescales the whole map.
-        addSettingsCard(page.content, QStringLiteral("Specular"), tr("Specular"), {
-            numberField("ior", "Specular IOR", 1.5, 0.0, 100.0, 0.001, "OpenPBR specular_ior. 1.5 is the dielectric default (F0 0.04); 0 makes the specular color the reflectance outright. Ignored where the specular color map declares an IOR alpha."),
-            numberField("iorMax", "IOR map ceiling", 4.25, 0.01, 100.0, 0.01, "The IOR that texel 255 of an IOR map stands for. 4.25 puts IOR 1.5 exactly on texel 90.")
-        });
         addSettingsCard(page.content, QStringLiteral("Shading/Core"), tr("Core shading"), {
             choiceField("normalSpace", "Normal space", "Tangent", {"Tangent", "Model", "World"}, "Space used to decode the primary normal."),
             numberField("normalStrength", "Final normal multiplier", 1.0, 0.0, 8.0, 0.01, "Final multiplier applied after every texture-specific normal strength."),
@@ -628,26 +620,7 @@ QWidget* MainWindow::createShadingPage()
             m_document.setting(QStringLiteral("Shading/Core"), QStringLiteral("specularAa"), true).toBool());
     }
 
-    if (mode == Pbr::ShaderMode::HairSurface || mode == Pbr::ShaderMode::AllFeatures) {
-        addSettingsCard(page.content, QStringLiteral("Shading/Hair"), tr("Hair lobes"), {
-            choiceField("direction", "Direction source", "Hair Direction RG", {"Hair Direction RG", "Mesh Tangent"}, "Strand direction around which highlights stretch."),
-            numberField("primaryStrength", "Primary strength", 1.0, 0.0, 8.0, 0.01, "Strength of the sharp primary hair highlight."),
-            numberField("primaryRoughness", "Primary roughness", 0.25, 0.0, 1.0, 0.005, "Width of the primary hair highlight."),
-            numberField("primaryShift", "Primary shift", -0.08, -1.0, 1.0, 0.002, "Moves the primary highlight along the strand direction."),
-            numberField("secondaryStrength", "Secondary strength", 0.5, 0.0, 8.0, 0.01, "Strength of the broad colored secondary highlight."),
-            numberField("secondaryRoughness", "Secondary roughness", 0.45, 0.0, 1.0, 0.005, "Width of the secondary highlight."),
-            numberField("secondaryShift", "Secondary shift", 0.12, -1.0, 1.0, 0.002, "Moves the secondary highlight along the strand direction."),
-            numberField("scatter", "Scatter", 0.5, 0.0, 4.0, 0.01, "Light scattered through the hair fiber volume."),
-            numberField("backlight", "Backlight", 0.5, 0.0, 4.0, 0.01, "Transmission visible when light is behind hair cards.")
-        });
-    }
     if (mode == Pbr::ShaderMode::GlassSurface || mode == Pbr::ShaderMode::AllFeatures) {
-        addSettingsCard(page.content, QStringLiteral("Shading/Glass"), tr("Glass transmission"), {
-            numberField("ior", "Index of refraction", 1.5, 1.0, 3.0, 0.001, "Physical glass IOR."),
-            numberField("absorptionDistance", "Absorption distance", 1.0, 0.0001, 100000.0, 0.01, "World-space distance at which the authored absorption color is reached."),
-            numberField("refractionRoughness", "Refraction roughness", 0.0, 0.0, 1.0, 0.005, "Blurs transmitted scene radiance."),
-            toggleField("thinWalled", "Thin walled", false, "Treats geometry as an infinitely thin sheet when thickness is unavailable.")
-        });
         addSettingsCard(page.content, QStringLiteral("Shading/BottleLiquid"), tr("Bottle liquid"), {
             toggleField("enabled", "Liquid in the container", false, "Fakes liquid with a clipped fill plane, sloshing spring, meniscus, and depth absorption — no fluid simulation. The runtime drives the slosh from object motion; the preview reacts to the Object Transform controls."),
             numberField("fillLevel", "Fill level", 0.6, 0.0, 1.0, 0.005, "Liquid height as a fraction of the mesh bounds."),
@@ -668,48 +641,6 @@ QWidget* MainWindow::createShadingPage()
             numberField("scattering", "Scattering", 0.25, 0.0, 10.0, 0.01, "Light redirected through suspended material."),
             numberField("reflectionStrength", "Reflection strength", 1.0, 0.0, 4.0, 0.01, "Scales environment and screen-space reflection."),
             toggleField("shoreFoam", "Shore foam", true, "Generates foam from water/scene depth intersections.")
-        });
-    }
-    if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || mode == Pbr::ShaderMode::VegetationSurface || mode == Pbr::ShaderMode::AllFeatures) {
-        addSettingsCard(page.content, QStringLiteral("Shading/Subsurface"), tr("Subsurface and transmission"), {
-            choiceField("mode", "Mode", mode == Pbr::ShaderMode::VegetationSurface ? "Thin Transmission" : "Diffusion Profile", {"Disabled", "Diffusion Profile", "Thin Transmission", "Combined"}, "Selects thick diffusion, thin transmission, or both."),
-            choiceField("profile", "Diffusion profile", "Skin", {"Skin", "Wax", "Flesh", "Plant", "Custom"}, "Profile defining wavelength-dependent scatter radius."),
-            colorField("customScatterColor", "Custom scatter color", "#FFB39D", "Wavelength tint used when Diffusion profile is Custom."),
-            numberField("customRadiusR", "Custom radius R", 1.0, 0.001, 1000.0, 0.01, "Red-channel diffusion radius for a Custom profile."),
-            numberField("customRadiusG", "Custom radius G", 0.35, 0.001, 1000.0, 0.01, "Green-channel diffusion radius for a Custom profile."),
-            numberField("customRadiusB", "Custom radius B", 0.2, 0.001, 1000.0, 0.01, "Blue-channel diffusion radius for a Custom profile."),
-            numberField("weight", "Scatter weight", 1.0, 0.0, 4.0, 0.01, "Scales profile-driven scattering."),
-            numberField("transmission", "Transmission", 0.0, 0.0, 4.0, 0.01, "Scales light passing through the surface."),
-            colorField("transmissionTint", "Transmission tint", "#FFFFFF", "Multiplies the sampled scatter color for the thin-transmission lobe only, so backlight can be tinted independently of diffusion (e.g. a warm leaf backlight over green diffusion)."),
-            numberField("thicknessScale", "Thickness scale", 1.0, 0.0, 1000.0, 0.01, "Scales texture or mesh thickness.")
-        });
-        const bool custom = m_document.setting(QStringLiteral("Shading/Subsurface"), QStringLiteral("profile"), QStringLiteral("Skin")).toString() == QStringLiteral("Custom");
-        setSettingEditorsEnabled(page.page, QStringLiteral("Shading/Subsurface"),
-            {QStringLiteral("customScatterColor"), QStringLiteral("customRadiusR"), QStringLiteral("customRadiusG"), QStringLiteral("customRadiusB")}, custom);
-        const QString subsurfaceMode = m_document.setting(QStringLiteral("Shading/Subsurface"), QStringLiteral("mode"),
-            mode == Pbr::ShaderMode::VegetationSurface ? QStringLiteral("Thin Transmission") : QStringLiteral("Diffusion Profile")).toString();
-        setSettingEditorsEnabled(page.page, QStringLiteral("Shading/Subsurface"), {QStringLiteral("transmissionTint")},
-            subsurfaceMode == QStringLiteral("Thin Transmission") || subsurfaceMode == QStringLiteral("Combined"));
-    }
-    if (mode == Pbr::ShaderMode::EyeSurface || mode == Pbr::ShaderMode::AllFeatures) {
-        addSettingsCard(page.content, QStringLiteral("Shading/Eye"), tr("Cornea and iris"), {
-            numberField("corneaIor", "Cornea IOR", 1.376, 1.0, 2.0, 0.001, "Physical cornea index of refraction."),
-            numberField("irisDepth", "Iris depth", 0.08, 0.0, 1.0, 0.001, "Distance of the iris below the cornea."),
-            numberField("limbalStrength", "Limbal strength", 1.0, 0.0, 4.0, 0.01, "Dark ring around the outside of the iris."),
-            numberField("pupilScale", "Pupil scale", 1.0, 0.0, 4.0, 0.01, "Runtime-controllable pupil dilation."),
-            numberField("wetness", "Wet reflection", 1.0, 0.0, 4.0, 0.01, "Strength of the clear wet outer lobe.")
-        });
-    }
-    if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AllFeatures) {
-        addSettingsCard(page.content, QStringLiteral("Shading/SurfaceEffects"), tr("Sheen, glints, and iridescence"), {
-            numberField("sheenStrength", "Sheen strength", 0.0, 0.0, 8.0, 0.01, "Grazing fabric/fuzz reflection masked by Surface Effects R."),
-            numberField("sheenRoughness", "Sheen roughness", 0.6, 0.0, 1.0, 0.005, "Width of the sheen lobe."),
-            numberField("glintIntensity", "Glint intensity", 0.0, 0.0, 100.0, 0.01, "Sparse microfacet sparkle masked by Surface Effects G."),
-            numberField("glintScale", "Glint scale", 1.0, 0.001, 10000.0, 0.01, "Spatial frequency of procedural glints."),
-            numberField("filmIor", "Thin-film IOR", 1.5, 1.0, 3.0, 0.001, "IOR of the iridescent thin film."),
-            numberField("iridescenceStrength", "Iridescence strength", 0.0, 0.0, 4.0, 0.01, "Angle-dependent thin-film interference masked by Surface Effects A."),
-            numberField("retroStrength", "Retroreflection", 0.0, 0.0, 8.0, 0.01, "Bounces light back toward its source (road signs, safety tape, cat-eye markers). Strongest when the viewer is near the light, e.g. a Pip-Boy lamp at night."),
-            numberField("retroWidth", "Retroreflection width", 0.25, 0.0, 1.0, 0.005, "Angular width of the retroreflective lobe.")
         });
     }
     page.content->addStretch();
@@ -1542,15 +1473,13 @@ void MainWindow::applyMaterialTemplate(const QString& templateName)
     } else if (templateName == QStringLiteral("Glass")) {
         m_document.setShaderMode(Pbr::ShaderMode::GlassSurface);
         setSlot(QStringLiteral("UV0"), QStringLiteral("primaryTransmissionAbsorption"), true,
-            {{"absorption", QStringLiteral("#EAF7FF")}, {"thickness", 1.0}});
-        m_document.setSetting(QStringLiteral("Shading/Glass"), QStringLiteral("ior"), 1.5);
+            {{"absorption", QStringLiteral("#EAF7FF")}, {"thickness", 1.0}, {"ior", 1.5}});
         m_document.setSetting(QStringLiteral("Transparency/Composition"), QStringLiteral("mode"), QStringLiteral("Physical Transmission"));
     } else if (templateName == QStringLiteral("Skin")) {
         m_document.setShaderMode(Pbr::ShaderMode::AdvancedSubsurface);
         setSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"), true,
-            {{"scatterTint", QStringLiteral("#F2A38F")}, {"weight", 0.8}, {"thickness", 1.0}});
-        m_document.setSetting(QStringLiteral("Shading/Subsurface"), QStringLiteral("mode"), QStringLiteral("Combined"));
-        m_document.setSetting(QStringLiteral("Shading/Subsurface"), QStringLiteral("profile"), QStringLiteral("Skin"));
+            {{"scatterTint", QStringLiteral("#F2A38F")}, {"weight", 0.8}, {"thickness", 1.0},
+                {"mode", QStringLiteral("Combined")}, {"profile", QStringLiteral("Skin")}});
     } else if (templateName == QStringLiteral("Vegetation")) {
         m_document.setShaderMode(Pbr::ShaderMode::VegetationSurface);
         setSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"), true,

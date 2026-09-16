@@ -50,7 +50,7 @@ QString specularPathFor(const QString& rmaosPath);
 // Rewrites the slot's RMAOS texture (and writes or extends the matching
 // specular colour map when an IOR map is needed), then clears the marker,
 // declares the alpha (overrideSpecularWeight = false, alphaCarries = Specular
-// Weight) and, if an IOR map was written, sets iorInAlpha on the colour slot.
+// Weight) and, if an IOR map was written, clears overrideIor on the colour slot.
 bool repackRmaosSlot(Pbr::MaterialDocument* document, const QString& setName, const QString& slotKey,
     const QString& textureRoot, QString* error);
 

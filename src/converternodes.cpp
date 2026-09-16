@@ -2409,7 +2409,7 @@ void registerAll(Registry& registry)
         // the source material nodes shade the untouched original.
         spec.materialPreview = QStringLiteral("output");
         spec.params = {floatParam("specularIor", "Specular IOR", 1.5, 0.0, 100.0, 0.001,
-            "OpenPBR specular_ior written to the material (Specular/ior). RMAOS.A is a 0-1 weight on the reflectance this sets: 1.5 is F0 0.04. The FO4 graph anchors its corpus median here.")};
+            "OpenPBR specular_ior written to the specular colour input (primarySpecularColor.ior). RMAOS.A is a 0-1 weight on the reflectance this sets: 1.5 is F0 0.04. The FO4 graph anchors its corpus median here.")};
         // Finished textures only. Packing lives in Combine Maps (PBR), so there is
         // exactly one route into every channel and nothing to arbitrate here.
         spec.inputs = {packedPort("baseColor", "BC", kBaseColorChannels),

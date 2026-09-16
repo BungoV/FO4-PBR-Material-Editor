@@ -154,8 +154,11 @@ bool repackRmaosSlot(Pbr::MaterialDocument* document, const QString& setName, co
     if (rmaos.isNull())
         return fail(error, QStringLiteral("%1/%2 cannot be loaded: %3").arg(setName, slotKey, loadError));
 
-    const double materialIor = document->setting(QStringLiteral("Specular"), QStringLiteral("ior"), 1.5).toDouble();
-    const double iorMax = document->setting(QStringLiteral("Specular"), QStringLiteral("iorMax"), 4.25).toDouble();
+    // v6: the IOR scalar and ceiling live on this set's specular colour slot.
+    const Pbr::TextureSlotState iorSlot = document->textureSlot(setName,
+        slotKey.left(slotKey.size() - QStringLiteral("Rmaos").size()) + QStringLiteral("SpecularColor"));
+    const double materialIor = iorSlot.values.value(QStringLiteral("ior")).toDouble(1.5);
+    const double iorMax = iorSlot.values.value(QStringLiteral("iorMax")).toDouble(4.25);
 
     if (rmaos.hasAlphaChannel()) {
         const F0Repack repack = repackF0Alpha(rmaos, materialIor, iorMax);
@@ -186,7 +189,7 @@ bool repackRmaosSlot(Pbr::MaterialDocument* document, const QString& setName, co
             }
             spec = withAlpha(spec, repack.iorAlpha);
             if (!TextureWriter::saveDds(spec, specFile, TextureWriter::DdsFormat::Bc7Srgb, true, error)) return false;
-            specSlot.values.insert(QStringLiteral("iorInAlpha"), true);
+            specSlot.values.insert(QStringLiteral("overrideIor"), false);
             specSlot.values.remove(QStringLiteral("legacyTintAlpha"));
             document->setTextureSlot(setName, specKey, specSlot);
         }
@@ -212,13 +215,13 @@ bool bakeTintSlot(Pbr::MaterialDocument* document, const QString& setName, const
     const QImage spec = TextureImage::load(specSlot.path, textureRoot, &loadError);
     if (spec.isNull())
         return fail(error, QStringLiteral("%1/%2 cannot be loaded: %3").arg(setName, slotKey, loadError));
-    const double materialIor = document->setting(QStringLiteral("Specular"), QStringLiteral("ior"), 1.5).toDouble();
-    const double iorMax = document->setting(QStringLiteral("Specular"), QStringLiteral("iorMax"), 4.25).toDouble();
+    const double materialIor = specSlot.values.value(QStringLiteral("ior")).toDouble(1.5);
+    const double iorMax = specSlot.values.value(QStringLiteral("iorMax")).toDouble(4.25);
     if (spec.hasAlphaChannel()) {
         if (!backup(specFile, error)) return false;
         if (!TextureWriter::saveDds(bakeTintAlpha(spec, materialIor, iorMax), specFile, TextureWriter::DdsFormat::Bc7Srgb, true, error))
             return false;
-        specSlot.values.insert(QStringLiteral("iorInAlpha"), true);
+        specSlot.values.insert(QStringLiteral("overrideIor"), false);
     }
     specSlot.values.remove(QStringLiteral("legacyTintAlpha"));
     document->setTextureSlot(setName, slotKey, specSlot);

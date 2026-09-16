@@ -585,7 +585,8 @@ since unlit base color already is the radiance.
 
 FO76 authors a translucency block (v≥8) and FO4 a simpler subsurface-lighting
 pair. Both select the Advanced Subsurface family, and both carry values that
-must reach `Shading/Subsurface` — selecting the family alone converts skin as a
+must reach the `primarySubsurface` input's values (v6: feature parameters live
+on the input, which the conversion enables) — selecting the family alone converts skin as a
 subsurface material with *default* scattering, which is what the pipeline used
 to do.
 

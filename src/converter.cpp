@@ -522,9 +522,6 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         rmaosSlot.path = QDir::toNativeSeparators(rmaosPortable);
         document.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos"), rmaosSlot);
     }
-    // v6: the reflectance level is the material's specular IOR; RMAOS.A only
-    // weighs it. Written even at the default so the file states its anchor.
-    document.setSetting(QStringLiteral("Specular"), QStringLiteral("ior"), double(converted.specularIor));
     if (!emissivePortable.isEmpty())
         wireSlot(&document, QStringLiteral("primaryEmissive"), emissivePortable,
             QJsonObject{{QStringLiteral("intensity"), double(std::max(material.emittanceMult, 0.0f))}});
@@ -545,6 +542,15 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         // the tint in. The slot has no constants, so there is nothing else to
         // write and nothing that can disagree with the runtime.
         wireSlot(&document, QStringLiteral("primarySpecularColor"), specularColorPortable, QJsonObject{});
+    }
+    {
+        // v6: the reflectance level is the specular IOR on the specular colour
+        // slot; RMAOS.A only weighs it. Written even at the default so the
+        // file states its anchor. The slot stays as wired (or disabled, no
+        // map): the scalar is read either way.
+        Pbr::TextureSlotState specularColorSlot = document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor"));
+        specularColorSlot.values.insert(QStringLiteral("ior"), double(converted.specularIor));
+        document.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor"), specularColorSlot);
     }
 
     // Review flags for the workspace queue.

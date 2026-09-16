@@ -165,7 +165,7 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
     }
 
     if (mode != Pbr::ShaderMode::LandscapeSurface || all) {
-        add(slot(prefix + "Normal", secondary ? tr("%1 Normal + Height").arg(layerName) : tr("Normal + Height"), "NRM", "Linear • RG normal / B optional height / A signed curvature", QColor(112, 112, 202), true,
+        add(slot(prefix + "Normal", secondary ? tr("%1 Normal + Height").arg(layerName) : tr("Normal + Height"), "NRM", "Linear • RG normal / B optional height / A curvature or cone map", QColor(112, 112, 202), true,
             QString(),
             "Tangent-space normal. Blue may contain parallax height; alpha may carry signed curvature baked with the normal (0.5 neutral, below = convex edges, above = concave cavities).", {
                 toggleField("overrideNormal", "RG • Tangent normal", true, "Checked replaces the sampled tangent normal with a constant."),
@@ -199,11 +199,13 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
         // the tint can only darken or hue-shift it. A material without the
         // map takes the material's IOR scalar and a white tint, which is the
         // scalar path bit for bit in the preview and the runtime alike.
-        add(slot(prefix + "SpecularColor", secondary ? tr("%1 Specular Color").arg(layerName) : tr("Specular Color"),
-            "SPEC", "sRGB • RGB specular tint / A specular IOR (optional)", QColor(128, 130, 156), false,
+        add(slot(prefix + "SpecularColor", secondary ? tr("%1 Specular Color + Specular IOR").arg(layerName) : tr("Specular Color + Specular IOR"),
+            "SPEC", "sRGB • RGB specular tint / A specular IOR", QColor(128, 130, 156), false,
             QString(),
-            "Tints the dielectric specular reflection (OpenPBR specular_color): RGB multiplies the reflectance the specular IOR and weight set, so white is no change and a color can only darken or shift the hue. Alpha, when declared below, is the specular IOR map over 0 to the material's IOR map ceiling (texel 90 of 255 is IOR 1.5 at the default ceiling 4.25, texel 0 makes the tint the reflectance outright); undeclared, the material's specular IOR scalar applies everywhere. Metals are untouched: their F0 is the base color.", {
-                toggleField("iorInAlpha", "A contains IOR", false, "Checked reads alpha as the specular IOR map and ignores the material's IOR scalar. Unchecked ignores alpha.")
+            "Tints the dielectric specular reflection (OpenPBR specular_color): RGB multiplies the reflectance the specular IOR and weight set, so white is no change and a color can only darken or shift the hue. Alpha is the specular IOR map over 0 to the IOR map ceiling (texel 90 of 255 is IOR 1.5 at the default ceiling 4.25, texel 0 makes the tint the reflectance outright) while its override is unchecked; otherwise the IOR override applies everywhere. Metals are untouched: their F0 is the base color.", {
+                toggleField("overrideIor", "A • Specular IOR", true, "Checked uses the constant specular IOR below everywhere. Unchecked reads the texture alpha as the IOR map; an opaque texture decodes alpha as 1, which would be the ceiling, so leave this checked unless the alpha was authored as IOR."),
+                numberField("ior", "Specular IOR override", 1.5, 0.0, 100.0, 0.001, "OpenPBR specular_ior. 1.5 is the dielectric default (F0 0.04); 0 makes the specular color the reflectance outright."),
+                numberField("iorMax", "IOR map ceiling", 4.25, 0.01, 100.0, 0.01, "The IOR that texel 255 of an IOR map stands for. 4.25 puts IOR 1.5 exactly on texel 90.")
             }));
     }
 
@@ -283,7 +285,7 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
     const bool usesSurfaceEffects = mode == Pbr::ShaderMode::StandardSurface || all;
     if (usesSurfaceEffects) {
         add(slot(prefix + "SurfaceEffects", tr("Surface Effects"), "FX", "Linear • R sheen / G glints / B film thickness / A iridescence", QColor(137, 91, 169), false, {},
-            "Packed masks for optional surface lobes. The Shading page controls their physical response.", {
+            "Packed masks for optional surface lobes and the lobes' physical response. The lobes are off while this input is disabled.", {
                 toggleField("overrideSheen", "R • Sheen", true, "Checked uses the constant sheen override."),
                 numberField("sheenFallback", "Sheen override", 0.0, 0.0, 1.0, 0.005, "Constant sheen mask when texture R is overridden or absent."),
                 toggleField("overrideGlints", "G • Glints", true, "Checked uses the constant glint override."),
@@ -291,7 +293,15 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 toggleField("overrideFilm", "B • Film thickness", true, "Checked uses the constant film-thickness override."),
                 numberField("filmFallback", "Film thickness override", 0.5, 0.0, 1.0, 0.005, "Thin-film thickness when texture B is overridden or absent."),
                 toggleField("overrideIridescence", "A • Iridescence", true, "Checked uses the constant iridescence override."),
-                numberField("iridescenceFallback", "Iridescence override", 0.0, 0.0, 1.0, 0.005, "Iridescence mask when texture A is overridden or absent.")
+                numberField("iridescenceFallback", "Iridescence override", 0.0, 0.0, 1.0, 0.005, "Iridescence mask when texture A is overridden or absent."),
+                numberField("sheenStrength", "Sheen strength", 0.0, 0.0, 8.0, 0.01, "Grazing fabric/fuzz reflection masked by R."),
+                numberField("sheenRoughness", "Sheen roughness", 0.6, 0.0, 1.0, 0.005, "Width of the sheen lobe."),
+                numberField("glintIntensity", "Glint intensity", 0.0, 0.0, 100.0, 0.01, "Sparse microfacet sparkle masked by G."),
+                numberField("glintScale", "Glint scale", 1.0, 0.001, 10000.0, 0.01, "Spatial frequency of procedural glints."),
+                numberField("filmIor", "Thin-film IOR", 1.5, 1.0, 3.0, 0.001, "IOR of the iridescent thin film."),
+                numberField("iridescenceStrength", "Iridescence strength", 0.0, 0.0, 4.0, 0.01, "Angle-dependent thin-film interference masked by A."),
+                numberField("retroStrength", "Retroreflection", 0.0, 0.0, 8.0, 0.01, "Bounces light back toward its source (road signs, safety tape, cat-eye markers). Strongest when the viewer is near the light, e.g. a Pip-Boy lamp at night."),
+                numberField("retroWidth", "Retroreflection width", 0.25, 0.0, 1.0, 0.005, "Angular width of the retroreflective lobe.")
             }));
     }
 
@@ -316,13 +326,21 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
 
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::VegetationSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || all) {
         add(slot(prefix + "Subsurface", tr("Subsurface Scattering / Transmission"), "SS", "Linear • RGB scatter tint / A thickness", QColor(202, 96, 91), false, {},
-            "Controls subsurface diffusion, thin transmission, or a combination depending on the shader.", {
+            "Subsurface diffusion, thin transmission, or both. The feature is on while this input is enabled, with or without a map.", {
                 toggleField("overrideScatterTint", "RGB • Scatter tint", true, "Checked replaces sampled scatter tint with a constant."),
                 colorField("scatterTint", "Scatter tint override", "#FFFFFF", "Constant scatter or transmission tint."),
                 toggleField("overrideThicknessValue", "A • Thickness", true, "Checked replaces sampled thickness with a constant."),
                 numberField("thicknessValue", "Thickness override", 1.0, 0.0, 1.0, 0.005, "Constant normalized thickness."),
-                numberField("weight", "Weight", 0.0, 0.0, 1.0, 0.005, "Overall scattering contribution."),
-                numberField("thickness", "Thickness scale", 1.0, 0.0, 100.0, 0.01, "Scales alpha-decoded thickness.")
+                choiceField("mode", "Mode", mode == Pbr::ShaderMode::VegetationSurface ? "Thin Transmission" : "Diffusion Profile", {"Diffusion Profile", "Thin Transmission", "Combined"}, "Thick diffusion, thin transmission, or both."),
+                choiceField("profile", "Diffusion profile", "Skin", {"Skin", "Wax", "Flesh", "Plant", "Custom"}, "Profile defining wavelength-dependent scatter radius."),
+                enabledWhen(colorField("customScatterColor", "Custom scatter color", "#FFB39D", "Wavelength tint used when Diffusion profile is Custom."), "profile", {"Custom"}),
+                enabledWhen(numberField("customRadiusR", "Custom radius R", 1.0, 0.001, 1000.0, 0.01, "Red-channel diffusion radius for a Custom profile."), "profile", {"Custom"}),
+                enabledWhen(numberField("customRadiusG", "Custom radius G", 0.35, 0.001, 1000.0, 0.01, "Green-channel diffusion radius for a Custom profile."), "profile", {"Custom"}),
+                enabledWhen(numberField("customRadiusB", "Custom radius B", 0.2, 0.001, 1000.0, 0.01, "Blue-channel diffusion radius for a Custom profile."), "profile", {"Custom"}),
+                numberField("weight", "Scatter weight", 1.0, 0.0, 4.0, 0.01, "Scales profile-driven scattering."),
+                numberField("transmission", "Transmission", 0.0, 0.0, 4.0, 0.01, "Scales light passing through the surface."),
+                enabledWhen(colorField("transmissionTint", "Transmission tint", "#FFFFFF", "Multiplies the sampled scatter color for the thin-transmission lobe only, so backlight can be tinted independently of diffusion (e.g. a warm leaf backlight over green diffusion)."), "mode", {"Thin Transmission", "Combined"}),
+                numberField("thickness", "Thickness scale", 1.0, 0.0, 1000.0, 0.01, "Scales the texture or constant thickness.")
             }));
     }
     if (mode == Pbr::ShaderMode::HairSurface || all) {
@@ -334,14 +352,23 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 numberField("lobeShift", "Lobe shift override", 0.5, 0.0, 1.0, 0.005, "Constant lobe-shift value."),
                 toggleField("overrideScatter", "A • Scatter", true, "Checked replaces sampled scatter with a constant."),
                 numberField("scatter", "Scatter override", 1.0, 0.0, 1.0, 0.005, "Constant scatter mask."),
-                numberField("strength", "Direction strength", 1.0, 0.0, 4.0, 0.01, "Blends from mesh tangent to texture-authored direction.")
+                numberField("strength", "Direction strength", 1.0, 0.0, 4.0, 0.01, "Blends from mesh tangent to texture-authored direction."),
+                choiceField("direction", "Direction source", "Hair Direction RG", {"Hair Direction RG", "Mesh Tangent"}, "Strand direction around which highlights stretch."),
+                numberField("primaryStrength", "Primary strength", 1.0, 0.0, 8.0, 0.01, "Strength of the sharp primary hair highlight."),
+                numberField("primaryRoughness", "Primary roughness", 0.25, 0.0, 1.0, 0.005, "Width of the primary hair highlight."),
+                numberField("primaryShift", "Primary shift", -0.08, -1.0, 1.0, 0.002, "Moves the primary highlight along the strand direction."),
+                numberField("secondaryStrength", "Secondary strength", 0.5, 0.0, 8.0, 0.01, "Strength of the broad colored secondary highlight."),
+                numberField("secondaryRoughness", "Secondary roughness", 0.45, 0.0, 1.0, 0.005, "Width of the secondary highlight."),
+                numberField("secondaryShift", "Secondary shift", 0.12, -1.0, 1.0, 0.002, "Moves the secondary highlight along the strand direction.")
             }));
         add(slot(prefix + "HairScatter", tr("Hair Scatter"), "HSS", "Linear • RGB scatter tint / A backlight mask", QColor(176, 116, 88), false, {},
             "Controls light passing through and around hair cards.", {
                 toggleField("overrideScatterTint", "RGB • Scatter tint", true, "Checked replaces sampled hair scatter tint with a constant."),
                 colorField("scatterTint", "Scatter tint override", "#8B5A3C", "Constant hair-fiber scatter tint."),
                 toggleField("overrideBacklight", "A • Backlight mask", true, "Checked replaces sampled backlight mask with a constant."),
-                numberField("backlight", "Backlight override", 1.0, 0.0, 1.0, 0.005, "Constant backlight mask.")
+                numberField("backlight", "Backlight override", 1.0, 0.0, 1.0, 0.005, "Constant backlight mask."),
+                numberField("scatterStrength", "Scatter", 0.5, 0.0, 4.0, 0.01, "Light scattered through the hair fiber volume."),
+                numberField("backlightStrength", "Backlight", 0.5, 0.0, 4.0, 0.01, "Transmission visible when light is behind hair cards.")
             }));
     }
     if (mode == Pbr::ShaderMode::GlassSurface || all) {
@@ -350,7 +377,11 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 toggleField("overrideAbsorption", "RGB • Absorption", true, "Checked replaces sampled absorption with a constant."),
                 colorField("absorption", "Absorption override", "#FFFFFF", "Constant Beer-Lambert absorption color."),
                 toggleField("overrideThickness", "A • Thickness", true, "Checked uses the constant optical-thickness override."),
-                numberField("thickness", "Thickness override", 1.0, 0.0, 1000.0, 0.01, "Constant thickness when texture alpha is overridden or unavailable.")
+                numberField("thickness", "Thickness override", 1.0, 0.0, 1000.0, 0.01, "Constant thickness when texture alpha is overridden or unavailable."),
+                numberField("ior", "Index of refraction", 1.5, 1.0, 3.0, 0.001, "Physical glass IOR."),
+                numberField("absorptionDistance", "Absorption distance", 1.0, 0.0001, 100000.0, 0.01, "World-space distance at which the authored absorption color is reached."),
+                numberField("refractionRoughness", "Refraction roughness", 0.0, 0.0, 1.0, 0.005, "Blurs transmitted scene radiance."),
+                toggleField("thinWalled", "Thin walled", false, "Treats geometry as an infinitely thin sheet when thickness is unavailable.")
             }));
         add(slot(prefix + "InteriorMap", tr("Interior Map"), "ROOM", "sRGB • Room cubemap RGB / A lit-window mask (DDS)", QColor(94, 118, 96), false, {},
             "Parallax cubemap rooms rendered behind the glass (building windows). The runtime projects a fake interior per window pane; the preview evaluates the same ray-box lookup. The cubemap's alpha marks self-lit interior areas that glow independently of scene lighting.", {
@@ -415,7 +446,10 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 toggleField("overridePupil", "B • Pupil mask", true, "Checked replaces sampled pupil mask with a constant."),
                 numberField("pupil", "Pupil mask override", 0.0, 0.0, 1.0, 0.005, "Constant pupil mask."),
                 toggleField("overrideCornea", "A • Cornea coverage", true, "Checked replaces sampled cornea coverage with a constant."),
-                numberField("cornea", "Cornea coverage override", 1.0, 0.0, 1.0, 0.005, "Constant wet-layer coverage.")
+                numberField("cornea", "Cornea coverage override", 1.0, 0.0, 1.0, 0.005, "Constant wet-layer coverage."),
+                numberField("irisDepth", "Iris depth", 0.08, 0.0, 1.0, 0.001, "Distance of the iris below the cornea."),
+                numberField("limbalStrength", "Limbal strength", 1.0, 0.0, 4.0, 0.01, "Dark ring around the outside of the iris."),
+                numberField("pupilScale", "Pupil scale", 1.0, 0.0, 4.0, 0.01, "Runtime-controllable pupil dilation.")
             }));
         add(slot(prefix + "Cornea", tr("Cornea"), "COR", "Linear • RG normal / B roughness / A coverage", QColor(87, 142, 168), true, {},
             "Clear wet outer lobe covering the iris and sclera.", {
@@ -424,7 +458,9 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 toggleField("overrideRoughness", "B • Cornea roughness", true, "Checked replaces sampled cornea roughness with a constant."),
                 numberField("roughness", "Cornea roughness override", 0.025, 0.0, 1.0, 0.001, "Constant outer wet-lobe roughness."),
                 toggleField("overrideCoverage", "A • Cornea coverage", true, "Checked replaces sampled cornea coverage with a constant."),
-                numberField("coverage", "Cornea coverage override", 1.0, 0.0, 1.0, 0.005, "Constant cornea coverage.")
+                numberField("coverage", "Cornea coverage override", 1.0, 0.0, 1.0, 0.005, "Constant cornea coverage."),
+                numberField("ior", "Cornea IOR", 1.376, 1.0, 2.0, 0.001, "Physical cornea index of refraction."),
+                numberField("wetness", "Wet reflection", 1.0, 0.0, 4.0, 0.01, "Strength of the clear wet outer lobe.")
             }));
     }
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::GlassSurface || mode == Pbr::ShaderMode::EyeSurface || all) {

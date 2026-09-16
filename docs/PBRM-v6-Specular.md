@@ -14,10 +14,10 @@ describes what ships.
 | `primaryRmaos` constant `f0` (default 0.04) | scalar F0 | renamed `specularWeight`, default 1 |
 | `primaryRmaos.alphaCarries` | `"Dielectric F0"` / `"Porosity"` | `"Specular Weight"` / `"Porosity"` |
 | `primarySpecularColor` RGB | sRGB tint on the dielectric Fresnel (doc row wrongly said linear) | unchanged, doc row corrected to sRGB |
-| `primarySpecularColor` A | tint coverage weight | `specular_ior` map, linear 0..`specularIorMax`, texel 255 = `specularIorMax`; read only when `iorInAlpha=true` |
-| `primarySpecularColor.iorInAlpha` | — | bool, default false |
-| material `specularIor` | — | float, default 1.5, range [0, inf). Used when no IOR map is read |
-| material `specularIorMax` | — | float, default 4.25, range (0, inf). What texel 255 of the IOR map means |
+| `primarySpecularColor` A | tint coverage weight | `specular_ior` map, linear 0..`specularIorMax`, texel 255 = `iorMax`; read only while `overrideIor=false` |
+| `primarySpecularColor.overrideIor` | — | bool, default true; checked = the constant `ior` everywhere, unchecked = alpha is the IOR map (the editor forces it while the texture has no alpha) |
+| `primarySpecularColor.ior` | — | float, default 1.5, range [0, inf). Used when no IOR map is read; read whether or not the slot is enabled |
+| `primarySpecularColor.iorMax` | — | float, default 4.25, range (0, inf). What texel 255 of the IOR map means |
 | `primaryNormal.curvatureInAlpha` | bool | retired |
 | `primaryNormal.alphaCarries` | — | `"None"` / `"Curvature"` / `"Cone Map"`, default `"None"` |
 | `schemaVersion` | 5 | 6 |
@@ -33,8 +33,10 @@ it; the guard has no operand left.
     F0_diel    = specularWeight * tint * F0_ior           (per channel)
     F0         = lerp(F0_diel, baseColor, metallic)       (metals untouched, as before)
 
-`ior` is the map texel * `specularIorMax` when `iorInAlpha` is true and the slot
-resolves, otherwise the material scalar `specularIor`. The map is never
+`ior` is the map texel * `iorMax` when `overrideIor` is false and the slot
+resolves, otherwise the slot constant `ior`. All three live on the specular
+colour slot (feature parameters sit with their texture, 2026-09-16), not in a
+material setting group. The map is never
 multiplied by the scalar (Option A: texture replaces scalar).
 
 `specularWeight` is the RMAOS alpha texel when `alphaCarries="Specular Weight"`
@@ -82,9 +84,9 @@ fixes (editor) and are handled by `pbrm migrate` (CLI):
 - v5 RMAOS alpha carrying F0: repack alpha as weight with the rule above per
   texel; texels above 0.04 need an IOR texel, written into the specular color
   alpha (a white sRGB color map is created if the slot is empty) with
-  `iorInAlpha=true`.
+  `overrideIor=false`.
 - v5 specular color map whose alpha was a tint coverage: bake
-  `lerp(1, rgb, a)` into RGB, set alpha to texel 90 (IOR 1.5), `iorInAlpha=true`.
+  `lerp(1, rgb, a)` into RGB, set alpha to texel 90 (IOR 1.5), `overrideIor=false`.
   Equivalent by construction, since v5 resolved the tint as exactly that lerp.
 
 A v5 document with constants only renders identically after migration; that is
@@ -95,12 +97,13 @@ a test pin. A v6 file is refused by a v5 reader (schemaVersion gate, as before).
 - `res/Lighting/deferred_prepass.hlsl` ~854-867: `f4fxF0Scalar` becomes the
   weight; drop `min(., 0.16)`; multiply by `F0_ior` from the new constants and
   by the tint when the color map is bound.
-- Constant buffer: two new floats, `specularIor` and `specularIorMax`. The v5
+- Constant buffer: two new floats, `specularIor` and `specularIorMax`, read
+  from `primarySpecularColor.ior` / `.iorMax` (not a setting group). The v5
   note "the color slot needs no new constant-buffer space" is void.
 - Feature bits: 7 `RmaosF0` renamed `RmaosSpecularWeight` (condition: bit 3,
   `overrideSpecularWeight=false`, `alphaCarries="Specular Weight"`); 9
   `NormalCurvature` condition becomes `alphaCarries="Curvature"`; NEW 26
-  `SpecularIorTexture` (bit 25 and `iorInAlpha=true`); NEW 27 `NormalConeMap`
+  `SpecularIorTexture` (bit 25 and `overrideIor=false`); NEW 27 `NormalConeMap`
   (bit 1 and `alphaCarries="Cone Map"`), reserved, no consumer yet.
 - PREREQUISITE: the glossy-diffuse energy split (OpenPBR alignment item A2,
   `ambient_ibl_pass.hlsl` ~1086/3587). With the guard gone, a dielectric can
