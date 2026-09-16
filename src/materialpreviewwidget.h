@@ -236,10 +236,10 @@ private:
         bool hasBase = false, hasNormal = false, hasRmaos = false, hasEmissive = false;
         bool overrideBaseColor = true, overrideOpacity = true, overrideNormal = true;
         bool overrideEmissiveColor = true, overrideEmissiveMask = true;
-        bool useRoughness = false, useMetallic = false, useAo = false, useF0 = false;
+        bool useRoughness = false, useMetallic = false, useAo = false, useSpecularWeight = false;
         QVector3D baseFallback{1, 1, 1}, tint{1, 1, 1}, normalFallback{.5f, .5f, 1}, emissiveColor{1, 1, 1};
         float opacity = 1, colorScale = 1, normalStrength = 1;
-        float roughness = .5f, metallic = 0, ao = 1, f0 = .04f, emissiveMask = 1, emissiveIntensity = 0;
+        float roughness = .5f, metallic = 0, ao = 1, specularWeight = 1, emissiveMask = 1, emissiveIntensity = 0;
         QVector4D uvTransform{1, 1, 0, 0}, uvAnimation{0, 0, 0, 0};
         float uvRotation = 0;
         int uvAddress = 0;
@@ -384,26 +384,31 @@ private:
     std::vector<CompanionMaterial> m_companions;
     bool m_companionsDirty = false;
     QColor m_baseColor = Qt::white, m_tint = Qt::white, m_normalColor = QColor(QStringLiteral("#8080FF")), m_emissiveColor = Qt::white, m_keyColor = Qt::white;
-    float m_opacity = 1, m_colorScale = 1, m_normalStrength = 1, m_roughness = .5f, m_metallic = 0, m_ao = 1, m_f0 = .04f, m_emissiveMask = 1, m_emissiveIntensity = 0;
+    float m_opacity = 1, m_colorScale = 1, m_normalStrength = 1, m_roughness = .5f, m_metallic = 0, m_ao = 1, m_specularWeight = 1, m_emissiveMask = 1, m_emissiveIntensity = 0;
     bool m_hasBase = false, m_hasNormal = false, m_hasRmaos = false, m_hasEmissive = false;
     bool m_overrideBaseColor = true, m_overrideOpacity = true, m_overrideNormal = true;
     bool m_overrideEmissiveColor = true, m_overrideEmissiveMask = true;
-    bool m_useRoughness = false, m_useMetallic = false, m_useAo = false, m_useF0 = false;
+    bool m_useRoughness = false, m_useMetallic = false, m_useAo = false, m_useSpecularWeight = false;
     // v5 surface response: porosity rides RMAOS.A, signed curvature rides
     // Normal.A, adhesion/shelter/mask bindings come from SurfaceResponse.
     bool m_rmaosAlphaPorosity = false, m_porosityOverride = false, m_curvatureInAlpha = false, m_sssAlphaAuthored = false;
+    // v6 specular model (docs/PBRM-v6-Specular.md): the material's specular
+    // IOR scalar, what texel 255 of an IOR map means, and whether the specular
+    // colour slot's alpha is that map.
+    float m_specularIor = 1.5f, m_specularIorMax = 4.25f;
+    bool m_iorInAlpha = false;
     float m_porosityConstant = .5f, m_cavitySpecOcclusion = 1.0f, m_stateAdhesion = 1.0f;
     int m_shelterChannel = -1;
     QColor m_secondaryBaseColor = Qt::white, m_secondaryTint = Qt::white;
     QColor m_secondaryNormalColor = QColor(QStringLiteral("#8080FF")), m_secondaryEmissiveColor = Qt::white;
     float m_secondaryOpacity = 1, m_secondaryColorScale = 1, m_secondaryNormalStrength = 1;
-    float m_secondaryRoughness = .5f, m_secondaryMetallic = 0, m_secondaryAo = 1, m_secondaryF0 = .04f;
+    float m_secondaryRoughness = .5f, m_secondaryMetallic = 0, m_secondaryAo = 1, m_secondarySpecularWeight = 1;
     float m_secondaryEmissiveMask = 1, m_secondaryEmissiveIntensity = 0, m_constantCoverage = 1;
     bool m_hasSecondaryBase = false, m_hasSecondaryNormal = false, m_hasSecondaryRmaos = false, m_hasSecondaryEmissive = false, m_hasLayerCoverage = false;
     bool m_overrideLayerCoverage = true, m_invertLayerCoverage = false;
     bool m_overrideSecondaryBaseColor = true, m_overrideSecondaryOpacity = true, m_overrideSecondaryNormal = true;
     bool m_overrideSecondaryEmissiveColor = true, m_overrideSecondaryEmissiveMask = true;
-    bool m_useSecondaryRoughness = false, m_useSecondaryMetallic = false, m_useSecondaryAo = false, m_useSecondaryF0 = false;
+    bool m_useSecondaryRoughness = false, m_useSecondaryMetallic = false, m_useSecondaryAo = false, m_useSecondarySpecularWeight = false;
     int m_secondaryBlendMode = 0, m_coverageMode = 1, m_patternSource = 3;
     float m_coverageBias = 0, m_coverageContrast = 1, m_coverageSoftness = .1f;
     float m_layerCoverageFallback = 1, m_layerCoverageSlotBias = 0, m_layerCoverageSlotContrast = 1;
@@ -411,13 +416,13 @@ private:
     QColor m_tertiaryBaseColor = Qt::white, m_tertiaryTint = Qt::white;
     QColor m_tertiaryNormalColor = QColor(QStringLiteral("#8080FF")), m_tertiaryEmissiveColor = Qt::white;
     float m_tertiaryOpacity = 1, m_tertiaryColorScale = 1, m_tertiaryNormalStrength = 1;
-    float m_tertiaryRoughness = .5f, m_tertiaryMetallic = 0, m_tertiaryAo = 1, m_tertiaryF0 = .04f;
+    float m_tertiaryRoughness = .5f, m_tertiaryMetallic = 0, m_tertiaryAo = 1, m_tertiarySpecularWeight = 1;
     float m_tertiaryEmissiveMask = 1, m_tertiaryEmissiveIntensity = 0, m_tConstantCoverage = 1;
     bool m_hasTertiaryBase = false, m_hasTertiaryNormal = false, m_hasTertiaryRmaos = false, m_hasTertiaryEmissive = false, m_hasTertiaryCoverage = false;
     bool m_overrideTertiaryCoverage = true, m_invertTertiaryCoverage = false;
     bool m_overrideTertiaryBaseColor = true, m_overrideTertiaryOpacity = true, m_overrideTertiaryNormal = true;
     bool m_overrideTertiaryEmissiveColor = true, m_overrideTertiaryEmissiveMask = true;
-    bool m_useTertiaryRoughness = false, m_useTertiaryMetallic = false, m_useTertiaryAo = false, m_useTertiaryF0 = false;
+    bool m_useTertiaryRoughness = false, m_useTertiaryMetallic = false, m_useTertiaryAo = false, m_useTertiarySpecularWeight = false;
     int m_tertiaryBlendMode = 0, m_tCoverageMode = 1, m_tPatternSource = 3;
     float m_tCoverageBias = 0, m_tCoverageContrast = 1, m_tCoverageSoftness = .1f;
     float m_tertiaryCoverageFallback = 1, m_tertiaryCoverageSlotBias = 0, m_tertiaryCoverageSlotContrast = 1;

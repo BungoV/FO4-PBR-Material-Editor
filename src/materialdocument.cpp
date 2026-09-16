@@ -109,6 +109,82 @@ QJsonObject migrateOverridesRecursively(QJsonObject object)
 // SurfaceResponse bindings. Legacy SurfaceStates/* groups and response slots
 // that still carry an assigned map are preserved inert so validation and the
 // batch tools can surface them; nothing is destroyed silently. Idempotent.
+// v5 -> v6 (docs/PBRM-v6-Specular.md section 4). Constants migrate exactly:
+// the authored dielectric F0 becomes a specular weight against the default
+// IOR 1.5 (F0 0.04), and an F0 above 0.04 lifts the material's specular IOR
+// instead, so a constants-only document renders identically. Texture alphas
+// cannot be rewritten here: a slot whose alpha texels were authored as F0 (or
+// as a tint weight on the specular colour) is marked with a legacy key that
+// validation and `pbrm migrate` turn into a repack, and its constant override
+// is forced on so it renders at the IOR level rather than nearly black until
+// then. The normal's curvature bool becomes the alpha selector.
+double specularIorForF0(double f0)
+{
+    const double s = std::sqrt(std::clamp(f0, 0.0, 0.999999));
+    return (1.0 + s) / (1.0 - s);
+}
+
+void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersion, bool primarySet)
+{
+    if (!set) return;
+    for (auto it = set->begin(); it != set->end(); ++it) {
+        if (!it.value().isObject()) continue;
+        QJsonObject slot = it.value().toObject();
+        QJsonObject values = slot.value(QStringLiteral("values")).toObject();
+        const QString key = it.key();
+        const bool enabledWithPath = slot.value(QStringLiteral("enabled")).toBool(false)
+            && !slot.value(QStringLiteral("path")).toString().trimmed().isEmpty();
+        bool changed = false;
+        if (key.contains(QStringLiteral("Rmaos"), Qt::CaseInsensitive) || key == QLatin1String("rmaosArray")) {
+            const bool hadOverrideF0 = values.contains(QStringLiteral("overrideF0"));
+            const bool oldOverrideF0 = values.value(QStringLiteral("overrideF0")).toBool(true);
+            const QString oldCarries = values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0"));
+            if (values.contains(QStringLiteral("f0"))) {
+                const double f0 = values.value(QStringLiteral("f0")).toDouble(0.04);
+                values.remove(QStringLiteral("f0"));
+                values.insert(QStringLiteral("specularWeight"), std::min(f0 / 0.04, 1.0));
+                if (f0 > 0.04 && primarySet && key == QLatin1String("primaryRmaos") && settings) {
+                    QJsonObject specular = settings->value(QStringLiteral("Specular")).toObject();
+                    if (!specular.contains(QStringLiteral("ior")))
+                        specular.insert(QStringLiteral("ior"), specularIorForF0(f0));
+                    settings->insert(QStringLiteral("Specular"), specular);
+                }
+                changed = true;
+            }
+            if (hadOverrideF0) {
+                values.remove(QStringLiteral("overrideF0"));
+                values.insert(QStringLiteral("overrideSpecularWeight"), oldOverrideF0);
+                changed = true;
+            }
+            if (values.value(QStringLiteral("alphaCarries")).toString() == QLatin1String("Dielectric F0")) {
+                values.insert(QStringLiteral("alphaCarries"), QStringLiteral("Specular Weight"));
+                changed = true;
+            }
+            if (hadOverrideF0 && !oldOverrideF0 && oldCarries != QLatin1String("Porosity") && enabledWithPath) {
+                values.insert(QStringLiteral("legacyF0Alpha"), true);
+                values.insert(QStringLiteral("overrideSpecularWeight"), true);
+                changed = true;
+            }
+        }
+        if (key.endsWith(QStringLiteral("Normal")) && !key.contains(QStringLiteral("Dynamic"))
+            && values.contains(QStringLiteral("curvatureInAlpha"))) {
+            const bool curvature = values.value(QStringLiteral("curvatureInAlpha")).toBool(false);
+            values.remove(QStringLiteral("curvatureInAlpha"));
+            values.insert(QStringLiteral("alphaCarries"), curvature ? QStringLiteral("Curvature") : QStringLiteral("None"));
+            changed = true;
+        }
+        if (key.endsWith(QStringLiteral("SpecularColor")) && schemaVersion < 6 && enabledWithPath
+            && !values.contains(QStringLiteral("iorInAlpha"))) {
+            values.insert(QStringLiteral("legacyTintAlpha"), true);
+            changed = true;
+        }
+        if (changed) {
+            slot.insert(QStringLiteral("values"), values);
+            it.value() = slot;
+        }
+    }
+}
+
 void migrateV4SurfaceData(QJsonObject* uv0, QJsonObject* uv1, QJsonObject* uv2, QJsonObject* settings)
 {
     QJsonObject response = settings->value(QStringLiteral("SurfaceResponse")).toObject();
@@ -269,7 +345,7 @@ bool MaterialDocument::load(const QString& fileName, QString* error)
         if (error) *error = QStringLiteral("Not a PBRM material (invalid signature).");
         return false;
     }
-    if (version != Version && version != LegacyVersion) {
+    if (version < LegacyVersion || version > Version) {
         if (error) *error = QStringLiteral("Unsupported PBRM version %1; this editor reads versions %2-%3.").arg(version).arg(LegacyVersion).arg(Version);
         return false;
     }
@@ -463,7 +539,7 @@ bool MaterialDocument::fromJson(const QJsonObject& object, QString* error)
         return false;
     }
     const int schemaVersion = object.value(QStringLiteral("schemaVersion")).toInt(-1);
-    if (schemaVersion != static_cast<int>(Version) && schemaVersion != static_cast<int>(LegacyVersion)) {
+    if (schemaVersion < static_cast<int>(LegacyVersion) || schemaVersion > static_cast<int>(Version)) {
         if (error) *error = QStringLiteral("The PBRM JSON schema version is not supported.");
         return false;
     }
@@ -526,6 +602,14 @@ bool MaterialDocument::fromJson(const QJsonObject& object, QString* error)
     else m_resources.insert(QStringLiteral("Environment"), environment);
     m_settings = object.value(QStringLiteral("settings")).toObject();
     migrateV4SurfaceData(&m_uv0, &m_uv1, &m_uv2, &m_settings);
+    migrateV5Specular(&m_uv0, &m_settings, schemaVersion, true);
+    migrateV5Specular(&m_uv1, &m_settings, schemaVersion, false);
+    migrateV5Specular(&m_uv2, &m_settings, schemaVersion, false);
+    if (m_resources.contains(QStringLiteral("Landscape"))) {
+        QJsonObject landscape = m_resources.value(QStringLiteral("Landscape")).toObject();
+        migrateV5Specular(&landscape, &m_settings, schemaVersion, false);
+        m_resources.insert(QStringLiteral("Landscape"), landscape);
+    }
 	m_unknownRoot = object;
 	for (const QString& known : {
 	         QStringLiteral("schema"), QStringLiteral("schemaVersion"), QStringLiteral("shader"),

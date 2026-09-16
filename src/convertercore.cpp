@@ -90,6 +90,22 @@ bool cubemapDeclaresMetal(const QString& envmapTexture)
     return false;
 }
 
+float specularIorForF0(float f0)
+{
+    const float s = std::sqrt(std::clamp(f0, 0.0f, 0.999999f));
+    return (1.0f + s) / (1.0f - s);
+}
+
+float fo4SpecularIor(const Options& options)
+{
+    return specularIorForF0(0.04f / std::max(options.specMedianReference, 1e-4f));
+}
+
+float fo76SpecularIor(const Options& options)
+{
+    return specularIorForF0(std::max(options.dielectricF0Max, 1e-4f));
+}
+
 float metallicConfidenceFo4(float specStrength, const Options& options)
 {
     // Closing the window converts fully dielectric, and it has to hold for a
@@ -271,6 +287,7 @@ QImage reflectanceSpecularTint(const QImage& reflectance)
 ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& material, const Options& options)
 {
     ConvertedImages result;
+    result.specularIor = fo4SpecularIor(options);
     const QImage diffuse = toRgba(sources.diffuse);
     if (diffuse.isNull()) return result;
     // FO4 has no specular COLOR map to take: _s is BC5, R specular strength and
@@ -345,19 +362,18 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
             baseLine[x * 4 + 3] = diffuseLine[x * 4 + 3];
 
             const float roughness = glossToRoughness(gloss, options);
-            // _s.R is a Blinn-Phong intensity, not an F0, so it is anchored on
-            // the corpus rather than on a physical table: the measured median
-            // maps to the dielectric default 0.04 and the window clamps the
-            // tails. The old specStrength * 0.08 put the median texel of the
-            // median material at 0.017, under the floor -- so the whole F0 axis
-            // pinned flat at 0.02 and carried no information at all.
-            const float dielectricF0 = std::clamp(
-                specStrength * (0.04f / std::max(options.specMedianReference, 1e-4f)),
-                options.dielectricF0Min, options.dielectricF0Max);
+            // v6: RMAOS.A is a specular WEIGHT (docs/PBRM-v6-Specular.md). _s.R
+            // times fSpecularMult is a Blinn-Phong intensity, which is a weight
+            // by nature, so it is written raw and the corpus anchor moves into
+            // the material's specular IOR: F0(ior) = 0.04 / specMedianReference
+            // (0.189), so the median texel still lands on 0.04. The top of the
+            // range now reaches 0.189, a hair under vanilla's own hardcoded F0
+            // of 0.2; the old 0.02-0.08 window went with the level.
+            const float specularWeight = std::clamp(specStrength, 0.0f, 1.0f);
             rmaosLine[x * 4] = uchar(std::lround(roughness * 255.0f));
             rmaosLine[x * 4 + 1] = uchar(std::lround(metallic * 255.0f));
             rmaosLine[x * 4 + 2] = 255; // AO joins from the derivation pass
-            rmaosLine[x * 4 + 3] = uchar(std::lround(dielectricF0 * 255.0f));
+            rmaosLine[x * 4 + 3] = uchar(std::lround(specularWeight * 255.0f));
             const uchar metallicByte = uchar(std::lround(metallic * 255.0f));
             metallicLine[x * 4] = metallicByte;
             metallicLine[x * 4 + 1] = metallicByte;
@@ -393,6 +409,7 @@ ConvertedImages convertFo4(const Fo4Sources& sources, const Bgsm::Material& mate
 ConvertedImages convertFo76(const Fo76Sources& sources, const Bgsm::Material& material, const Options& options)
 {
     ConvertedImages result;
+    result.specularIor = fo76SpecularIor(options);
     const QImage diffuse = toRgba(sources.diffuse);
     if (diffuse.isNull()) return result;
     const int width = diffuse.width(), height = diffuse.height();
@@ -448,12 +465,17 @@ ConvertedImages convertFo76(const Fo76Sources& sources, const Bgsm::Material& ma
             baseLine[x * 4 + 3] = diffuseLine[x * 4 + 3];
 
             const float roughness = glossToRoughness(smoothness, options);
-            const float dielectricF0 = std::clamp(luminance(reflectanceLinear),
-                options.dielectricF0Min, options.dielectricF0Max);
+            // v6: the reflectance luminance becomes a weight against a material
+            // IOR whose F0 is the top of the v5 dielectric window (0.08 -> IOR
+            // 1.789), so weight * 0.08 reproduces the v5 clamp [0.02, 0.08]
+            // exactly: weight = clamp(luma / 0.08, 0.25, 1).
+            const float f0Ceiling = std::max(options.dielectricF0Max, 1e-4f);
+            const float specularWeight = std::clamp(luminance(reflectanceLinear) / f0Ceiling,
+                options.dielectricF0Min / f0Ceiling, 1.0f);
             rmaosLine[x * 4] = uchar(std::lround(roughness * 255.0f));
             rmaosLine[x * 4 + 1] = uchar(std::lround(metallic * 255.0f));
             rmaosLine[x * 4 + 2] = uchar(std::lround(bakedAo * 255.0f)); // FO76 ships AO in _l.G
-            rmaosLine[x * 4 + 3] = uchar(std::lround(dielectricF0 * 255.0f));
+            rmaosLine[x * 4 + 3] = uchar(std::lround(specularWeight * 255.0f));
             const uchar metallicByte = uchar(std::lround(metallic * 255.0f));
             metallicLine[x * 4] = metallicByte;
             metallicLine[x * 4 + 1] = metallicByte;

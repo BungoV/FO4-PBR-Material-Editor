@@ -1,4 +1,5 @@
 #include "clicommands.h"
+#include "specularmigrate.h"
 
 #include "converter.h"
 #include "converternodes.h"
@@ -208,6 +209,19 @@ int runMigrate(const QStringList& args)
             findings.append({file, true, error});
             continue;
         }
+        // v6: texture alphas authored as dielectric F0 or tint weight cannot
+        // migrate in memory (docs/PBRM-v6-Specular.md section 4); the loader
+        // marks the slots and the repack rewrites the textures beside their
+        // .v5.bak. A dry run leaves the markers for the editor's validation.
+        QString repackError;
+        QStringList repackReport;
+        const int repacked = dryRun ? 0
+            : SpecularMigrate::repackDocument(&document, effectiveTextureRoot(options), &repackError, &repackReport);
+        if (repacked < 0) {
+            findings.append({file, true, QStringLiteral("v6 texture repack failed: ") + repackError});
+            continue;
+        }
+        for (const QString& line : repackReport) findings.append({file, false, line});
         const QByteArray current = rawPayload(file);
         const QByteArray next = QJsonDocument(document.toJson()).toJson(QJsonDocument::Compact);
         if (current == next) continue;
@@ -883,7 +897,7 @@ QString helpText()
         "\n"
         "verbs:\n"
         "  validate            check materials (same findings as the GUI validation)\n"
-        "  migrate             re-save materials on the current schema (v4 -> v5)\n"
+        "  migrate             re-save materials on the current schema (v4/v5 -> v6); repacks v5 F0 and tint alphas beside a .v5.bak\n"
         "  extract-states      write legacy per-material states to definitions JSON sidecars\n"
         "  strip-legacy        remove legacy surface data (groups, response slots, retired keys)\n"
         "  set-setting         set one setting key across materials\n"

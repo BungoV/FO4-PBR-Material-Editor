@@ -147,8 +147,8 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                     numberField("metallic", "Metallic override", 0.0, 0.0, 1.0, 0.005, "Constant metallic."),
                     toggleField("overrideAo", "B • Ambient Occlusion", true, "Checked uses the constant AO override."),
                     numberField("ao", "AO override", 1.0, 0.0, 1.0, 0.005, "Constant ambient occlusion."),
-                    toggleField("overrideF0", "A • Specular", true, "Checked uses the constant dielectric F0 override."),
-                    numberField("f0", "Specular F0 override", 0.04, 0.0, 1.0, 0.001, "Default four-percent dielectric reflectance.")
+                    toggleField("overrideSpecularWeight", "A • Specular Weight", true, "Checked uses the constant specular weight override."),
+                    numberField("specularWeight", "Specular weight override", 1.0, 0.0, 1.0, 0.005, "OpenPBR specular_weight: a 0-1 multiplier on the dielectric reflectance the specular IOR sets. 1 is the full level.")
                 }));
         }
         add(slot(prefix + "ScreenDistortion", tr("Screen Distortion"), "DIST", "Linear • RG direction / B strength / A mask", QColor(82, 137, 150), false, {},
@@ -174,39 +174,37 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 numberField("height", "Height override", 0.5, 0.0, 1.0, 0.005, "Constant packed height."),
                 numberField("strength", "Normal strength", 1.0, 0.0, 8.0, 0.01, "Scales the tangent-space normal."),
                 toggleField("heightInBlue", "B contains height", false, "Checked treats blue as packed height. Unchecked ignores blue for height and reconstructs the normal from RG."),
-                toggleField("curvatureInAlpha", "A contains curvature", false, "Checked treats alpha as signed curvature from the same bake as the normal. Guides surface states (edge shedding, cavity collection), occludes direct specular in seams, and broadens subsurface scattering. Curvature has no constant: it is map-authored or derived from AO."),
+                choiceField("alphaCarries", "A carries", "None", {"None", "Curvature", "Cone Map"}, "What the normal's alpha stores. Curvature: signed curvature from the same bake as the normal (guides surface states, occludes direct specular in seams, broadens subsurface scattering; no constant, derived from AO otherwise). Cone Map: a relaxed-cone-step parallax map baked from the height in blue; reserved, the preview still derives curvature from AO."),
                 numberField("cavitySpecOcclusion", "Cavity specular occlusion", 1.0, 0.0, 1.0, 0.005, "Concave curvature occludes direct-light specular so highlights break inside seams and pores. Only active with authored curvature — the AO-derived fallback must never touch direct light.")
             }));
         add(slot(prefix + "Rmaos", secondary ? tr("%1 Roughness + Metallic + Ambient Occlusion + Specular").arg(layerName) : tr("Roughness + Metallic + Ambient Occlusion + Specular"),
-            "RMAOS", "Linear • R roughness / G metallic / B AO / A dielectric F0 or porosity", QColor(108, 136, 111), true,
+            "RMAOS", "Linear • R roughness / G metallic / B AO / A specular weight or porosity", QColor(108, 136, 111), true,
             QString(),
-            "Packed physical material properties. Alpha carries dielectric F0 or porosity: dielectrics (cloth, leather) rarely author F0 but are exactly where porosity varies, while metals are sealed — the two uses almost never collide.", {
+            "Packed physical material properties. Alpha carries specular weight (OpenPBR specular_weight: a 0-1 multiplier on the level the specular IOR sets) or porosity: dielectrics (cloth, leather) rarely author a weight but are exactly where porosity varies, while metals are sealed — the two uses almost never collide.", {
                 toggleField("overrideRoughness", "R • Roughness", true, "Checked uses the constant roughness override."),
                 numberField("roughness", "Roughness override", 0.5, 0.0, 1.0, 0.005, "Microsurface roughness used when texture R is overridden."),
                 toggleField("overrideMetallic", "G • Metallic", true, "Checked uses the constant metallic override."),
                 numberField("metallic", "Metallic override", 0.0, 0.0, 1.0, 0.005, "Metallic response used when texture G is overridden."),
                 toggleField("overrideAo", "B • Ambient Occlusion", true, "Checked uses the constant AO override."),
                 numberField("ao", "AO override", 1.0, 0.0, 1.0, 0.005, "Indirect-occlusion strength used when texture B is overridden."),
-                choiceField("alphaCarries", "A carries", "Dielectric F0", {"Dielectric F0", "Porosity"}, "What the texture's alpha channel stores. The property not carried by alpha uses its constant (or the derived porosity fallback)."),
-                toggleField("overrideF0", "A • Specular", true, "Checked uses the constant dielectric F0 override."),
-                numberField("f0", "Specular F0 override", 0.04, 0.0, 1.0, 0.001, "Dielectric reflectance used when texture A is overridden, absent, or carrying porosity."),
+                choiceField("alphaCarries", "A carries", "Specular Weight", {"Specular Weight", "Porosity"}, "What the texture's alpha channel stores. The property not carried by alpha uses its constant (or the derived porosity fallback)."),
+                toggleField("overrideSpecularWeight", "A • Specular Weight", true, "Checked uses the constant specular weight override."),
+                numberField("specularWeight", "Specular weight override", 1.0, 0.0, 1.0, 0.005, "OpenPBR specular_weight: a 0-1 multiplier on the dielectric reflectance the specular IOR sets. 1 is the full level."),
                 toggleField("overridePorosity", "Porosity constant", false, "Checked pins porosity to the constant. Unchecked samples alpha when it carries porosity, otherwise derives saturate(roughness × (1 − metallic)) — the standard engine heuristic, so most materials need no porosity authoring at all."),
                 numberField("porosity", "Porosity override", 0.5, 0.0, 1.0, 0.005, "How much fluid soaks in: 1 darkens like cloth, 0 beads like sealed metal.")
             }));
-        // The dielectric F0 that RMAOS alpha carries is one grey number, so a
-        // painted specular color is the only way to author a tinted dielectric
-        // reflection (a green bottle's own sheen, a tarnish film, colored
-        // lacquer). It TINTS, following OpenPBR's specular_color: it modulates
-        // the Fresnel term and can only darken or hue-shift it, never raise
-        // reflectivity, and the level stays owned by RMAOS alpha. Map-driven on
-        // purpose: with no constants, a material without the map is bit-exact
-        // the scalar path it has always been, in the preview and the runtime
-        // alike.
+        // v6 (docs/PBRM-v6-Specular.md): the specular colour map is the OpenPBR
+        // specular_color tint on the dielectric Fresnel, and its alpha, when
+        // declared, is the specular_ior map. The level is IOR times weight;
+        // the tint can only darken or hue-shift it. A material without the
+        // map takes the material's IOR scalar and a white tint, which is the
+        // scalar path bit for bit in the preview and the runtime alike.
         add(slot(prefix + "SpecularColor", secondary ? tr("%1 Specular Color").arg(layerName) : tr("Specular Color"),
-            "SPEC", "sRGB • RGB specular tint / A tint weight", QColor(128, 130, 156), false,
+            "SPEC", "sRGB • RGB specular tint / A specular IOR (optional)", QColor(128, 130, 156), false,
             QString(),
-            "Tints the dielectric specular reflection. RGB multiplies the F0 that RMAOS alpha carries, so white is no change and a color can only darken or shift the hue — the reflectance level stays with RMAOS. Alpha weighs the tint in: 1 applies the painted color, 0 leaves the surface exactly as it was. Metals are untouched: their F0 is the base color, and their 82-degree edge tint is an angular effect this shading model does not carry. A texture with no alpha channel weighs 1 everywhere, which is what a plain specular color map means.",
-            {}));
+            "Tints the dielectric specular reflection (OpenPBR specular_color): RGB multiplies the reflectance the specular IOR and weight set, so white is no change and a color can only darken or shift the hue. Alpha, when declared below, is the specular IOR map over 0 to the material's IOR map ceiling (texel 90 of 255 is IOR 1.5 at the default ceiling 4.25, texel 0 makes the tint the reflectance outright); undeclared, the material's specular IOR scalar applies everywhere. Metals are untouched: their F0 is the base color.", {
+                toggleField("iorInAlpha", "A contains IOR", false, "Checked reads alpha as the specular IOR map and ignores the material's IOR scalar. Unchecked ignores alpha.")
+            }));
     }
 
     if (mode == Pbr::ShaderMode::StandardSurface || mode == Pbr::ShaderMode::AdvancedSubsurface || all) {
@@ -515,8 +513,8 @@ QVector<TextureSlotSpec> MainWindow::landscapeSlots() const
                 numberField("metallic", "Metallic override", 0.0, 0.0, 1.0, 0.005, "Constant landscape metallic value."),
                 toggleField("overrideAo", "B • Ambient Occlusion", true, "Checked uses constant ambient occlusion for the array."),
                 numberField("ao", "AO override", 1.0, 0.0, 1.0, 0.005, "Constant landscape ambient occlusion."),
-                toggleField("overrideF0", "A • Specular", true, "Checked uses constant dielectric F0 for the array."),
-                numberField("f0", "Specular F0 override", 0.04, 0.0, 1.0, 0.001, "Default four-percent dielectric reflectance.")
+                toggleField("overrideSpecularWeight", "A • Specular Weight", true, "Checked uses the constant specular weight override."),
+                numberField("specularWeight", "Specular weight override", 1.0, 0.0, 1.0, 0.005, "OpenPBR specular_weight: a 0-1 multiplier on the dielectric reflectance the specular IOR sets. 1 is the full level.")
             }),
         slot("heightArray", tr("Optional Separate Height Array"), "L-HGT", "Linear texture array • R height",
             QColor(126, 126, 126), false, {}, "Alternative height slices when height is not stored in the normal array.", {

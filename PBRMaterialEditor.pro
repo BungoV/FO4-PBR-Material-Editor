@@ -12,6 +12,7 @@ SOURCES += \
     src/main.cpp \
     src/bgsmreader.cpp \
     src/clicommands.cpp \
+    src/specularmigrate.cpp \
     src/converter.cpp \
     src/convertercore.cpp \
     src/converternodes.cpp \
@@ -44,6 +45,7 @@ SOURCES += \
 HEADERS += \
     src/bgsmreader.h \
     src/clicommands.h \
+    src/specularmigrate.h \
     src/converter.h \
     src/convertercore.h \
     src/converternodes.h \

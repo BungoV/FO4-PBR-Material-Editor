@@ -12,7 +12,7 @@ validated PBRM v4 slice that must be upgraded to v5.
 `PBR Material Editor` — a standalone C++20/Qt 6 authoring tool for the `.pbrm`
 material format that the Fallout 4 Community Shaders fork (FO4CS) consumes.
 Written from scratch; it does not reuse the legacy C# editor. The README covers
-the feature surface; `docs/PBRM-v5.md` is the format spec;
+the feature surface; `docs/PBRM-v6.md` is the format spec;
 `docs/SurfaceStates-Architecture.md` is the authoritative design for the v5
 surface-state split and the future runtime catalog.
 
@@ -214,7 +214,7 @@ order:
 
 1. Upgrade the runtime PBRM parser to v5: accept envelope/schema 4-5, the new
    alpha semantics (`alphaCarries`, `curvatureInAlpha`), feature bits 9-10,
-   and the `SurfaceResponse` bindings per `docs/PBRM-v5.md`.
+   and the `SurfaceResponse` bindings per `docs/PBRM-v6.md`.
 2. Freeze/ship the definitions asset (export the starter JSON from the
    editor's built-in defaults; decide file location, load order, hot reload).
 3. Weather → state-amount binding by name; the tag interaction physics stays

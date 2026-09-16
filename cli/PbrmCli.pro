@@ -11,6 +11,7 @@ INCLUDEPATH += ../src
 SOURCES += main_cli.cpp \
     ../src/bgsmreader.cpp \
     ../src/clicommands.cpp \
+    ../src/specularmigrate.cpp \
     ../src/converter.cpp \
     ../src/convertercore.cpp \
     ../src/converternodes.cpp \
@@ -26,7 +27,7 @@ SOURCES += main_cli.cpp \
     ../src/upscaler.cpp \
     ../src/texturewriter.cpp \
     ../src/tinyexr_impl.cpp
-HEADERS += ../src/clicommands.h ../src/materialdocument.h ../src/texturearchive.h \
+HEADERS += ../src/clicommands.h ../src/specularmigrate.h ../src/materialdocument.h ../src/texturearchive.h \
     ../src/texturecache.h ../src/textureimage.h ../src/upscaler.h ../src/texturewriter.h
 
 LIBS += -lz

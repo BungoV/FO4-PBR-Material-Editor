@@ -1,6 +1,6 @@
 {
   "schema": "FO4.PBRM.Material",
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "shader": "Standard",
   "secondaryUvEnabled": false,
   "primaryUv": {
@@ -34,8 +34,8 @@
         "metallic": 0.0,
         "overrideAo": false,
         "ao": 1.0,
-        "overrideF0": true,
-        "f0": 0.04
+        "overrideSpecularWeight": true,
+        "specularWeight": 1.0
       }
     },
     "primaryEmissive": {

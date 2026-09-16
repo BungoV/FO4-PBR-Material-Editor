@@ -3,7 +3,7 @@
 Ruling: bungo with DarkStar [CSE], 2026-09-13 (Discord), ratified with Claude
 2026-09-16 19:42. This page is the contract for the v6 schema bump. It is the
 input to the editor lane (this repo) and to the FO4CS runtime lane, which
-builds last by standing order. Until the lane lands, `docs/PBRM-v5.md` still
+builds last by standing order. Until the lane lands, `docs/PBRM-v6.md` (the folded format spec) still
 describes what ships.
 
 ## 1. What changes, in one table
@@ -41,8 +41,8 @@ multiplied by the scalar (Option A: texture replaces scalar).
 and `overrideSpecularWeight=false`, otherwise the constant. A missing map or a
 missing alpha channel is weight 1: the surface gets the full F0 the IOR gives it.
 
-Surface states keep blending the RESOLVED F0 (after weight, tint, IOR and the
-metal mix) toward their targets exactly as in v5. Nothing in the state system
+Surface states keep blending the RESOLVED dielectric F0 (after weight, tint and IOR,
+before the metal mix, as in v5) toward their targets exactly as in v5. Nothing in the state system
 reads weight or IOR.
 
 Secondary and tertiary layers: their RMAOS alpha is a weight too, with the same
@@ -118,7 +118,7 @@ Cone-step marching is a later lane on both sides.
 
 ## 7. Editor lane work list
 
-1. Format doc: fold this page into `docs/PBRM-v5.md` and rename it
+1. Format doc: DONE: format spec renamed to `docs/PBRM-v6.md` with the rows updated; this page stays the detailed contract
    `docs/PBRM-v6.md`; fix the color row to sRGB.
 2. Document model: version 6, field renames, three new material fields, the
    normal selector, constant migration on load.

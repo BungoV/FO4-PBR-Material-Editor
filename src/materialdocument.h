@@ -43,7 +43,12 @@ public:
     // definitions; the material keeps physical maps (porosity in RMAOS.A,
     // signed curvature in Normal.A) plus the small SurfaceResponse bindings.
     // v4 files load with an in-memory migration and save as v5.
-    static constexpr quint32 Version = 5u;
+    // v6 (docs/PBRM-v6-Specular.md): RMAOS.A is OpenPBR specular_weight, the
+    // specular colour's alpha is an IOR map, the material carries specularIor
+    // and specularIorMax scalars, and the normal's alpha is a selector
+    // (None/Curvature/Cone Map). v4 and v5 files load with in-memory
+    // migrations; texture repacks are left to validation and `pbrm migrate`.
+    static constexpr quint32 Version = 6u;
     static constexpr quint32 LegacyVersion = 4u;
 
     MaterialDocument();

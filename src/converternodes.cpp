@@ -112,7 +112,7 @@ const QVector<ChannelMap> kRmaosChannels{
     {QStringLiteral("Roughness"), ChannelR},
     {QStringLiteral("Metallic"), ChannelG},
     {QStringLiteral("Ambient Occlusion"), ChannelB},
-    {QStringLiteral("Specular F0"), ChannelA}};
+    {QStringLiteral("Specular Weight"), ChannelA}};
 
 // An image output whose channels are separate maps. Declaring them lets the
 // preview offer "Roughness" on its own without anything downstream having to
@@ -2316,7 +2316,7 @@ void registerAll(Registry& registry)
             imagePort("normal", "Normal", true), imagePort("height", "Height", true),
             imagePort("curvature", "Curvature", true),
             imagePort("roughness", "Roughness", true), imagePort("metallic", "Metallic", true),
-            imagePort("ao", "Ambient Occlusion", true), imagePort("specular", "Specular F0 / Porosity", true),
+            imagePort("ao", "Ambient Occlusion", true), imagePort("specular", "Specular Weight / Porosity", true),
             imagePort("emissive", "Emissive", true), imagePort("subsurface", "Subsurface", true),
             imagePort("specularColor", "Specular Tint", true)};
         spec.outputs = {packedPort("baseColor", "BC", kBaseColorChannels),
@@ -2408,6 +2408,8 @@ void registerAll(Registry& registry)
         // strip. Selecting it shades that material in the 3D view, exactly as
         // the source material nodes shade the untouched original.
         spec.materialPreview = QStringLiteral("output");
+        spec.params = {floatParam("specularIor", "Specular IOR", 1.5, 0.0, 100.0, 0.001,
+            "OpenPBR specular_ior written to the material (Specular/ior). RMAOS.A is a 0-1 weight on the reflectance this sets: 1.5 is F0 0.04. The FO4 graph anchors its corpus median here.")};
         // Finished textures only. Packing lives in Combine Maps (PBR), so there is
         // exactly one route into every channel and nothing to arbitrate here.
         spec.inputs = {packedPort("baseColor", "BC", kBaseColorChannels),
@@ -2673,6 +2675,7 @@ Converter::SuppliedImages runGraph(const Graph& graph, const QString& materialPa
             supplied.emissive = arriving("emissive");
             supplied.subsurface = arriving("subsurface");
             supplied.specularColor = arriving("specularColor");
+            supplied.specularIor = float(node.params.value(QStringLiteral("specularIor")).toDouble(1.5));
             continue;
         }
         if (node.typeId != QStringLiteral("output.texture")) continue;
@@ -2849,25 +2852,22 @@ Graph defaultFo4Graph()
     builder.link(metallic, "image", baseMix, "factor");
     builder.link(baseMix, "image", baseColor, "image");
 
-    // ---- Dielectric F0 ------------------------------------------------------
-    // _s.R is a Blinn-Phong intensity with no physical anchor, so the mapping is
-    // anchored on the corpus instead: the measured median (54/255 = 0.212) maps
-    // to the physical dielectric default 0.04, and the 0.02-0.08 window clamps
-    // the tails. The two in-points are that same line read backwards -- 0.106
-    // is where it crosses 0.02, 0.424 where it crosses 0.08 -- so one Levels
-    // node reproduces the clamped ramp exactly, and shows the histogram under
-    // it. Auto levels OFF: this is a physical quantity, not a classification,
-    // and stretching it per material is what the roughness rule warns against.
+    // ---- Specular weight (v6) ----------------------------------------------
+    // _s.R times fSpecularMult is a Blinn-Phong intensity, which is a weight by
+    // nature: it goes into RMAOS.A raw. The corpus anchor that used to squeeze
+    // it into the 0.02-0.08 F0 window now lives in the output node's material
+    // IOR (F0(ior) = 0.04 / 0.212), so the median texel still lands on 0.04.
+    // The Levels node is an identity clamp that keeps the histogram visible.
     const QString specMultImage = builder.add("image.solidColor", 700, 340);
     builder.link(material, "specMult", specMultImage, "value");
     const QString specScaled = builder.add("math.op", 920, 320, {{QStringLiteral("operation"), 2}});
     builder.link(upSpecular, "image", specScaled, "a");
     builder.link(specMultImage, "image", specScaled, "b");
-    const QString specularF0 = builder.add("image.levels", 1140, 320,
-        {{QStringLiteral("inBlack"), 0.106}, {QStringLiteral("inWhite"), 0.424},
-            {QStringLiteral("outBlack"), 0.02}, {QStringLiteral("outWhite"), 0.08},
+    const QString specularWeight = builder.add("image.levels", 1140, 320,
+        {{QStringLiteral("inBlack"), 0.0}, {QStringLiteral("inWhite"), 1.0},
+            {QStringLiteral("outBlack"), 0.0}, {QStringLiteral("outWhite"), 1.0},
             {QStringLiteral("autoLevels"), false}});
-    builder.link(specScaled, "image", specularF0, "image");
+    builder.link(specScaled, "image", specularWeight, "image");
 
     // ---- Emissive -----------------------------------------------------------
     // The glow mask tinted by the material's emittance colour, exactly as FO76
@@ -2892,10 +2892,11 @@ Graph defaultFo4Graph()
     builder.link(roughness, "image", channels, "roughness");
     builder.link(metallic, "image", channels, "metallic");
     builder.link(derive, "ao", channels, "ao"); // derived detail AO, not the conversion's B
-    builder.link(specularF0, "image", channels, "specular");
+    builder.link(specularWeight, "image", channels, "specular");
     builder.link(emissive, "image", channels, "emissive");
 
-    const QString pbr = builder.add("output.pbrMaterial", 1580, 300);
+    const QString pbr = builder.add("output.pbrMaterial", 1580, 300,
+        {{QStringLiteral("specularIor"), double(Converter::fo4SpecularIor(Converter::Options{}))}});
     builder.link(channels, "baseColor", pbr, "baseColor");
     builder.link(channels, "normal", pbr, "normal");
     builder.link(channels, "rmaos", pbr, "rmaos");
@@ -3042,14 +3043,15 @@ Graph defaultFo76Graph()
     const QString roughness = builder.add("image.invert", 700, 280);
     builder.link(unpack, "smoothness", roughness, "image");
 
-    // Specular F0 is deliberately NOT derived here. FO76's _r is a reflectance
-    // colour, and squeezing its luma into the 0.02-0.08 dielectric band varies
-    // F0 across a surface that physically has none to vary: every common
-    // dielectric sits at 0.04, and the differences that survive the clamp are
-    // texture detail, not material change. Metals get their reflectance through
-    // base colour and the metallic mask instead. Leaving the packer's slot
-    // unwired holds F0 at the 0.04 constant. Wire something into Combine Maps
-    // (PBR) -> Specular F0 for the rare material that needs otherwise.
+    // Specular weight is deliberately NOT derived here. FO76's _r is a
+    // reflectance colour, and squeezing its luma into the 0.02-0.08 dielectric
+    // band varies F0 across a surface that physically has none to vary: every
+    // common dielectric sits at 0.04, and the differences that survive the
+    // clamp are texture detail, not material change. Metals get their
+    // reflectance through base colour and the metallic mask instead. Leaving
+    // the packer's slot unwired holds the weight at 1 against the output
+    // node's IOR 1.5, i.e. F0 0.04. Wire something into Combine Maps (PBR) ->
+    // Specular Weight for the rare material that needs otherwise.
     // The HUE of _r, which the F0 above cannot carry whatever it is set to: a
     // scalar has no colour. Dividing the linear reflectance by its own
     // luminance leaves the colour alone at unit brightness, so this tints the

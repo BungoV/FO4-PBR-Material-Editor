@@ -269,7 +269,7 @@ Third-party source and licenses are in `third_party/ufbx/`,
 
 ## PBRM format
 
-See [docs/PBRM-v5.md](docs/PBRM-v5.md). Version 5 moves surface state
+See [docs/PBRM-v6.md](docs/PBRM-v6.md). Version 6 replaces the authored dielectric F0 with OpenPBR specular weight and IOR ([docs/PBRM-v6-Specular.md](docs/PBRM-v6-Specular.md)). Version 5 moves surface state
 behavior out of materials into runtime-owned definitions
 ([docs/SurfaceStates-Architecture.md](docs/SurfaceStates-Architecture.md)):
 materials carry physical maps — porosity in RMAOS alpha, signed curvature in
@@ -302,7 +302,7 @@ runtime integration.
   deferred renderer discards and which 15% of vanilla materials actually author
   — a Fallout 4 `_s` map is BC5, specular strength and gloss, with no color in
   it to take. Both write `<name>_SC.dds` beside the other converted textures.
-- **Format** - `docs/PBRM-v5.md` gained the socket as an additive row. No schema
+- **Format** - `docs/PBRM-v6.md` gained the socket as an additive row. No schema
   version change: a document written before this parses unchanged, and a
   consumer that ignores the socket renders what it always rendered.
 

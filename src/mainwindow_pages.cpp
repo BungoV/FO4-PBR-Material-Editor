@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "specularmigrate.h"
 
 #include "colorpicker.h"
 #include "disclosureicon.h"
@@ -608,6 +609,13 @@ QWidget* MainWindow::createShadingPage()
             toggleField("exposure", "Apply scene exposure", true, "Passes the unlit result through scene exposure and tone mapping.")
         });
     } else {
+        // v6 specular model: the IOR scalar is the fallback when no IOR map is
+        // declared on the specular colour slot; the ceiling is what texel 255
+        // of such a map means. Raising the ceiling rescales the whole map.
+        addSettingsCard(page.content, QStringLiteral("Specular"), tr("Specular"), {
+            numberField("ior", "Specular IOR", 1.5, 0.0, 100.0, 0.001, "OpenPBR specular_ior. 1.5 is the dielectric default (F0 0.04); 0 makes the specular color the reflectance outright. Ignored where the specular color map declares an IOR alpha."),
+            numberField("iorMax", "IOR map ceiling", 4.25, 0.01, 100.0, 0.01, "The IOR that texel 255 of an IOR map stands for. 4.25 puts IOR 1.5 exactly on texel 90.")
+        });
         addSettingsCard(page.content, QStringLiteral("Shading/Core"), tr("Core shading"), {
             choiceField("normalSpace", "Normal space", "Tangent", {"Tangent", "Model", "World"}, "Space used to decode the primary normal."),
             numberField("normalStrength", "Final normal multiplier", 1.0, 0.0, 8.0, 0.01, "Final multiplier applied after every texture-specific normal strength."),
@@ -921,14 +929,14 @@ QWidget* MainWindow::createSurfaceResponsePage()
     // the slots that own them.
     const auto rmaos = m_document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos"));
     const auto normal = m_document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal"));
-    const bool alphaPorosity = rmaos.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Porosity");
+    const bool alphaPorosity = rmaos.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Specular Weight")) == QLatin1String("Porosity");
     const bool porosityOverride = rmaos.values.value(QStringLiteral("overridePorosity")).toBool(false);
     const QString porositySource = porosityOverride
         ? tr("constant %1").arg(rmaos.values.value(QStringLiteral("porosity")).toDouble(.5))
         : (alphaPorosity && !rmaos.path.trimmed().isEmpty()
             ? tr("RMAOS alpha — %1").arg(rmaos.path)
             : tr("derived — saturate(roughness × (1 − metallic))"));
-    const bool curvatureAuthored = normal.values.value(QStringLiteral("curvatureInAlpha")).toBool(false) && !normal.path.trimmed().isEmpty();
+    const bool curvatureAuthored = normal.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("None")) == QLatin1String("Curvature") && !normal.path.trimmed().isEmpty();
     const QString curvatureSource = curvatureAuthored
         ? tr("Normal alpha — %1").arg(normal.path)
         : tr("derived from AO (concave only: no edge shedding, no cavity specular occlusion)");
@@ -1162,12 +1170,23 @@ QWidget* MainWindow::createValidationPage()
                     warnings << tr("%1/%2 should use BC5 or BC7.").arg(setName, spec.name);
             }
             if (spec.key.contains(QStringLiteral("Rmaos"), Qt::CaseInsensitive)) {
-                const bool alphaPorosity = state.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Porosity");
-                if (!alphaPorosity && !state.values.value(QStringLiteral("overrideF0")).toBool(true)
+                const bool alphaPorosity = state.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Specular Weight")) == QLatin1String("Porosity");
+                if (!alphaPorosity && !state.values.value(QStringLiteral("overrideSpecularWeight")).toBool(true)
                     && !info.channels.contains(QStringLiteral("A")))
-                    addFix(true, tr("%1/%2 samples dielectric F0 but the texture has no alpha channel.").arg(setName, spec.name),
-                        tr("Use F0 constant"), tr("Use the F0 constant on %1").arg(spec.name),
-                        [setSlotValue] { setSlotValue(QStringLiteral("overrideF0"), true); });
+                    addFix(true, tr("%1/%2 samples specular weight but the texture has no alpha channel.").arg(setName, spec.name),
+                        tr("Use weight constant"), tr("Use the weight constant on %1").arg(spec.name),
+                        [setSlotValue] { setSlotValue(QStringLiteral("overrideSpecularWeight"), true); });
+                // PBRM v5 authored alpha as dielectric F0; v6 reads it as specular
+                // weight. The repack rewrites the texture (docs/PBRM-v6-Specular.md
+                // section 4) and clears the marker the loader left.
+                if (state.values.value(QStringLiteral("legacyF0Alpha")).toBool(false))
+                    addFix(true, tr("%1/%2 alpha texels were authored as dielectric F0 (PBRM v5); v6 reads alpha as specular weight. Repack the alpha as weight; texels above 0.04 move into a specular IOR map.").arg(setName, spec.name),
+                        tr("Repack as weight"), tr("Repack %1 alpha as specular weight").arg(spec.name),
+                        [this, setName, key = spec.key] {
+                            QString repackError;
+                            if (!SpecularMigrate::repackRmaosSlot(&m_document, setName, key, m_textureRoot, &repackError))
+                                QMessageBox::warning(this, tr("Repack failed"), repackError);
+                        });
                 if (alphaPorosity && !state.values.value(QStringLiteral("overridePorosity")).toBool(false)
                     && !info.channels.contains(QStringLiteral("A")))
                     addFix(true, tr("%1/%2 declares alpha as porosity but the texture has no alpha channel.").arg(setName, spec.name),
@@ -1175,7 +1194,7 @@ QWidget* MainWindow::createValidationPage()
                         [setSlotValue] { setSlotValue(QStringLiteral("overridePorosity"), true); });
                 if (alphaPorosity && state.values.value(QStringLiteral("overrideMetallic")).toBool(true)
                     && state.values.value(QStringLiteral("metallic")).toDouble(0.0) > .5)
-                    warnings << tr("%1/%2 dedicates alpha to porosity on a strongly metallic material; sealed metal has no meaningful porosity and F0 authoring is sacrificed.").arg(setName, spec.name);
+                    warnings << tr("%1/%2 dedicates alpha to porosity on a strongly metallic material; sealed metal has no meaningful porosity and specular weight authoring is sacrificed.").arg(setName, spec.name);
             }
             if (spec.channels.size() == 1 && info.channels.size() > 1 && info.format != QStringLiteral("BC4"))
                 warnings << tr("%1/%2 only samples one channel but the texture carries %3; a single-channel BC4 bake would save memory.")
@@ -1187,11 +1206,15 @@ QWidget* MainWindow::createValidationPage()
                 && m_document.setting(QStringLiteral("Transparency/Composition"), QStringLiteral("mode"), QStringLiteral("Opaque")).toString() == QStringLiteral("Opaque"))
                 warnings << tr("%1/%2 carries an alpha channel that Opaque composition never samples; BC1 would halve the memory.").arg(setName, spec.name);
             if (spec.key.contains(QStringLiteral("Normal"), Qt::CaseInsensitive) && !spec.key.contains(QStringLiteral("Dynamic"), Qt::CaseInsensitive)) {
-                if (state.values.value(QStringLiteral("curvatureInAlpha")).toBool(false)
-                    && !info.channels.contains(QStringLiteral("A")))
-                    addFix(true, tr("%1/%2 enables \"A contains curvature\" but the texture has no alpha channel.").arg(setName, spec.name),
-                        tr("Disable curvature flag"), tr("Disable A contains curvature on %1").arg(spec.name),
-                        [setSlotValue] { setSlotValue(QStringLiteral("curvatureInAlpha"), false); });
+                const QString normalAlpha = state.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("None"));
+                if (normalAlpha != QLatin1String("None") && !info.channels.contains(QStringLiteral("A")))
+                    addFix(true, tr("%1/%2 declares alpha as %3 but the texture has no alpha channel.").arg(setName, spec.name, normalAlpha),
+                        tr("Clear alpha selector"), tr("Clear the alpha selector on %1").arg(spec.name),
+                        [setSlotValue] { setSlotValue(QStringLiteral("alphaCarries"), QStringLiteral("None")); });
+                if (normalAlpha == QLatin1String("Cone Map") && !state.values.value(QStringLiteral("heightInBlue")).toBool(false))
+                    addFix(true, tr("%1/%2 declares alpha as a cone map but B does not carry height; a cone map is baked from the height beside it.").arg(setName, spec.name),
+                        tr("Clear alpha selector"), tr("Clear the alpha selector on %1").arg(spec.name),
+                        [setSlotValue] { setSlotValue(QStringLiteral("alphaCarries"), QStringLiteral("None")); });
                 if (state.values.value(QStringLiteral("layerMaskInAlpha")).toBool(false))
                     addFix(false, tr("%1/%2 carries the retired layer-modulation-in-alpha flag; Normal alpha now carries signed curvature. Repack the old mask into a Layer Coverage texture or switch the layer to Height Blend coverage first if the mask mattered.").arg(setName, spec.name),
                         tr("Remove retired keys"), tr("Remove retired layer-mask keys from %1").arg(spec.name),
@@ -1202,12 +1225,21 @@ QWidget* MainWindow::createValidationPage()
                             m_document.setTextureSlot(setName, key, slotState);
                         });
                 if (!state.values.value(QStringLiteral("heightInBlue")).toBool(false)
-                    && !state.values.value(QStringLiteral("curvatureInAlpha")).toBool(false)
+                    && normalAlpha == QLatin1String("None")
                     && (info.channels.contains(QStringLiteral("B")) || info.channels.contains(QStringLiteral("A")))
                     && info.format != QStringLiteral("BC5"))
                     warnings << tr("%1/%2 only samples RG (height and curvature are off) but the texture carries %3; BC5 would halve the memory.")
                         .arg(setName, spec.name).arg(info.channels.join(QString()));
             }
+            if (spec.key.endsWith(QStringLiteral("SpecularColor"))
+                && state.values.value(QStringLiteral("legacyTintAlpha")).toBool(false))
+                addFix(true, tr("%1/%2 alpha was a tint weight (PBRM v5); v6 reads alpha as the specular IOR map. Bake the weight into RGB and write the material's IOR into alpha.").arg(setName, spec.name),
+                    tr("Bake tint weight"), tr("Bake %1 tint weight into RGB").arg(spec.name),
+                    [this, setName, key = spec.key] {
+                        QString bakeError;
+                        if (!SpecularMigrate::bakeTintSlot(&m_document, setName, key, m_textureRoot, &bakeError))
+                            QMessageBox::warning(this, tr("Bake failed"), bakeError);
+                    });
             QStringList overrideToggles;
             QStringList providedOverrides;
             bool allOverridden = true;
@@ -1494,11 +1526,11 @@ void MainWindow::applyMaterialTemplate(const QString& templateName)
     if (templateName == QStringLiteral("Standard Metal")) {
         m_document.setShaderMode(Pbr::ShaderMode::StandardSurface);
         setSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos"), true,
-            {{"roughness", 0.22}, {"metallic", 1.0}, {"ao", 1.0}, {"f0", 0.04}});
+            {{"roughness", 0.22}, {"metallic", 1.0}, {"ao", 1.0}, {"specularWeight", 1.0}});
     } else if (templateName == QStringLiteral("Painted Metal")) {
         m_document.setShaderMode(Pbr::ShaderMode::StandardSurface);
         setSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos"), true,
-            {{"roughness", 0.32}, {"metallic", 0.15}, {"ao", 1.0}, {"f0", 0.04}});
+            {{"roughness", 0.32}, {"metallic", 0.15}, {"ao", 1.0}, {"specularWeight", 1.0}});
         m_document.setSecondaryUvEnabled(true);
         setSlot(QStringLiteral("UV1"), QStringLiteral("secondaryBaseColor"), true,
             {{"tint", QStringLiteral("#FFFFFF")}, {"blend", QStringLiteral("Masked Replace")}});
@@ -1506,7 +1538,7 @@ void MainWindow::applyMaterialTemplate(const QString& templateName)
     } else if (templateName == QStringLiteral("Plastic")) {
         m_document.setShaderMode(Pbr::ShaderMode::StandardSurface);
         setSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos"), true,
-            {{"roughness", 0.42}, {"metallic", 0.0}, {"ao", 1.0}, {"f0", 0.04}});
+            {{"roughness", 0.42}, {"metallic", 0.0}, {"ao", 1.0}, {"specularWeight", 1.0}});
     } else if (templateName == QStringLiteral("Glass")) {
         m_document.setShaderMode(Pbr::ShaderMode::GlassSurface);
         setSlot(QStringLiteral("UV0"), QStringLiteral("primaryTransmissionAbsorption"), true,
@@ -1544,7 +1576,7 @@ void MainWindow::applyMaterialTemplate(const QString& templateName)
         setSlot(QStringLiteral("Landscape"), QStringLiteral("baseColorArray"), true);
         setSlot(QStringLiteral("Landscape"), QStringLiteral("normalHeightArray"), true);
         setSlot(QStringLiteral("Landscape"), QStringLiteral("rmaosArray"), true,
-            {{"f0", 0.04}});
+            {{"specularWeight", 1.0}});
     }
     m_undoStack->clear();
     m_undoStack->resetClean();

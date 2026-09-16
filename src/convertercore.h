@@ -51,7 +51,10 @@ struct Options {
     float metalSpecStart = 0.20f, metalSpecFull = 0.30f;
     // Gloss/smoothness -> roughness response curve (1 = linear invert).
     float glossCurve = 1.0f;
-    // Dielectric F0 window (the physical dielectric range).
+    // Dielectric F0 window (the physical dielectric range). Since PBRM v6 the
+    // window is expressed as a specular WEIGHT against a material IOR whose
+    // F0 is dielectricF0Max: FO76 weight = clamp(luma / max, min / max, 1),
+    // so weight * F0(ior) reproduces the v5 clamp [min, max] exactly.
     float dielectricF0Min = 0.02f, dielectricF0Max = 0.08f;
     // _s.R is a Blinn-Phong specular intensity with no physical anchor, so the
     // F0 mapping is anchored on the corpus instead: the measured median
@@ -158,13 +161,22 @@ struct Fo76Sources {
     QImage correctionMask;
 };
 
+// IOR whose normal-incidence Fresnel is f0: ior = (1 + sqrt f0) / (1 - sqrt f0).
+float specularIorForF0(float f0);
+// The FO4 anchor: F0(ior) = 0.04 / specMedianReference, so the corpus median
+// _s.R texel keeps landing on the dielectric default while the weight is the
+// raw Blinn-Phong intensity.
+float fo4SpecularIor(const Options& options);
+// The FO76 anchor: F0(ior) = dielectricF0Max (see Options).
+float fo76SpecularIor(const Options& options);
+
 struct ConvertedImages {
     QImage baseColor;      // sRGB + opacity alpha
-    QImage rmaos;          // linear: R rough, G metal, B AO (1.0 until derivations), A dielectric F0
+    QImage rmaos;          // linear: R rough, G metal, B AO (1.0 until derivations), A specular weight (v6)
     QImage emissive;       // sRGB tinted emission + A mask; null when the material does not emit
     QImage subsurface;     // FO76 _l.B scatter mask; null unless the material scatters
-    // Specular TINT (sRGB RGB, A = weight): multiplies the dielectric F0 that
-    // RMAOS.A carries, never raises it. FO76 fills it with the HUE of _r, which
+    // Specular TINT (sRGB RGB; A unused, the converter writes no IOR map):
+    // multiplies the reflectance the material IOR and the weight set. FO76 fills it with the HUE of _r, which
     // the F0 luminance throws away; FO4 fills it from the material's
     // cSpecularColor constant, because an FO4 _s map is BC5 (R spec strength,
     // G gloss) and carries no color at all. Null wherever the tint is white,
@@ -173,6 +185,9 @@ struct ConvertedImages {
     QImage specularColor;
     QImage metallic;       // grayscale metallic confidence (diagnostics / masking UI)
     float metalCoverage = 0; // fraction of texels with metallic > 0.5 (report)
+    // v6: the material's specular IOR scalar (Specular/ior). The converter
+    // anchors the reflectance LEVEL here and writes only the weight per texel.
+    float specularIor = 1.5f;
 };
 
 // The specular tint an FO4/FO76 material's own constant asks for, as a small

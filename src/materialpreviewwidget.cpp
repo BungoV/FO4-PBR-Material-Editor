@@ -509,20 +509,28 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     m_roughness = numberValue(rmaos.values, QStringLiteral("roughness"), 0.5f);
     m_metallic = numberValue(rmaos.values, QStringLiteral("metallic"), 0.0f);
     m_ao = numberValue(rmaos.values, QStringLiteral("ao"), 1.0f);
-    m_f0 = numberValue(rmaos.values, QStringLiteral("f0"), 0.04f);
+    m_specularWeight = numberValue(rmaos.values, QStringLiteral("specularWeight"), 1.0f);
     m_useRoughness = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideRoughness"), !m_hasRmaos);
     m_useMetallic = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideMetallic"), !m_hasRmaos);
     m_useAo = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideAo"), !m_hasRmaos);
-    m_useF0 = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideF0"), !m_hasRmaos);
-    // v5 alpha duty: RMAOS.A carries dielectric F0 or porosity. F0 samples the
-    // channel only while it owns it; porosity resolves alpha -> constant ->
-    // derived saturate(rough * (1 - metal)).
-    m_rmaosAlphaPorosity = rmaos.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Porosity");
-    m_useF0 = m_useF0 && !m_rmaosAlphaPorosity;
+    m_useSpecularWeight = m_hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideSpecularWeight"), !m_hasRmaos);
+    // Alpha duty: RMAOS.A carries specular weight (v6) or porosity. The weight
+    // samples the channel only while it owns it; porosity resolves alpha ->
+    // constant -> derived saturate(rough * (1 - metal)).
+    m_rmaosAlphaPorosity = rmaos.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Specular Weight")) == QLatin1String("Porosity");
+    m_specularIor = static_cast<float>(document.setting(QStringLiteral("Specular"), QStringLiteral("ior"), 1.5).toDouble());
+    m_specularIorMax = static_cast<float>(document.setting(QStringLiteral("Specular"), QStringLiteral("iorMax"), 4.25).toDouble());
+    {
+        const auto specularColorSlot = document.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor"));
+        m_iorInAlpha = boolValue(specularColorSlot.values, QStringLiteral("iorInAlpha"), false);
+    }
+    m_useSpecularWeight = m_useSpecularWeight && !m_rmaosAlphaPorosity;
     m_porosityOverride = boolValue(rmaos.values, QStringLiteral("overridePorosity"), false);
     m_porosityConstant = numberValue(rmaos.values, QStringLiteral("porosity"), .5f);
-    // Signed curvature rides the primary normal alpha; it has no constant.
-    m_curvatureInAlpha = m_hasNormal && boolValue(normal.values, QStringLiteral("curvatureInAlpha"), false);
+    // Signed curvature rides the primary normal alpha when the selector says
+    // so; it has no constant. "Cone Map" reserves the alpha for a parallax
+    // cone map (v6) and yields the AO-derived curvature like "None".
+    m_curvatureInAlpha = m_hasNormal && normal.values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("None")) == QLatin1String("Curvature");
     m_cavitySpecOcclusion = numberValue(normal.values, QStringLiteral("cavitySpecOcclusion"), 1.0f);
     const QColor emission(emissive.values.value(QStringLiteral("color")).toString(QStringLiteral("#FFFFFF")));
     m_emissiveColor = emission.isValid() ? emission : Qt::white;
@@ -579,11 +587,11 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     m_secondaryRoughness = numberValue(secondaryRmaos.values, QStringLiteral("roughness"), .5f);
     m_secondaryMetallic = numberValue(secondaryRmaos.values, QStringLiteral("metallic"), 0.0f);
     m_secondaryAo = numberValue(secondaryRmaos.values, QStringLiteral("ao"), 1.0f);
-    m_secondaryF0 = numberValue(secondaryRmaos.values, QStringLiteral("f0"), .04f);
+    m_secondarySpecularWeight = numberValue(secondaryRmaos.values, QStringLiteral("specularWeight"), 1.0f);
     m_useSecondaryRoughness = m_hasSecondaryRmaos && !boolValue(secondaryRmaos.values, QStringLiteral("overrideRoughness"), !m_hasSecondaryRmaos);
     m_useSecondaryMetallic = m_hasSecondaryRmaos && !boolValue(secondaryRmaos.values, QStringLiteral("overrideMetallic"), !m_hasSecondaryRmaos);
     m_useSecondaryAo = m_hasSecondaryRmaos && !boolValue(secondaryRmaos.values, QStringLiteral("overrideAo"), !m_hasSecondaryRmaos);
-    m_useSecondaryF0 = m_hasSecondaryRmaos && !boolValue(secondaryRmaos.values, QStringLiteral("overrideF0"), !m_hasSecondaryRmaos);
+    m_useSecondarySpecularWeight = m_hasSecondaryRmaos && !boolValue(secondaryRmaos.values, QStringLiteral("overrideSpecularWeight"), !m_hasSecondaryRmaos);
     const QColor secondaryEmission(secondaryEmissive.values.value(QStringLiteral("color")).toString(QStringLiteral("#FFFFFF")));
     m_secondaryEmissiveColor = secondaryEmission.isValid() ? secondaryEmission : Qt::white;
     m_overrideSecondaryEmissiveColor = boolValue(secondaryEmissive.values, QStringLiteral("overrideColor"), !m_hasSecondaryEmissive);
@@ -631,11 +639,11 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     m_tertiaryRoughness = numberValue(tertiaryRmaos.values, QStringLiteral("roughness"), .5f);
     m_tertiaryMetallic = numberValue(tertiaryRmaos.values, QStringLiteral("metallic"), 0.0f);
     m_tertiaryAo = numberValue(tertiaryRmaos.values, QStringLiteral("ao"), 1.0f);
-    m_tertiaryF0 = numberValue(tertiaryRmaos.values, QStringLiteral("f0"), .04f);
+    m_tertiarySpecularWeight = numberValue(tertiaryRmaos.values, QStringLiteral("specularWeight"), 1.0f);
     m_useTertiaryRoughness = m_hasTertiaryRmaos && !boolValue(tertiaryRmaos.values, QStringLiteral("overrideRoughness"), !m_hasTertiaryRmaos);
     m_useTertiaryMetallic = m_hasTertiaryRmaos && !boolValue(tertiaryRmaos.values, QStringLiteral("overrideMetallic"), !m_hasTertiaryRmaos);
     m_useTertiaryAo = m_hasTertiaryRmaos && !boolValue(tertiaryRmaos.values, QStringLiteral("overrideAo"), !m_hasTertiaryRmaos);
-    m_useTertiaryF0 = m_hasTertiaryRmaos && !boolValue(tertiaryRmaos.values, QStringLiteral("overrideF0"), !m_hasTertiaryRmaos);
+    m_useTertiarySpecularWeight = m_hasTertiaryRmaos && !boolValue(tertiaryRmaos.values, QStringLiteral("overrideSpecularWeight"), !m_hasTertiaryRmaos);
     const QColor tertiaryEmission(tertiaryEmissive.values.value(QStringLiteral("color")).toString(QStringLiteral("#FFFFFF")));
     m_tertiaryEmissiveColor = tertiaryEmission.isValid() ? tertiaryEmission : Qt::white;
     m_overrideTertiaryEmissiveColor = boolValue(tertiaryEmissive.values, QStringLiteral("overrideColor"), !m_hasTertiaryEmissive);
@@ -996,11 +1004,11 @@ PbrPreviewGL::CompanionMaterial PbrPreviewGL::makeCompanionMaterial(const QStrin
     companion.roughness = numberValue(rmaos.values, QStringLiteral("roughness"), .5f);
     companion.metallic = numberValue(rmaos.values, QStringLiteral("metallic"), 0.0f);
     companion.ao = numberValue(rmaos.values, QStringLiteral("ao"), 1.0f);
-    companion.f0 = numberValue(rmaos.values, QStringLiteral("f0"), .04f);
+    companion.specularWeight = numberValue(rmaos.values, QStringLiteral("specularWeight"), 1.0f);
     companion.useRoughness = companion.hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideRoughness"), !companion.hasRmaos);
     companion.useMetallic = companion.hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideMetallic"), !companion.hasRmaos);
     companion.useAo = companion.hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideAo"), !companion.hasRmaos);
-    companion.useF0 = companion.hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideF0"), !companion.hasRmaos);
+    companion.useSpecularWeight = companion.hasRmaos && !boolValue(rmaos.values, QStringLiteral("overrideSpecularWeight"), !companion.hasRmaos);
     companion.emissiveColor = jsonColor(emissive.values, QStringLiteral("color"), QStringLiteral("#FFFFFF"));
     companion.overrideEmissiveColor = boolValue(emissive.values, QStringLiteral("overrideColor"), !companion.hasEmissive);
     companion.overrideEmissiveMask = boolValue(emissive.values, QStringLiteral("overrideMask"), !companion.hasEmissive);
@@ -1101,6 +1109,9 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
     // neutral physical inputs: derived porosity, AO-derived curvature, no
     // lighting-side curvature consumers.
     m_program->setUniformValue("uCurvatureInAlpha", false);
+    m_program->setUniformValue("uSpecularIor", 1.5f);
+    m_program->setUniformValue("uSpecularIorMax", 4.25f);
+    m_program->setUniformValue("uIorInAlpha", false);
     m_program->setUniformValue("uCavitySpecOcclusion", 0.0f);
     m_program->setUniformValue("uRmaosAlphaPorosity", false);
     m_program->setUniformValue("uPorosityOverride", false);
@@ -1130,7 +1141,7 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
     m_program->setUniformValue("uUseRoughness", companion.useRoughness);
     m_program->setUniformValue("uUseMetallic", companion.useMetallic);
     m_program->setUniformValue("uUseAo", companion.useAo);
-    m_program->setUniformValue("uUseF0", companion.useF0);
+    m_program->setUniformValue("uUseSpecularWeight", companion.useSpecularWeight);
     m_program->setUniformValue("uBaseFallback", companion.baseFallback);
     m_program->setUniformValue("uTint", companion.tint);
     m_program->setUniformValue("uNormalFallback", companion.normalFallback);
@@ -1141,7 +1152,7 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
     m_program->setUniformValue("uRoughness", companion.roughness);
     m_program->setUniformValue("uMetallic", companion.metallic);
     m_program->setUniformValue("uAo", companion.ao);
-    m_program->setUniformValue("uF0", companion.f0);
+    m_program->setUniformValue("uSpecularWeight", companion.specularWeight);
     m_program->setUniformValue("uEmissiveMask", companion.emissiveMask);
     m_program->setUniformValue("uEmissiveIntensity", companion.emissiveIntensity);
     m_program->setUniformValue("uUvTransform0", companion.uvTransform);
@@ -1575,10 +1586,10 @@ void PbrPreviewGL::initializeGL()
         uniform bool uHasTertiaryBase,uHasTertiaryNormal,uHasTertiaryEmissive,uHasTertiaryCoverage;
         uniform bool uOverrideTertiaryBaseColor,uOverrideTertiaryOpacity,uOverrideTertiaryNormal,uOverrideTertiaryEmissiveColor,uOverrideTertiaryEmissiveMask;
         uniform bool uOverrideTertiaryCoverage,uInvertTertiaryCoverage;
-        uniform bool uUseTertiaryRoughness,uUseTertiaryMetallic,uUseTertiaryAo,uUseTertiaryF0;
+        uniform bool uUseTertiaryRoughness,uUseTertiaryMetallic,uUseTertiaryAo,uUseTertiarySpecularWeight;
         uniform vec3 uTertiaryBaseFallback,uTertiaryTint,uTertiaryNormalFallback,uTertiaryEmissiveColorFallback;
         uniform float uTertiaryOpacity,uTertiaryColorScale,uTertiaryNormalStrength;
-        uniform float uTertiaryRoughness,uTertiaryMetallic,uTertiaryAo,uTertiaryF0,uTertiaryEmissiveMask,uTertiaryEmissiveIntensity;
+        uniform float uTertiaryRoughness,uTertiaryMetallic,uTertiaryAo,uTertiarySpecularWeight,uTertiaryEmissiveMask,uTertiaryEmissiveIntensity;
         uniform int uTertiaryBlendMode,uTCoverageMode,uTPatternSource;
         uniform float uTConstantCoverage,uTCoverageBias,uTCoverageContrast,uTCoverageSoftness;
         uniform float uTertiaryCoverageFallback,uTertiaryCoverageSlotBias,uTertiaryCoverageSlotContrast;
@@ -1642,12 +1653,12 @@ void PbrPreviewGL::initializeGL()
         uniform float uLiquidFillY,uLiquidAbsorption,uMeniscusWidth,uLiquidSurfaceBrightness;
         uniform samplerCube uEnvironment,uPrefilteredEnvironment;
         uniform sampler2D uBrdfLut;uniform sampler2DArray uSpecial;
-        uniform bool uHasBase,uHasNormal,uHasHeight,uHasEmissive,uUseRoughness,uUseMetallic,uUseAo,uUseF0,uOverrideBaseColor,uOverrideOpacity,uOverrideNormal;
+        uniform bool uHasBase,uHasNormal,uHasHeight,uHasEmissive,uUseRoughness,uUseMetallic,uUseAo,uUseSpecularWeight,uOverrideBaseColor,uOverrideOpacity,uOverrideNormal;
         uniform bool uFlatSplit;
         uniform bool uOverrideEmissiveColor,uOverrideEmissiveMask,uOverrideHeight,uHeightBlue,uHeightInvert,uParallaxClip,uIsGround,uCompare,uShadowsEnabled,uDerivedEnvironmentShadow;
         uniform bool uHasSecondaryBase,uHasSecondaryNormal,uHasSecondaryEmissive,uHasLayerCoverage,uOverrideLayerCoverage,uInvertLayerCoverage;
         uniform bool uOverrideSecondaryBaseColor,uOverrideSecondaryOpacity,uOverrideSecondaryNormal,uOverrideSecondaryEmissiveColor,uOverrideSecondaryEmissiveMask;
-        uniform bool uUseSecondaryRoughness,uUseSecondaryMetallic,uUseSecondaryAo,uUseSecondaryF0;
+        uniform bool uUseSecondaryRoughness,uUseSecondaryMetallic,uUseSecondaryAo,uUseSecondarySpecularWeight;
         uniform bool uHasGradient,uOverrideGradientColor,uOverrideGradientOpacity,uUnlitVertexColor,uUnlitExposure;
         uniform bool uDecalBaseColor,uDecalNormal,uDecalRoughness,uDecalMetallic,uDecalAo,uDecalEmissive;
         uniform int uUvSet,uHeightUvSet,uDebugView,uParallaxMode,uParallaxMinSteps,uParallaxMaxSteps,uParallaxRefinementSteps,uParallaxShadowSteps;
@@ -1658,11 +1669,12 @@ void PbrPreviewGL::initializeGL()
         uniform vec3 uTintColorR,uTintColorG,uTintColorB,uTintColorA,uSubsurfaceProfileColor,uGradientColor;
         uniform vec4 uUvTransform0,uUvTransform1,uUvAnimation0,uUvAnimation1;
         uniform mat4 uShadowMatrix;
-        uniform float uOpacity,uColorScale,uNormalStrength,uRoughness,uMetallic,uAo,uF0,uEmissiveMask,uEmissiveIntensity;
+        uniform float uOpacity,uColorScale,uNormalStrength,uRoughness,uMetallic,uAo,uSpecularWeight,uEmissiveMask,uEmissiveIntensity;
+        uniform float uSpecularIor,uSpecularIorMax;uniform bool uIorInAlpha;
         uniform float uHeightFallback,uHeightCenter,uHeightBias,uParallaxDepth,uParallaxGrazingFade,uParallaxShadowStrength,uParallaxShadowBias,uParallaxShadowSoftness,uParallaxFadeStart,uParallaxFadeEnd;
         uniform float uKeyIntensity,uEnvironmentIntensity,uEnvironmentYaw,uExposure,uViewportWidth,uDebugSplit,uEnvironmentSourceMaxLod,uPrefilteredEnvironmentMaxLod,uShadowIntensity,uDerivedEnvironmentShadowWeight;
         uniform float uUvRotation0,uUvRotation1,uGlobalOpacity,uAlphaThreshold,uGlobalNormalStrength,uDiffuseScale,uSpecularScale,uTime;
-        uniform float uSecondaryOpacity,uSecondaryColorScale,uSecondaryNormalStrength,uSecondaryRoughness,uSecondaryMetallic,uSecondaryAo,uSecondaryF0,uSecondaryEmissiveMask,uSecondaryEmissiveIntensity;
+        uniform float uSecondaryOpacity,uSecondaryColorScale,uSecondaryNormalStrength,uSecondaryRoughness,uSecondaryMetallic,uSecondaryAo,uSecondarySpecularWeight,uSecondaryEmissiveMask,uSecondaryEmissiveIntensity;
         uniform float uConstantCoverage,uCoverageBias,uCoverageContrast,uCoverageSoftness,uLayerCoverageFallback,uLayerCoverageSlotBias,uLayerCoverageSlotContrast;
         uniform float uGradientOpacity,uGradientIntensity,uGradientConstant,uUnlitIntensity;
         uniform float uDynamicStrength,uDynamicDriverValue,uDynamicInputMin,uDynamicInputMax;
@@ -2300,21 +2312,31 @@ void PbrPreviewGL::initializeGL()
             float rough=defaults?.5:clamp(uUseRoughness?channelData.r:uRoughness,.035,1.0);
             float metal=defaults?0:clamp(uUseMetallic?channelData.g:uMetallic,0.0,1.0);
             float ao=defaults?1:clamp(uUseAo?channelData.b:uAo,0.0,1.0);
-            // THE CONDUCTOR GUARD, matching the runtime (lane OPENPBR1, item
-            // A4, 2026-09-03). res/Lighting/deferred_prepass.hlsl:863 writes
-            //     const float3 f4fxDielectricF0 = min(f4fxF0Scalar, 0.16).xxx;
-            // so a material authored at F0 0.5 RENDERS at 0.16. Until now this
-            // preview clamped only to [0,1] and showed 0.5, i.e. it lied to the
-            // author about how reflective the surface actually is -- by a
-            // factor of three at the top of the range. 0.16 is the ceiling for
-            // a DIELECTRIC (an IOR around 3, past every ordinary insulator);
-            // above it a surface is a conductor and belongs on the metal side
-            // of the mix, which is why the guard is on the authored scalar and
-            // not on the blended F0. OpenPBR's own level is specular_ior with
-            // the default 1.5 -> F0 0.04 (spec [unmodulated_fresnel]); ours is
-            // an authored F0 standing in for that IOR, so the guard is where
-            // the two parametrizations are reconciled.
-            float dielectric=defaults?.04:min(clamp(uUseF0?channelData.a:uF0,0.0,1.0),0.16);
+            // v6 SPECULAR MODEL (docs/PBRM-v6-Specular.md section 2). RMAOS alpha
+            // is OpenPBR specular_weight: a 0..1 multiplier on the level the
+            // IOR sets, F0_ior = ((ior-1)/(ior+1))^2. The IOR is the material
+            // scalar, or the specular colour map's alpha over [0,uSpecularIorMax]
+            // when that slot declares it (Option A: the map replaces the
+            // scalar, never multiplies it). The colour map's RGB stays the
+            // OpenPBR specular_color tint on the dielectric Fresnel; it is
+            // sampled here, above the surface-state blend, so states weather
+            // the resolved F0. The 0.16 conductor guard of lane OPENPBR1 A4 is
+            // gone: the weight can only lower the level and the IOR owns it,
+            // so there is no authored F0 left to clamp; the runtime drops its
+            // min(f4fxF0Scalar, 0.16) in the same change.
+            // DIVERGENCE, deliberate: the runtime samples the colour map
+            // through an sRGB SRV (the exact piecewise transfer); the preview
+            // decodes with pow(2.2) like every other sRGB input here.
+            float specWeight=defaults?1.0:clamp(uUseSpecularWeight?channelData.a:uSpecularWeight,0.0,1.0);
+            float specIor=uSpecularIor;
+            vec3 specularTint=vec3(1.0);
+            if(hasSpecial(uSpecularColorLayer)&&!defaults){
+                vec4 specularColorSample=specialSample(uSpecularColorLayer,uv);
+                specularTint=clamp(pow(specularColorSample.rgb,vec3(2.2)),0.0,1.0);
+                if(uIorInAlpha)specIor=clamp(specularColorSample.a,0.0,1.0)*uSpecularIorMax;
+            }
+            float iorF0=(specIor-1.0)/(specIor+1.0);iorF0*=iorF0;
+            vec3 dielectricF0=defaults?vec3(.04):vec3(specWeight*iorF0)*specularTint;
             if(uDecalEnabled&&!defaults){if(!uDecalRoughness)rough=.5;if(!uDecalMetallic)metal=0.0;if(!uDecalAo)ao=1.0;}
             if(uShaderMode==7&&hasSpecial(15)&&!defaults)rough=clamp(rough+(landscapeMacro.a-.5)*2.0*uLandscapeMacroRoughnessStrength,.035,1.0);
             if(uSecondaryLayerActive&&layerCoverage>0.0&&!defaults){
@@ -2322,16 +2344,16 @@ void PbrPreviewGL::initializeGL()
                 float sr=clamp(uUseSecondaryRoughness?secondaryChannels.r:uSecondaryRoughness,.035,1.0);
                 float sm=clamp(uUseSecondaryMetallic?secondaryChannels.g:uSecondaryMetallic,0.0,1.0);
                 float sa=clamp(uUseSecondaryAo?secondaryChannels.b:uSecondaryAo,0.0,1.0);
-                float sf=clamp(uUseSecondaryF0?secondaryChannels.a:uSecondaryF0,0.0,1.0);
-                rough=mix(rough,sr,layerCoverage);metal=mix(metal,sm,layerCoverage);ao=mix(ao,sa,layerCoverage);dielectric=mix(dielectric,sf,layerCoverage);
+                float sf=clamp(uUseSecondarySpecularWeight?secondaryChannels.a:uSecondarySpecularWeight,0.0,1.0);
+                rough=mix(rough,sr,layerCoverage);metal=mix(metal,sm,layerCoverage);ao=mix(ao,sa,layerCoverage);dielectricF0=mix(dielectricF0,vec3(sf*iorF0),layerCoverage);
             }
             if(uTertiaryLayerActive&&tertiaryCoverage>0.0&&!defaults){
                 vec4 tertiaryChannels=texture(uTertiaryRmaos,uv2);
                 float tr=clamp(uUseTertiaryRoughness?tertiaryChannels.r:uTertiaryRoughness,.035,1.0);
                 float tm=clamp(uUseTertiaryMetallic?tertiaryChannels.g:uTertiaryMetallic,0.0,1.0);
                 float ta=clamp(uUseTertiaryAo?tertiaryChannels.b:uTertiaryAo,0.0,1.0);
-                float tf=clamp(uUseTertiaryF0?tertiaryChannels.a:uTertiaryF0,0.0,1.0);
-                rough=mix(rough,tr,tertiaryCoverage);metal=mix(metal,tm,tertiaryCoverage);ao=mix(ao,ta,tertiaryCoverage);dielectric=mix(dielectric,tf,tertiaryCoverage);
+                float tf=clamp(uUseTertiarySpecularWeight?tertiaryChannels.a:uTertiarySpecularWeight,0.0,1.0);
+                rough=mix(rough,tr,tertiaryCoverage);metal=mix(metal,tm,tertiaryCoverage);ao=mix(ao,ta,tertiaryCoverage);dielectricF0=mix(dielectricF0,vec3(tf*iorF0),tertiaryCoverage);
             }
             if(hasSpecial(uDetailNormalLayer)&&!defaults&&uDetailNormalStrength>0.0){
                 // Tiling micro-detail normal: cheap close-range surface texture
@@ -2439,8 +2461,8 @@ void PbrPreviewGL::initializeGL()
                     float roughWeight=uStateRoughWeight[i]*cover*mix(1.0,1.0-statePorosity*.6,porosityMix);
                     if(uStateRoughMode[i]==1)rough=mix(rough,clamp(rough+uStateRoughTarget[i],0.0,1.0),roughWeight);
                     else rough=mix(rough,uStateRoughTarget[i],roughWeight);
-                    dielectric=mix(dielectric,uStateF0Target[i],uStateF0Weight[i]*cover);
-                    dielectric=max(dielectric,uStateFilmF0[i]*cover*(1.0-statePorosity*porosityMix));
+                    dielectricF0=mix(dielectricF0,vec3(uStateF0Target[i]),uStateF0Weight[i]*cover);
+                    dielectricF0=max(dielectricF0,vec3(uStateFilmF0[i]*cover*(1.0-statePorosity*porosityMix)));
                     if(uStateKillMetallic[i]==1)metal=mix(metal,0.0,cover);
                     stateSparkle+=cover*uStateSparkle[i];
                     if(uStateGlowIntensity[i]>0.0){
@@ -2482,23 +2504,6 @@ void PbrPreviewGL::initializeGL()
             float resolvedHeight=defaults?.5:uHeightFallback;
             if(!defaults&&uHasHeight&&!uOverrideHeight){vec4 heightSample=texture(uHeight,heightUv);resolvedHeight=uHeightBlue?heightSample.b:heightSample.r;}
             if(!defaults&&uHeightInvert)resolvedHeight=1.0-resolvedHeight;resolvedHeight=clamp(resolvedHeight+uHeightBias,0.0,1.0);
-            // Dielectric F0 becomes a color here. The specular map TINTS it
-            // (OpenPBR specular_color): RGB multiplies the level RMAOS alpha
-            // owns, so it can only darken or hue-shift, and A weighs the tint
-            // in. White RGB and zero weight are both exactly 1.0, so a material
-            // without the map keeps the scalar path untouched. The 0.16 ceiling
-            // is the runtime's dielectric clamp, mirrored here so the preview
-            // and the game agree on the level as well as the hue.
-            // DIVERGENCE, deliberate: the runtime samples this map through an
-            // sRGB SRV (the exact piecewise transfer); the preview decodes with
-            // pow(2.2), the same approximation it uses for every other sRGB
-            // input, so very dark tints differ slightly between the two.
-            vec3 specularTint=vec3(1.0);
-            if(hasSpecial(uSpecularColorLayer)&&!defaults){
-                vec4 specularColorSample=specialSample(uSpecularColorLayer,uv);
-                specularTint=mix(vec3(1.0),clamp(pow(specularColorSample.rgb,vec3(2.2)),0.0,1.0),clamp(specularColorSample.a,0.0,1.0));
-            }
-            vec3 dielectricF0=vec3(min(dielectric,0.16))*specularTint;
             // Debug split view: left of the divider renders uDebugViewLeft
             // (default Shaded), the right the inspected map (uDebugSplit 0 =
             // map fills the view). Any A|B channel pairing works.
@@ -2633,7 +2638,7 @@ void PbrPreviewGL::initializeGL()
             float heightVisibility=(uParallaxMode==3&&!defaults)?parallaxShadow(uv,hitDepth,normalize(worldToTangent*L)):1.0;
             float keyShadow=shadowVisibility(vWorldPosition,N);
             vec3 color=(uShaderMode==10
-                ? (base*(.15+.85*NoL)+vec3(dielectric)*pow(NoH,mix(8.0,96.0,1.0-rough))*NoL)*uKeyColor*uKeyIntensity
+                ? (base*(.15+.85*NoL)+dielectricF0*pow(NoH,mix(8.0,96.0,1.0-rough))*NoL)*uKeyColor*uKeyIntensity
                 : (diffuse+spec)*uKeyColor*uKeyIntensity*NoL*heightVisibility)*keyShadow;
             vec3 R=reflect(-V,anisoBentN);
             vec3 environmentR=environmentDirection(R);
@@ -3544,16 +3549,16 @@ void PbrPreviewGL::uploadTextures()
     uploadTexture(m_baseTexture,m_baseImage,Qt::white);
     uploadTexture(m_normalTexture,m_normalImage,QColor(128,128,255));
     uploadTexture(m_heightTexture,m_heightImage,QColor::fromRgbF(m_heightCenter,m_heightCenter,m_heightCenter));
-    uploadTexture(m_rmaosTexture,m_rmaosImage,QColor::fromRgbF(m_roughness,m_metallic,m_ao,m_f0));
+    uploadTexture(m_rmaosTexture,m_rmaosImage,QColor::fromRgbF(m_roughness,m_metallic,m_ao,m_specularWeight));
     uploadTexture(m_emissiveTexture,m_emissiveImage,Qt::white);
     uploadTexture(m_secondaryBaseTexture,m_secondaryBaseImage,Qt::white);
     uploadTexture(m_secondaryNormalTexture,m_secondaryNormalImage,QColor(128,128,255));
-    uploadTexture(m_secondaryRmaosTexture,m_secondaryRmaosImage,QColor::fromRgbF(m_secondaryRoughness,m_secondaryMetallic,m_secondaryAo,m_secondaryF0));
+    uploadTexture(m_secondaryRmaosTexture,m_secondaryRmaosImage,QColor::fromRgbF(m_secondaryRoughness,m_secondaryMetallic,m_secondaryAo,m_secondarySpecularWeight));
     uploadTexture(m_secondaryEmissiveTexture,m_secondaryEmissiveImage,Qt::white);
     uploadTexture(m_layerCoverageTexture,m_layerCoverageImage,Qt::white);
     uploadTexture(m_tertiaryBaseTexture,m_tertiaryBaseImage,Qt::white);
     uploadTexture(m_tertiaryNormalTexture,m_tertiaryNormalImage,QColor(128,128,255));
-    uploadTexture(m_tertiaryRmaosTexture,m_tertiaryRmaosImage,QColor::fromRgbF(m_tertiaryRoughness,m_tertiaryMetallic,m_tertiaryAo,m_tertiaryF0));
+    uploadTexture(m_tertiaryRmaosTexture,m_tertiaryRmaosImage,QColor::fromRgbF(m_tertiaryRoughness,m_tertiaryMetallic,m_tertiaryAo,m_tertiarySpecularWeight));
     uploadTexture(m_tertiaryEmissiveTexture,m_tertiaryEmissiveImage,Qt::white);
     uploadTexture(m_tertiaryCoverageTexture,m_tertiaryCoverageImage,Qt::white);
     {
@@ -5071,10 +5076,10 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uOverrideTertiaryCoverage",m_overrideTertiaryCoverage);m_program->setUniformValue("uInvertTertiaryCoverage",m_invertTertiaryCoverage);m_program->setUniformValue("uTertiaryCoverageFallback",m_tertiaryCoverageFallback);m_program->setUniformValue("uTertiaryCoverageSlotBias",m_tertiaryCoverageSlotBias);m_program->setUniformValue("uTertiaryCoverageSlotContrast",m_tertiaryCoverageSlotContrast);
     m_program->setUniformValue("uOverrideTertiaryBaseColor",m_overrideTertiaryBaseColor);m_program->setUniformValue("uOverrideTertiaryOpacity",m_overrideTertiaryOpacity);m_program->setUniformValue("uOverrideTertiaryNormal",m_overrideTertiaryNormal);
     m_program->setUniformValue("uOverrideTertiaryEmissiveColor",m_overrideTertiaryEmissiveColor);m_program->setUniformValue("uOverrideTertiaryEmissiveMask",m_overrideTertiaryEmissiveMask);
-    m_program->setUniformValue("uUseTertiaryRoughness",m_useTertiaryRoughness);m_program->setUniformValue("uUseTertiaryMetallic",m_useTertiaryMetallic);m_program->setUniformValue("uUseTertiaryAo",m_useTertiaryAo);m_program->setUniformValue("uUseTertiaryF0",m_useTertiaryF0);
+    m_program->setUniformValue("uUseTertiaryRoughness",m_useTertiaryRoughness);m_program->setUniformValue("uUseTertiaryMetallic",m_useTertiaryMetallic);m_program->setUniformValue("uUseTertiaryAo",m_useTertiaryAo);m_program->setUniformValue("uUseTertiarySpecularWeight",m_useTertiarySpecularWeight);
     m_program->setUniformValue("uTertiaryBaseFallback",QVector3D(m_tertiaryBaseColor.redF(),m_tertiaryBaseColor.greenF(),m_tertiaryBaseColor.blueF()));m_program->setUniformValue("uTertiaryTint",QVector3D(m_tertiaryTint.redF(),m_tertiaryTint.greenF(),m_tertiaryTint.blueF()));m_program->setUniformValue("uTertiaryNormalFallback",QVector3D(m_tertiaryNormalColor.redF(),m_tertiaryNormalColor.greenF(),m_tertiaryNormalColor.blueF()));m_program->setUniformValue("uTertiaryEmissiveColorFallback",QVector3D(m_tertiaryEmissiveColor.redF(),m_tertiaryEmissiveColor.greenF(),m_tertiaryEmissiveColor.blueF()));
     m_program->setUniformValue("uTertiaryOpacity",m_tertiaryOpacity);m_program->setUniformValue("uTertiaryColorScale",m_tertiaryColorScale);m_program->setUniformValue("uTertiaryNormalStrength",m_tertiaryNormalStrength);
-    m_program->setUniformValue("uTertiaryRoughness",m_tertiaryRoughness);m_program->setUniformValue("uTertiaryMetallic",m_tertiaryMetallic);m_program->setUniformValue("uTertiaryAo",m_tertiaryAo);m_program->setUniformValue("uTertiaryF0",m_tertiaryF0);
+    m_program->setUniformValue("uTertiaryRoughness",m_tertiaryRoughness);m_program->setUniformValue("uTertiaryMetallic",m_tertiaryMetallic);m_program->setUniformValue("uTertiaryAo",m_tertiaryAo);m_program->setUniformValue("uTertiarySpecularWeight",m_tertiarySpecularWeight);
     m_program->setUniformValue("uTertiaryEmissiveMask",m_tertiaryEmissiveMask);m_program->setUniformValue("uTertiaryEmissiveIntensity",m_tertiaryEmissiveIntensity);
     m_program->setUniformValue("uTertiaryBlendMode",m_tertiaryBlendMode);m_program->setUniformValue("uTCoverageMode",m_tCoverageMode);m_program->setUniformValue("uTPatternSource",m_tPatternSource);
     m_program->setUniformValue("uTConstantCoverage",m_tConstantCoverage);m_program->setUniformValue("uTCoverageBias",m_tCoverageBias);m_program->setUniformValue("uTCoverageContrast",m_tCoverageContrast);m_program->setUniformValue("uTCoverageSoftness",m_tCoverageSoftness);
@@ -5111,15 +5116,15 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uOverrideSecondaryBaseColor",m_overrideSecondaryBaseColor);m_program->setUniformValue("uOverrideSecondaryOpacity",m_overrideSecondaryOpacity);m_program->setUniformValue("uOverrideSecondaryNormal",m_overrideSecondaryNormal);
     m_program->setUniformValue("uOverrideSecondaryEmissiveColor",m_overrideSecondaryEmissiveColor);m_program->setUniformValue("uOverrideSecondaryEmissiveMask",m_overrideSecondaryEmissiveMask);
     const bool liveRmaos=m_liveMaterial&&!m_rmaosImage.isNull();
-    m_program->setUniformValue("uUseRoughness",m_useRoughness||liveRmaos);m_program->setUniformValue("uUseMetallic",m_useMetallic||liveRmaos);m_program->setUniformValue("uUseAo",m_useAo||liveRmaos);m_program->setUniformValue("uUseF0",m_useF0||liveRmaos);
-    m_program->setUniformValue("uUseSecondaryRoughness",m_useSecondaryRoughness);m_program->setUniformValue("uUseSecondaryMetallic",m_useSecondaryMetallic);m_program->setUniformValue("uUseSecondaryAo",m_useSecondaryAo);m_program->setUniformValue("uUseSecondaryF0",m_useSecondaryF0);
+    m_program->setUniformValue("uUseRoughness",m_useRoughness||liveRmaos);m_program->setUniformValue("uUseMetallic",m_useMetallic||liveRmaos);m_program->setUniformValue("uUseAo",m_useAo||liveRmaos);m_program->setUniformValue("uUseSpecularWeight",m_useSpecularWeight||liveRmaos);
+    m_program->setUniformValue("uUseSecondaryRoughness",m_useSecondaryRoughness);m_program->setUniformValue("uUseSecondaryMetallic",m_useSecondaryMetallic);m_program->setUniformValue("uUseSecondaryAo",m_useSecondaryAo);m_program->setUniformValue("uUseSecondarySpecularWeight",m_useSecondarySpecularWeight);
     m_program->setUniformValue("uBaseFallback",QVector3D(m_baseColor.redF(),m_baseColor.greenF(),m_baseColor.blueF()));m_program->setUniformValue("uTint",QVector3D(m_tint.redF(),m_tint.greenF(),m_tint.blueF()));m_program->setUniformValue("uNormalFallback",QVector3D(m_normalColor.redF(),m_normalColor.greenF(),m_normalColor.blueF()));m_program->setUniformValue("uEmissiveColor",QVector3D(m_emissiveColor.redF(),m_emissiveColor.greenF(),m_emissiveColor.blueF()));
     m_program->setUniformValue("uSecondaryBaseFallback",QVector3D(m_secondaryBaseColor.redF(),m_secondaryBaseColor.greenF(),m_secondaryBaseColor.blueF()));m_program->setUniformValue("uSecondaryTint",QVector3D(m_secondaryTint.redF(),m_secondaryTint.greenF(),m_secondaryTint.blueF()));m_program->setUniformValue("uSecondaryNormalFallback",QVector3D(m_secondaryNormalColor.redF(),m_secondaryNormalColor.greenF(),m_secondaryNormalColor.blueF()));m_program->setUniformValue("uSecondaryEmissiveColor",QVector3D(m_secondaryEmissiveColor.redF(),m_secondaryEmissiveColor.greenF(),m_secondaryEmissiveColor.blueF()));
     m_program->setUniformValue("uKeyColor",QVector3D(m_keyColor.redF(),m_keyColor.greenF(),m_keyColor.blueF()));m_program->setUniformValue("uKeyDirection",keyDirection());m_program->setUniformValue("uKeyIntensity",effectiveKeyIntensity());
     m_program->setUniformValue("uFlatTiling",m_flatView?float(m_flatTiling):1.0f);
-    m_program->setUniformValue("uOpacity",m_opacity);m_program->setUniformValue("uColorScale",m_colorScale);m_program->setUniformValue("uNormalStrength",m_normalStrength);m_program->setUniformValue("uRoughness",m_roughness);m_program->setUniformValue("uMetallic",m_metallic);m_program->setUniformValue("uAo",m_ao);m_program->setUniformValue("uF0",m_f0);m_program->setUniformValue("uEmissiveMask",m_emissiveMask);m_program->setUniformValue("uEmissiveIntensity",m_emissiveIntensity);
+    m_program->setUniformValue("uOpacity",m_opacity);m_program->setUniformValue("uColorScale",m_colorScale);m_program->setUniformValue("uNormalStrength",m_normalStrength);m_program->setUniformValue("uRoughness",m_roughness);m_program->setUniformValue("uMetallic",m_metallic);m_program->setUniformValue("uAo",m_ao);m_program->setUniformValue("uSpecularWeight",m_specularWeight);m_program->setUniformValue("uSpecularIor",m_specularIor);m_program->setUniformValue("uSpecularIorMax",m_specularIorMax);m_program->setUniformValue("uIorInAlpha",m_iorInAlpha);m_program->setUniformValue("uEmissiveMask",m_emissiveMask);m_program->setUniformValue("uEmissiveIntensity",m_emissiveIntensity);
     m_program->setUniformValue("uSecondaryOpacity",m_secondaryOpacity);m_program->setUniformValue("uSecondaryColorScale",m_secondaryColorScale);m_program->setUniformValue("uSecondaryNormalStrength",m_secondaryNormalStrength);
-    m_program->setUniformValue("uSecondaryRoughness",m_secondaryRoughness);m_program->setUniformValue("uSecondaryMetallic",m_secondaryMetallic);m_program->setUniformValue("uSecondaryAo",m_secondaryAo);m_program->setUniformValue("uSecondaryF0",m_secondaryF0);
+    m_program->setUniformValue("uSecondaryRoughness",m_secondaryRoughness);m_program->setUniformValue("uSecondaryMetallic",m_secondaryMetallic);m_program->setUniformValue("uSecondaryAo",m_secondaryAo);m_program->setUniformValue("uSecondarySpecularWeight",m_secondarySpecularWeight);
     m_program->setUniformValue("uSecondaryEmissiveMask",m_secondaryEmissiveMask);m_program->setUniformValue("uSecondaryEmissiveIntensity",m_secondaryEmissiveIntensity);
     m_program->setUniformValue("uSecondaryBlendMode",m_secondaryBlendMode);m_program->setUniformValue("uCoverageMode",m_coverageMode);m_program->setUniformValue("uPatternSource",m_patternSource);
     m_program->setUniformValue("uConstantCoverage",m_constantCoverage);m_program->setUniformValue("uCoverageBias",m_coverageBias);m_program->setUniformValue("uCoverageContrast",m_coverageContrast);m_program->setUniformValue("uCoverageSoftness",m_coverageSoftness);

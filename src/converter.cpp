@@ -316,6 +316,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         converted.emissive = options.supplied.emissive;
         converted.subsurface = options.supplied.subsurface;
         converted.specularColor = options.supplied.specularColor;
+        converted.specularIor = options.supplied.specularIor;
         converted.metalCoverage = options.supplied.metalCoverage;
         result.notes.append(options.supplied.notes);
     } else if (fallout76) {
@@ -510,7 +511,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
             bgem ? QJsonObject{{QStringLiteral("tint"),
                 QColor::fromRgbF(material.baseColor.x(), material.baseColor.y(), material.baseColor.z()).name()}} : QJsonObject{});
     if (!normalPortable.isEmpty()) {
-        QJsonObject values{{QStringLiteral("curvatureInAlpha"), true}};
+        QJsonObject values{{QStringLiteral("alphaCarries"), QStringLiteral("Curvature")}};
         if (options.heightInBlue) values.insert(QStringLiteral("heightInBlue"), true);
         wireSlot(&document, QStringLiteral("primaryNormal"), normalPortable, values);
     }
@@ -521,6 +522,9 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
         rmaosSlot.path = QDir::toNativeSeparators(rmaosPortable);
         document.setTextureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos"), rmaosSlot);
     }
+    // v6: the reflectance level is the material's specular IOR; RMAOS.A only
+    // weighs it. Written even at the default so the file states its anchor.
+    document.setSetting(QStringLiteral("Specular"), QStringLiteral("ior"), double(converted.specularIor));
     if (!emissivePortable.isEmpty())
         wireSlot(&document, QStringLiteral("primaryEmissive"), emissivePortable,
             QJsonObject{{QStringLiteral("intensity"), double(std::max(material.emittanceMult, 0.0f))}});

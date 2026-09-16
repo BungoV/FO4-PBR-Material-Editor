@@ -1,6 +1,6 @@
 {
   "schema": "FO4.PBRM.Material",
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "shader": "Landscape",
   "secondaryUvEnabled": false,
   "primaryUv": {},
@@ -30,8 +30,8 @@
           "overrideRoughness": false,
           "overrideMetallic": false,
           "overrideAo": false,
-          "overrideF0": true,
-          "f0": 0.04
+          "overrideSpecularWeight": true,
+          "specularWeight": 1.0
         }
       }
     }

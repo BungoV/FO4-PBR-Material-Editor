@@ -354,8 +354,8 @@ bool TextureSlotWidget::channelOverrideApplicable(const FieldSpec& field, const 
     // alpha actually carries F0. (Porosity's constant toggle is deliberately
     // not a channel source at all — unchecked with no texture porosity means
     // the derived roughness/metallic heuristic, never a forced constant.)
-    if (field.key == QStringLiteral("overrideF0") && m_fieldEditors.contains(QStringLiteral("alphaCarries")))
-        return values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Dielectric F0")) == QLatin1String("Dielectric F0");
+    if (field.key == QStringLiteral("overrideSpecularWeight") && m_fieldEditors.contains(QStringLiteral("alphaCarries")))
+        return values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("Specular Weight")) == QLatin1String("Specular Weight");
     return true;
 }
 
@@ -410,7 +410,7 @@ void TextureSlotWidget::updateAdvancedVisibility()
     static const QSet<QString> basicKeys{
         QStringLiteral("tint"), QStringLiteral("scale"), QStringLiteral("blend"),
         QStringLiteral("strength"), QStringLiteral("color"), QStringLiteral("opacity"), QStringLiteral("intensity"),
-        QStringLiteral("roughness"), QStringLiteral("metallic"), QStringLiteral("ao"), QStringLiteral("f0"),
+        QStringLiteral("roughness"), QStringLiteral("metallic"), QStringLiteral("ao"), QStringLiteral("specularWeight"),
         QStringLiteral("heightInBlue")
     };
     for (auto it = m_fieldEditors.cbegin(); it != m_fieldEditors.cend(); ++it) {
@@ -518,10 +518,10 @@ void TextureSlotWidget::updateThumbnail()
                     warnings.append(tr("normal maps should use BC5 or BC7"));
             }
             if (m_spec.key.contains(QStringLiteral("Rmaos"), Qt::CaseInsensitive)
-                && !m_state.values.value(QStringLiteral("overrideF0")).toBool(true)
+                && !m_state.values.value(QStringLiteral("overrideSpecularWeight")).toBool(true)
                 && info.format != QStringLiteral("BC3") && info.format != QStringLiteral("BC7")
                 && info.format != QStringLiteral("RGBA32"))
-                warnings.append(tr("authored F0 requires an alpha-capable format such as BC7"));
+                warnings.append(tr("authored specular weight requires an alpha-capable format such as BC7"));
             QString text = info.summary();
             if (!warnings.isEmpty()) text += tr(" | Warning: %1").arg(warnings.join(QStringLiteral("; ")));
             if (!missing.isEmpty()) text += tr(" • Missing %1 (constant/optional)").arg(missing.join(QStringLiteral(", ")));

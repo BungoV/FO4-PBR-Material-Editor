@@ -9,6 +9,7 @@
 #include "geometryao.h"
 #include "maskpaint.h"
 #include "materialdocument.h"
+#include "specularmigrate.h"
 #include "disclosureicon.h"
 #include "texturearchive.h"
 #include "texturecache.h"
@@ -499,7 +500,8 @@ int main(int argc, char* argv[])
     check(migratedOverrides.fromJson(legacyRoot, &migrationError), QStringLiteral("legacy texture-source booleans migrate: %1").arg(migrationError));
     const QJsonObject migratedValues = migratedOverrides.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values;
     check(!migratedValues.value(QStringLiteral("overrideRoughness")).toBool(true)
-            && migratedValues.value(QStringLiteral("overrideF0")).toBool(false)
+            && migratedValues.value(QStringLiteral("overrideSpecularWeight")).toBool(false)
+            && !migratedValues.contains(QStringLiteral("overrideF0"))
             && !migratedValues.value(QStringLiteral("overrideMask")).toBool(true)
             && migratedValues.value(QStringLiteral("overrideMaskR")).toBool(false)
             && qFuzzyCompare(migratedValues.value(QStringLiteral("height")).toDouble(), 0.25)
@@ -508,6 +510,110 @@ int main(int argc, char* argv[])
             && !migratedValues.contains(QStringLiteral("useMask"))
             && !migratedValues.contains(QStringLiteral("fallback")),
         QStringLiteral("legacy source booleans and height fallback become positive constant overrides"));
+
+    // ---- PBRM v6: specular weight, specular IOR, normal alpha selector ----
+    // docs/PBRM-v6-Specular.md section 4. Constants migrate exactly (weight =
+    // min(f0 / 0.04, 1); f0 > 0.04 moves the level into the material IOR);
+    // texels cannot and are marked for the repack.
+    {
+        const auto v5Root = [](int schemaVersion, const QJsonObject& rmaosValues, const QJsonObject& normalValues, bool withSpecColor) {
+            QJsonObject primary{
+                {QStringLiteral("primaryRmaos"), QJsonObject{{QStringLiteral("enabled"), true}, {QStringLiteral("expanded"), true},
+                    {QStringLiteral("path"), QStringLiteral("old_rmaos.dds")}, {QStringLiteral("values"), rmaosValues}}},
+                {QStringLiteral("primaryNormal"), QJsonObject{{QStringLiteral("enabled"), true}, {QStringLiteral("expanded"), true},
+                    {QStringLiteral("path"), QStringLiteral("old_n.dds")}, {QStringLiteral("values"), normalValues}}}};
+            if (withSpecColor)
+                primary.insert(QStringLiteral("primarySpecularColor"), QJsonObject{{QStringLiteral("enabled"), true}, {QStringLiteral("expanded"), true},
+                    {QStringLiteral("path"), QStringLiteral("old_spec.dds")}, {QStringLiteral("values"), QJsonObject()}});
+            return QJsonObject{{QStringLiteral("schema"), QStringLiteral("FO4.PBRM.Material")},
+                {QStringLiteral("schemaVersion"), schemaVersion}, {QStringLiteral("shader"), QStringLiteral("Standard")},
+                {QStringLiteral("secondaryUvEnabled"), false}, {QStringLiteral("primaryUv"), primary},
+                {QStringLiteral("secondaryUv"), QJsonObject()}, {QStringLiteral("resources"), QJsonObject()},
+                {QStringLiteral("settings"), QJsonObject()}};
+        };
+        QString v6Error;
+        const QJsonObject constantLow{{QStringLiteral("f0"), 0.02}, {QStringLiteral("overrideF0"), true}};
+        Pbr::MaterialDocument low;
+        check(low.fromJson(v5Root(5, constantLow, QJsonObject{{QStringLiteral("curvatureInAlpha"), true}}, false), &v6Error),
+            QStringLiteral("v6: a v5 document loads: %1").arg(v6Error));
+        const QJsonObject lowValues = low.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values;
+        check(qFuzzyCompare(lowValues.value(QStringLiteral("specularWeight")).toDouble(), 0.5)
+                && lowValues.value(QStringLiteral("overrideSpecularWeight")).toBool(false)
+                && !lowValues.contains(QStringLiteral("f0")) && !lowValues.contains(QStringLiteral("overrideF0"))
+                && !lowValues.contains(QStringLiteral("legacyF0Alpha")),
+            QStringLiteral("v6: constant F0 0.02 becomes specular weight 0.5 at IOR 1.5 (exact)"));
+        check(!low.settingGroup(QStringLiteral("Specular")).contains(QStringLiteral("ior")),
+            QStringLiteral("v6: an F0 at or under 0.04 writes no material IOR"));
+        check(low.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.value(QStringLiteral("alphaCarries")).toString() == QLatin1String("Curvature")
+                && !low.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.contains(QStringLiteral("curvatureInAlpha")),
+            QStringLiteral("v6: curvatureInAlpha=true becomes the Curvature selector and the bool is gone"));
+
+        const QJsonObject constantHigh{{QStringLiteral("f0"), 0.16}, {QStringLiteral("overrideF0"), true}};
+        Pbr::MaterialDocument high;
+        check(high.fromJson(v5Root(5, constantHigh, QJsonObject(), false), &v6Error), QStringLiteral("v6: high constant loads"));
+        check(qFuzzyCompare(high.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values.value(QStringLiteral("specularWeight")).toDouble(), 1.0)
+                && qFuzzyCompare(high.setting(QStringLiteral("Specular"), QStringLiteral("ior")).toDouble(), (1.0 + 0.4) / (1.0 - 0.4)),
+            QStringLiteral("v6: constant F0 0.16 becomes weight 1 at IOR 2.333 (exact)"));
+        check(high.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal")).values.value(QStringLiteral("alphaCarries")).toString(QStringLiteral("None")) == QLatin1String("None"),
+            QStringLiteral("v6: a normal without curvature gets the None selector"));
+
+        const QJsonObject authored{{QStringLiteral("f0"), 0.04}, {QStringLiteral("overrideF0"), false}};
+        Pbr::MaterialDocument marked;
+        check(marked.fromJson(v5Root(5, authored, QJsonObject(), true), &v6Error), QStringLiteral("v6: authored-alpha document loads"));
+        const QJsonObject markedValues = marked.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values;
+        check(markedValues.value(QStringLiteral("legacyF0Alpha")).toBool(false) && markedValues.value(QStringLiteral("overrideSpecularWeight")).toBool(false),
+            QStringLiteral("v6: an authored F0 alpha is marked legacy and the constant override is forced on"));
+        check(marked.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySpecularColor")).values.value(QStringLiteral("legacyTintAlpha")).toBool(false),
+            QStringLiteral("v6: a v5 specular colour map is marked as carrying a tint-weight alpha"));
+
+        const QJsonObject porosity{{QStringLiteral("f0"), 0.04}, {QStringLiteral("overrideF0"), false}, {QStringLiteral("alphaCarries"), QStringLiteral("Porosity")}};
+        Pbr::MaterialDocument porous;
+        check(porous.fromJson(v5Root(5, porosity, QJsonObject(), false), &v6Error), QStringLiteral("v6: porosity document loads"));
+        check(!porous.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values.contains(QStringLiteral("legacyF0Alpha")),
+            QStringLiteral("v6: a porosity alpha carries no F0 and gets no marker"));
+
+        Pbr::MaterialDocument gate;
+        check(!gate.fromJson(v5Root(3, constantLow, QJsonObject(), false), &v6Error), QStringLiteral("v6: schema 3 is refused"));
+        check(!gate.fromJson(v5Root(7, constantLow, QJsonObject(), false), &v6Error), QStringLiteral("v6: schema 7 is refused"));
+        check(gate.fromJson(v5Root(6, QJsonObject{{QStringLiteral("specularWeight"), 0.7}}, QJsonObject(), false), &v6Error),
+            QStringLiteral("v6: schema 6 loads: %1").arg(v6Error));
+        check(qFuzzyCompare(gate.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRmaos")).values.value(QStringLiteral("specularWeight")).toDouble(), 0.7)
+                && gate.toJson().value(QStringLiteral("schemaVersion")).toInt() == 6,
+            QStringLiteral("v6: a v6 document is not migrated and saves as schema 6"));
+
+        // Hermetic repacks.
+        check(qFuzzyCompare(SpecularMigrate::specularIorForF0(0.04), 1.5), QStringLiteral("v6: F0 0.04 is IOR 1.5"));
+        QImage f0Map(2, 1, QImage::Format_RGBA8888);
+        f0Map.setPixelColor(0, 0, QColor(10, 20, 30, 10)); // F0 0.039: weight 250, material IOR
+        f0Map.setPixelColor(1, 0, QColor(10, 20, 30, 41)); // F0 0.161: weight 1, IOR 2.339
+        const SpecularMigrate::F0Repack repack = SpecularMigrate::repackF0Alpha(f0Map, 1.5, 4.25);
+        check(repack.rmaos.pixelColor(0, 0).alpha() == 250 && repack.rmaos.pixelColor(1, 0).alpha() == 255
+                && repack.rmaos.pixelColor(0, 0).red() == 10,
+            QStringLiteral("v6 repack: alpha becomes weight (F0/0.04, capped at 1), RGB untouched"));
+        check(!repack.iorAlpha.isNull() && repack.iorAlpha.pixelColor(0, 0).red() == 90 && repack.iorAlpha.pixelColor(1, 0).red() == 140
+                && repack.texelsAboveDefault == 1 && repack.texelsAboveCeiling == 0,
+            QStringLiteral("v6 repack: the IOR map carries the material IOR (texel 90) and IOR 2.339 (texel 140)"));
+        QImage lowOnly(1, 1, QImage::Format_RGBA8888);
+        lowOnly.setPixelColor(0, 0, QColor(0, 0, 0, 5));
+        check(SpecularMigrate::repackF0Alpha(lowOnly, 1.5, 4.25).iorAlpha.isNull(),
+            QStringLiteral("v6 repack: no texel above 0.04 means no IOR map"));
+        QImage tint(2, 1, QImage::Format_RGBA8888);
+        tint.setPixelColor(0, 0, QColor(0, 0, 0, 0));
+        tint.setPixelColor(1, 0, QColor(0, 0, 0, 255));
+        const QImage baked = SpecularMigrate::bakeTintAlpha(tint, 1.5, 4.25);
+        check(baked.pixelColor(0, 0).red() == 255 && baked.pixelColor(1, 0).red() == 0 && baked.pixelColor(0, 0).alpha() == 90,
+            QStringLiteral("v6 bake: tint weight 0 is white, 1 is the colour, alpha is the material IOR"));
+        check(SpecularMigrate::specularPathFor(QStringLiteral("textures/foo_RMAOS.dds")) == QStringLiteral("textures/foo_spec.dds")
+                && SpecularMigrate::specularPathFor(QStringLiteral("a\\b_n.dds")) == QStringLiteral("a\\b_n_spec.dds"),
+            QStringLiteral("v6 repack: the specular map name derives from the RMAOS name"));
+
+        // Converter anchors: the level moved from the alpha into the IOR.
+        const auto f0Of = [](float ior) { const float r = (ior - 1.0f) / (ior + 1.0f); return r * r; };
+        check(std::abs(f0Of(Converter::fo4SpecularIor(Converter::Options{})) - 0.04f / 0.212f) < 1e-4f,
+            QStringLiteral("v6 converter: the FO4 IOR reproduces the corpus anchor F0 0.04/0.212"));
+        check(std::abs(f0Of(Converter::fo76SpecularIor(Converter::Options{})) - 0.08f) < 1e-5f,
+            QStringLiteral("v6 converter: the FO76 IOR reproduces the old window ceiling F0 0.08"));
+    }
 
     ColorEdit colorEdit(QColor(QStringLiteral("#FFEEDD")), false);
     bool colorSignal = false;
@@ -740,8 +846,8 @@ int main(int argc, char* argv[])
         check(v5In.open(QIODevice::ReadOnly), QStringLiteral("migrated v5 file reopens"));
         const QJsonObject v5Root = QJsonDocument::fromJson(payloadFromEnvelope(v5In.readAll())).object();
         v5In.close();
-        check(v5Root.value(QStringLiteral("schemaVersion")).toInt() == 5,
-            QStringLiteral("migrated documents serialize as schema version 5"));
+        check(v5Root.value(QStringLiteral("schemaVersion")).toInt() == 6,
+            QStringLiteral("migrated documents serialize as schema version 6"));
         // Idempotency: reloading and re-saving the migrated document must be
         // byte-identical — the migration never re-fires on its own output.
         Pbr::MaterialDocument reloadedV5;
@@ -1124,8 +1230,8 @@ int main(int argc, char* argv[])
         const Pbr::TextureSlotState convertedNormalSlot = convertedDoc.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryNormal"));
         check(convertedBase.enabled && QDir::fromNativeSeparators(convertedBase.path) == QStringLiteral("armor/conv_BC.dds"),
             QStringLiteral("base color slot wires the portable texture path"));
-        check(convertedNormalSlot.values.value(QStringLiteral("curvatureInAlpha")).toBool(false),
-            QStringLiteral("normal slot declares curvature in alpha"));
+        check(convertedNormalSlot.values.value(QStringLiteral("alphaCarries")).toString() == QLatin1String("Curvature"),
+            QStringLiteral("normal slot declares curvature in alpha (v6 selector)"));
 
         QString decodeError;
         const QImage convertedBc = TextureImage::load(QStringLiteral("armor/conv_BC.dds"),
@@ -1574,9 +1680,15 @@ int main(int argc, char* argv[])
             plainSources.diffuse = diffuse;
             plainSources.specular = medianSpec;
             const Converter::ConvertedImages out = Converter::convertFo4(plainSources, plain, options);
-            const double f0 = QColor(out.rmaos.pixelColor(1, 1)).alphaF();
+            // v6: alpha is the raw weight; the level is the material IOR the
+            // converter anchors, so weight * F0(ior) is what the median renders.
+            const double weight = QColor(out.rmaos.pixelColor(1, 1)).alphaF();
+            const double iorF0 = std::pow((out.specularIor - 1.0) / (out.specularIor + 1.0), 2.0);
+            const double f0 = weight * iorF0;
             check(f0 > 0.035 && f0 < 0.045,
-                QStringLiteral("the corpus-median specular maps to the physical dielectric 0.04"));
+                QStringLiteral("the corpus-median specular weight times the FO4 IOR lands on the physical dielectric 0.04 (%1)").arg(f0));
+            check(weight > 0.15 && weight < 0.3,
+                QStringLiteral("the corpus-median specular is written raw as the weight (%1)").arg(weight));
         }
 
         // Image-level FO76 conversion: gold over black diffuse with _l data.
@@ -1653,8 +1765,9 @@ int main(int argc, char* argv[])
         check(dielectricRmaos.greenF() < 0.02,
             QStringLiteral("FO76 a dielectric _r reads as non-metal, not grey (metallic %1)")
                 .arg(dielectricRmaos.greenF()));
-        check(std::abs(dielectricRmaos.alphaF() - 0.04) < 0.015,
-            QStringLiteral("FO76 dielectric F0 lands mid-band, not pinned at the 0.08 ceiling (%1)")
+        const double fo76IorF0 = std::pow((dielectricOut.specularIor - 1.0) / (dielectricOut.specularIor + 1.0), 2.0);
+        check(std::abs(dielectricRmaos.alphaF() * fo76IorF0 - 0.04) < 0.015,
+            QStringLiteral("FO76 dielectric weight times the FO76 IOR lands mid-band, not pinned at the 0.08 ceiling (%1)")
                 .arg(dielectricRmaos.alphaF()));
 
         QImage metalRefl(4, 4, QImage::Format_RGBA8888);
@@ -3067,7 +3180,7 @@ int main(int argc, char* argv[])
 
             struct Expected { const char* label; int value; };
             static const Expected wanted[] = {{"Roughness", 41}, {"Metallic", 52},
-                {"Ambient Occlusion", 203}, {"Specular F0", 74}};
+                {"Ambient Occlusion", 203}, {"Specular Weight", 74}};
             for (const NodeGraph::ChannelMap& map : channelsOf(combiner, "rmaos")) {
                 const QColor texel = NodeGraph::applyChannelMask(rmaos, map.mask).pixelColor(0, 0);
                 int expected = -1;
@@ -3379,12 +3492,13 @@ int main(int argc, char* argv[])
                     QStringLiteral("the %1 preset wires a Paint Mask into the metal path").arg(preset.first));
             }
 
+            // v6: the ramp is an identity clamp; the level lives in the output
+            // node's specular IOR, whose F0 is the corpus anchor 0.04 / 0.212.
             check(f0 && f0->typeId == QStringLiteral("image.levels")
-                    && std::abs(f0->params.value(QStringLiteral("outBlack")).toDouble()
-                           - defaults.dielectricF0Min) < 1e-4
-                    && std::abs(f0->params.value(QStringLiteral("outWhite")).toDouble()
-                           - defaults.dielectricF0Max) < 1e-4,
-                QStringLiteral("the F0 ramp lands on convertercore's dielectric window"));
+                    && std::abs(f0->params.value(QStringLiteral("outBlack")).toDouble()) < 1e-6
+                    && std::abs(f0->params.value(QStringLiteral("outWhite")).toDouble() - 1.0) < 1e-6,
+                QStringLiteral("the specular weight ramp is an identity clamp (v6: the level is the output IOR)"));
+            Q_UNUSED(defaults);
         }
 
         // Levels: the histogram it publishes is what the node body plots, and
@@ -3949,41 +4063,28 @@ int main(int argc, char* argv[])
         check(preview.size() > 10000,
             QStringLiteral("OPENPBR1: the preview source was found and read"));
 
-        // ---- A4: the preview must not lie about the reflectivity LEVEL ----
+        // ---- A4, superseded by PBRM v6 (docs/PBRM-v6-Specular.md) ----
         //
-        // res/Lighting/deferred_prepass.hlsl:863 writes
-        //     const float3 f4fxDielectricF0 = min(f4fxF0Scalar, 0.16).xxx;
-        // so a material authored at F0 0.5 RENDERS at 0.16. The preview used
-        // to clamp only to [0,1] and show 0.5 -- three times the truth at the
-        // top of the range. Calibrating anything against that preview inherits
-        // the lie, which is why this is pinned rather than left to the eye.
-        check(preview.contains(QStringLiteral(
-                  "float dielectric=defaults?.04:min(clamp(uUseF0?channelData.a:uF0,0.0,1.0),0.16);")),
-            QStringLiteral("OPENPBR1 A4: the preview applies the runtime's 0.16 conductor guard"));
-        check(preview.contains(QStringLiteral("deferred_prepass.hlsl:863")),
-            QStringLiteral("OPENPBR1 A4: the guard cites the runtime line it mirrors"));
-        // The guard is on the AUTHORED SCALAR, where the runtime has it
-        // (deferred_prepass.hlsl clamps f4fxF0Scalar, not the blended F0), and
-        // therefore ABOVE both the surface-state blend and the metal mix. A
-        // metal's F0 is its base colour and must never meet this clamp, or
-        // every metal in the editor turns to plastic.
-        const int guardAt = preview.indexOf(QStringLiteral("float dielectric=defaults?.04:min("));
-        // The BLEND, not the uniform declaration -- the uniform block sits far
-        // above the guard and a bare name would make this pin pass on nothing.
-        const int stateBlendAt =
-            preview.indexOf(QStringLiteral("dielectric=mix(dielectric,uStateF0Target[i]"));
+        // OPENPBR1 A4 pinned the runtime's 0.16 conductor guard on the authored
+        // F0 scalar. v6 has no authored F0: RMAOS alpha is a weight that can
+        // only LOWER the level the IOR sets, so there is nothing left to clamp
+        // and the runtime drops min(f4fxF0Scalar, 0.16) in the same change.
+        check(preview.contains(QStringLiteral("vec3 dielectricF0=defaults?vec3(.04):vec3(specWeight*iorF0)*specularTint;")),
+            QStringLiteral("PBRM v6: dielectric F0 = weight * F0(ior) * tint"));
+        check(preview.contains(QStringLiteral("float iorF0=(specIor-1.0)/(specIor+1.0);iorF0*=iorF0;")),
+            QStringLiteral("PBRM v6: F0(ior) = ((ior-1)/(ior+1))^2"));
+        check(preview.contains(QStringLiteral("if(uIorInAlpha)specIor=clamp(specularColorSample.a,0.0,1.0)*uSpecularIorMax;")),
+            QStringLiteral("PBRM v6: the IOR map replaces the scalar over [0, iorMax] (Option A)"));
+        check(!preview.contains(QStringLiteral(",0.16)")) && !preview.contains(QStringLiteral("min(dielectric,0.16)")),
+            QStringLiteral("PBRM v6: the 0.16 conductor guard is gone from the preview"));
+        // The tint and the IOR map are resolved ABOVE the surface-state blend,
+        // so states weather the resolved dielectric F0, and the blend stays
+        // above the metal mix so metals keep their base-colour F0.
+        const int resolveAt = preview.indexOf(QStringLiteral("vec3 dielectricF0=defaults?vec3(.04):"));
+        const int stateBlendAt = preview.indexOf(QStringLiteral("dielectricF0=mix(dielectricF0,vec3(uStateF0Target[i])"));
         const int metalMixAt = preview.indexOf(QStringLiteral(",base,metal),F=fresnel(VoH,f0);"));
-        check(guardAt >= 0 && stateBlendAt > guardAt,
-            QStringLiteral("OPENPBR1 A4: the guard sits above the surface-state F0 blend"));
-        check(guardAt >= 0 && metalMixAt > guardAt,
-            QStringLiteral("OPENPBR1 A4: the guard sits above the metal mix, so metals keep their F0"));
-        // COEXISTENCE WITH THE SPECULAR-COLOUR LANE. That lane clamps again
-        // where it builds the tinted dielectric F0. min() is idempotent, so the
-        // two guards compose to exactly one bound; this pin records that the
-        // duplication is known and harmless rather than an accident.
-        check(preview.contains(QStringLiteral("min(dielectric,0.16)"))
-                  || preview.contains(QStringLiteral("min(vec3(dielectric),vec3(0.16))")),
-            QStringLiteral("OPENPBR1 A4: the specular-colour lane's own 0.16 guard is present and idempotent with this one"));
+        check(resolveAt >= 0 && stateBlendAt > resolveAt && metalMixAt > stateBlendAt,
+            QStringLiteral("PBRM v6: states weather the resolved dielectric F0, above the metal mix"));
 
         // ---- A5: emission is BELOW the coat ----
         //
@@ -4008,9 +4109,9 @@ int main(int argc, char* argv[])
             QStringLiteral("OPENPBR1 A5: the accumulator is declared above the coat loop (identity when no coat)"));
 
         // ---- A6: the thin-film unit, and the mapping table ----
-        const QString formatDoc = readRepoFile(QStringLiteral("docs/PBRM-v5.md"));
+        const QString formatDoc = readRepoFile(QStringLiteral("docs/PBRM-v6.md"));
         check(formatDoc.size() > 5000,
-            QStringLiteral("OPENPBR1: the PBRM v5 format doc was found and read"));
+            QStringLiteral("OPENPBR1: the PBRM v6 format doc was found and read"));
         check(formatDoc.contains(QStringLiteral("thin-film thickness\nin MICROMETRES"))
                   || formatDoc.contains(QStringLiteral("MICROMETRES")),
             QStringLiteral("OPENPBR1 A6: thin-film thickness is documented as micrometres"));
@@ -4024,7 +4125,7 @@ int main(int argc, char* argv[])
             check(formatDoc.contains(QString::fromLatin1(row)),
                 QStringLiteral("OPENPBR1 A6: the mapping table carries %1").arg(QString::fromLatin1(row)));
         }
-        check(formatDoc.contains(QStringLiteral("`F0 = ((1−η)/(1+η))²`")),
+        check(formatDoc.contains(QStringLiteral("`F0 = ((η−1)/(η+1))²`")),
             QStringLiteral("OPENPBR1 A6: the IOR->F0 conversion an importer needs is written down"));
     }
 

@@ -1,4 +1,9 @@
-# PBRM version 5
+# PBRM version 6
+
+Version 6 replaces the authored dielectric F0 with OpenPBR `specular_weight`
+and `specular_ior` (contract, arithmetic, landmarks and migration in
+[PBRM-v6-Specular.md](PBRM-v6-Specular.md)) and turns the normal-alpha
+curvature flag into a selector. Everything else is version 5 unchanged.
 
 PBRM v5 is a compact binary envelope around a UTF-8 JSON authoring document.
 `src/materialdocument.h` and `src/materialdocument.cpp` are authoritative for
@@ -30,7 +35,7 @@ The editor writes the core root fields and empty authoring collections.
 ```json
 {
   "schema": "FO4.PBRM.Material",
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "shader": "Standard",
   "secondaryUvEnabled": false,
   "primaryUv": {},
@@ -91,7 +96,9 @@ physical inputs that the definitions read:
   else the `overridePorosity`/`porosity` constant when checked, else derived
   as `saturate(roughness × (1 − metallic))`. Landscape keeps per-layer
   porosity in the `normalHeightArray` alpha.
-- **Signed curvature** — Normal alpha when `curvatureInAlpha` is true
+- **Signed curvature** — Normal alpha when the slot's `alphaCarries` is
+  `Curvature` (`Cone Map` reserves the alpha for a relaxed-cone parallax map
+  and yields the derived curvature; `None` is the default)
   (`0.5` neutral, below = convex edges that shed, above = concave cavities
   that collect). There is no curvature constant; without the map the concave
   half derives from AO (`0.5 + (1 − ao) × 0.5`), which feeds states only —
@@ -208,11 +215,11 @@ not yet consume.
 | `base_color` | color3 `[0,1]³`, default 0.8 grey | `primaryBaseColor` RGB (sRGB) | Present; OpenPBR additionally constrains it by `E_diffuse = (1 − E_spec)·C` |
 | `base_metalness` | float `[0,1]`, default 0 | `RMAOS` G | Present |
 | `base_diffuse_roughness` | float `[0,1]`, default 0 | — | Absent (no Oren-Nayar σ on either side) |
-| `specular_weight` | float `[0,∞)`, norm `[0,1]`, default 1 | folded into the authored F0 scalar | Different parametrization |
-| `specular_color` | color3 `[0,1]³`, default white | (the specular-colour slot; dielectric-only) | Different: OpenPBR uses it as the 82° **edge tint** on metals (the F82 model), which PBRM does not implement |
+| `specular_weight` | float `[0,∞)`, norm `[0,1]`, default 1 | `RMAOS` A while `alphaCarries="Specular Weight"`, else the `specularWeight` constant; `[0,1]`, default 1 | Present |
+| `specular_color` | color3 `[0,1]³`, default white | `primarySpecularColor` RGB (sRGB; dielectric-only) | Different: OpenPBR uses it as the 82° **edge tint** on metals (the F82 model), which PBRM does not implement |
 | `specular_roughness` | float `[0,1]`, default 0.3 | `RMAOS` R | Present, same convention (α = r²) |
 | `specular_roughness_anisotropy` | float `[0,1]`, default 0 | `Anisotropy` slot | Editor-only, and a bent-reflection approximation rather than OpenPBR's αt/αb split |
-| `specular_ior` | float `(0,∞)`, norm `[1,3]`, default 1.5 | `RMAOS` A as an authored F0 (default 0.04) | Different parametrization, same default point; convert with `F0 = ((1−η)/(1+η))²` |
+| `specular_ior` | float `(0,∞)`, norm `[1,3]`, default 1.5 | material `Specular/ior` scalar (default 1.5, no ceiling), or `primarySpecularColor` A over `[0, Specular/iorMax]` (ceiling default 4.25) when `iorInAlpha=true` | Present; `F0 = ((η−1)/(η+1))²`, IOR 0 makes the tint the F0 outright |
 | `transmission_weight` | float `[0,1]`, default 0 | `CompositionMode::PhysicalTransmission` | Different: a composition mode, not a mix weight |
 | `transmission_color` | color3 `[0,1]³`, default white | `TransmissionAbsorption` RGB | Editor-only |
 | `transmission_depth` | length, default 0 | `TransmissionAbsorption` A | Different: a thickness, with no Beer-law `μt = −ln T / λ` |
@@ -297,30 +304,29 @@ and these Primary UV socket keys:
 | Socket | Texture data | Missing-value defaults |
 | --- | --- | --- |
 | `primaryBaseColor` | sRGB RGB color, A opacity/coverage | `overrideColor=true`, color `#FFFFFF`; `overrideOpacity=true`, opacity `1.0`; tint `#FFFFFF`, scale `1.0`, blend `Base` |
-| `primaryNormal` | linear RG tangent normal, optional B height, A signed curvature | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `curvatureInAlpha=false`, `cavitySpecOcclusion=1.0` |
-| `primaryRmaos` | linear R roughness, G metallic, B AO, A dielectric F0 or porosity | `override*` channel fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, F0 `0.04`; `alphaCarries="Dielectric F0"`, `overridePorosity=false`, porosity `0.5` |
+| `primaryNormal` | linear RG tangent normal, optional B height, A signed curvature or cone map per `alphaCarries` | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `alphaCarries="None"`, `cavitySpecOcclusion=1.0` |
+| `primaryRmaos` | linear R roughness, G metallic, B AO, A specular weight or porosity | `override*` channel fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, specular weight `1.0`; `alphaCarries="Specular Weight"`, `overridePorosity=false`, porosity `0.5` |
 | `primaryEmissive` | sRGB RGB radiance, A intensity mask | color `#FFFFFF`, intensity `0.0` |
-| `primarySpecularColor` | linear RGB dielectric F0 color, A color weight | no constants and no `override*` fields; an absent, disabled, or unresolvable slot means weight `0` |
+| `primarySpecularColor` | sRGB RGB specular tint, A specular IOR map (read only when `iorInAlpha=true`) | no constants and no `override*` fields; `iorInAlpha=false`; an absent, disabled, or unresolvable slot means a white tint and the material IOR |
 
-`primarySpecularColor` is additive extension data: it changes no existing
-socket's meaning, so it does not move `schemaVersion`. A document written
-before this row parses unchanged, and a consumer that ignores the socket
-renders exactly what it rendered before.
+`primarySpecularColor` RGB is the OpenPBR `specular_color` tint on the
+dielectric Fresnel, and its alpha, when `iorInAlpha=true`, is the
+`specular_ior` map. The dielectric F0 resolves as
 
-The socket resolves the dielectric F0 that RMAOS alpha carries as one grey
-number into a color:
+    F0_ior = ((ior − 1) / (ior + 1))²
+    ior    = iorInAlpha ? specularColor.a × Specular/iorMax : Specular/ior
+    F0     = specularWeight × specularColor.rgb × F0_ior
 
-    dielectricF0 = lerp(scalarF0.rgb, specularColor.rgb, specularColor.a)
-
-with `scalarF0` the existing RMAOS-alpha-or-constant value and the result
-subject to the same per-channel clamp the consumer already applies to the
-scalar. Weight `0` is therefore the pre-existing scalar path bit for bit, and
-weight `1` makes the painted color the dielectric F0 outright. Metals are
-untouched: their F0 is the base color, mixed in by metallic, exactly as
-before. The socket deliberately has no constants — a material either paints
-this or does not have it — so a consumer needs one texture binding and no new
-constant-buffer space. A texture with no alpha channel decodes A as `1.0`,
-which is the intended reading of a plain specular color map.
+with `specularWeight` the RMAOS alpha (while `alphaCarries="Specular Weight"`
+and `overrideSpecularWeight=false`) or the constant, and the tint white when
+the slot is absent. A material without the map at the defaults (weight 1,
+IOR 1.5) is F0 0.04, the v5 default point bit for bit. Metals are untouched:
+their F0 is the base color, mixed in by metallic. The consumer no longer
+clamps the dielectric F0 to 0.16: the weight can only lower the level and the
+IOR owns it. Surface states blend the resolved dielectric F0 (after weight,
+tint and IOR, before the metal mix, as in v5). An opaque colour map decodes
+A as `1.0`, which would read as the IOR ceiling; that is why the alpha is
+read only behind `iorInAlpha`.
 
 A texture is sampled only when its slot has `enabled=true`, a non-empty valid
 runtime path, and the corresponding positive `override*` flag is false.
@@ -328,9 +334,9 @@ Otherwise the constant applies. Missing or unavailable texture channels force
 their positive overrides on, with one documented exemption: `overridePorosity`
 defaults false and is never auto-forced, because an absent porosity source has
 a meaningful derived value (the roughness/metallic heuristic). RMAOS alpha is
-sampled as F0 only while `alphaCarries` is `Dielectric F0` and
-`overrideF0=false`; while alpha carries porosity, F0 always uses its constant
-(default `0.04`).
+sampled as specular weight only while `alphaCarries` is `Specular Weight` and
+`overrideSpecularWeight=false`; while alpha carries porosity, the weight
+always uses its constant (default `1.0`).
 
 The runtime feature mask is derived rather than serialized. The initial bit
 assignments are:
@@ -344,10 +350,12 @@ assignments are:
 | 4 | `RmaosRoughness` | bit 3 and `overrideRoughness=false` |
 | 5 | `RmaosMetallic` | bit 3 and `overrideMetallic=false` |
 | 6 | `RmaosAo` | bit 3 and `overrideAo=false` |
-| 7 | `RmaosF0` | bit 3, `overrideF0=false`, and `alphaCarries="Dielectric F0"` |
+| 7 | `RmaosSpecularWeight` | bit 3, `overrideSpecularWeight=false`, and `alphaCarries="Specular Weight"` |
 | 8 | `EmissiveTexture` | enabled, valid `primaryEmissive` path |
-| 9 | `NormalCurvature` | bit 1 and `curvatureInAlpha=true` |
+| 9 | `NormalCurvature` | bit 1 and `alphaCarries="Curvature"` |
 | 10 | `RmaosPorosity` | bit 3 and `alphaCarries="Porosity"` |
+| 26 | `SpecularIorTexture` | enabled, valid `primarySpecularColor` path, and `iorInAlpha=true` |
+| 27 | `NormalConeMap` | bit 1 and `alphaCarries="Cone Map"` (reserved; no consumer yet) |
 
 Bits 11-24 were taken by later runtime slices for per-channel base/normal/
 emissive sampling, composition, and the subsurface bindings; the runtime
@@ -384,18 +392,23 @@ does not make the whole PBRM envelope unparsable.
 
 ## Errors, fallback, and migration
 
-Invalid magic, an envelope/schema version other than `4` or `5`, an invalid
+Invalid magic, an envelope/schema version other than `4`, `5` or `6`, an invalid
 payload size, malformed/non-object JSON, an unknown schema, an empty shader
 name, wrong root field types, and malformed requirement versions are hard
 parse errors. An unknown non-empty shader name is valid but
 runtime-unsupported.
 
-v4 reads through the in-memory migration described above and saves as v5.
+v4 and v5 read through in-memory migrations and save as v6. v5 constants
+migrate exactly (`specularWeight = min(f0 / 0.04, 1)`; an F0 above 0.04 moves
+its level into `Specular/ior`), while texture alphas authored as F0 or tint
+weight cannot: the loader marks them (`legacyF0Alpha`, `legacyTintAlpha`) for
+the editor's validation quick-fix or `pbrm migrate`, which rewrite the
+textures beside a `.v5.bak` (PBRM-v6-Specular.md section 4).
 There is no implicit migration from PBRM versions 1-3 and no best-effort read
 of future versions. Additive optional fields, slots, and requirements remain
-v5. Existing names, channel meanings, and defaults are stable. Only an
+v6. Existing names, channel meanings, and defaults are stable. Only an
 incompatible semantic or structural change may use a new envelope/schema
-version (v6), and that change requires an explicit migrator.
+version (v7), and that change requires an explicit migrator.
 
 PBRM is standalone. A NIF directly references its `.pbrm`; no same-name BGSM or
 BGEM is consulted. An invalid, unsupported, or requirements-incompatible PBRM
