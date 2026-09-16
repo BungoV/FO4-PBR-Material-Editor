@@ -51,7 +51,7 @@ int main(int argc, char* argv[])
     QApplication application(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("FO4CommunityShaders"));
     QCoreApplication::setApplicationName(QStringLiteral("PBRMaterialEditor"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("0.5.0"));
     application.setWindowIcon(QIcon(QStringLiteral(":/app-icon.png")));
 
     // Compatibility alias; the pbrm.exe console companion is the primary CLI.

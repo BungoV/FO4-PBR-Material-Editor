@@ -279,6 +279,28 @@ runtime integration.
 
 ## Changelog
 
+### 2026-09-16 — PBRM v6, feature parameters on their inputs, specular color override (v0.5.0)
+
+- **PBRM v6** - the authored dielectric F0 is gone: RMAOS alpha carries the
+  OpenPBR specular weight (texel 255 = 1 = default) and the level is a specular
+  IOR, a constant (1.5 = F0 0.04) or the Specular Color map's alpha over a
+  ceiling (4.25, so IOR 1.5 is texel 90). The 0.16 conductor guard went with the
+  F0 it guarded. The Normal slot's alpha is a selector: None / Curvature / Cone
+  Map (reserved). Old documents load exactly; authored F0 or tint-coverage
+  alphas are marked and repacked by the validation quick-fix or `pbrm migrate`
+  (`.v5.bak` beside every rewritten file). Spec: `docs/PBRM-v6.md`; runtime
+  contract: `docs/PBRM-v6-Specular.md`.
+- **Feature parameters live on their texture input** - specular IOR on Specular
+  Color, the subsurface profile/weight/transmission/thickness on Subsurface,
+  sheen/glints/film/retro on Surface Effects, hair lobes on Hair Direction and
+  Hair Scatter, glass on Transmission Absorption, the eye on Cornea and Iris
+  Masks. The Shading page keeps Core, Water, Bottle liquid and Unlit. The slot
+  checkbox is the feature switch; the "Disabled" subsurface mode is gone.
+  Shading-page groups migrate on load and leave the file.
+- **Specular Color RGB override** - the slot carries the editor-wide RGB
+  override (toggle + constant colour, white = no change) beside the IOR
+  override, the IOR constant and the map ceiling. Authored maps keep being read.
+
 ### 2026-09-03 — A specular color map
 
 - **Specular Color slot** - a new texture input, `primarySpecularColor`: RGB is
