@@ -620,6 +620,26 @@ int main(int argc, char* argv[])
                 check(room.contains(QStringLiteral("overrideWindowMask")) && !room.value(QStringLiteral("overrideWindowMask")).toBool(true),
                     QStringLiteral("an authored interior cubemap without the window-mask override key keeps reading its alpha"));
             }
+            {
+                // 2026-09-17: emission is luminance in nits; intensity x 100.
+                QJsonObject nitsRoot = v5Root(6, QJsonObject{{QStringLiteral("specularWeight"), 1.0}}, QJsonObject(), true);
+                QJsonObject nitsPrimary = nitsRoot.value(QStringLiteral("primaryUv")).toObject();
+                nitsPrimary.insert(QStringLiteral("primaryEmissive"), QJsonObject{{QStringLiteral("enabled"), true}, {QStringLiteral("expanded"), true},
+                    {QStringLiteral("path"), QStringLiteral("textures/test/primaryEmissive.dds")},
+                    {QStringLiteral("values"), QJsonObject{{QStringLiteral("intensity"), 2.5}}}});
+                nitsRoot.insert(QStringLiteral("primaryUv"), nitsPrimary);
+                Pbr::MaterialDocument nits;
+                QString nitsError;
+                check(nits.fromJson(nitsRoot, &nitsError), QStringLiteral("emissive-intensity document loads: %1").arg(nitsError));
+                const auto em = nits.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryEmissive")).values;
+                check(!em.contains(QStringLiteral("intensity")) && std::abs(em.value(QStringLiteral("luminance")).toDouble() - 250.0) < 1e-9,
+                    QStringLiteral("emissive intensity 2.5 loads as luminance 250 nits and the intensity key is gone"));
+                Pbr::MaterialDocument nitsAgain;
+                QString nitsAgainError;
+                check(nitsAgain.fromJson(nits.toJson(), &nitsAgainError)
+                        && std::abs(nitsAgain.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryEmissive")).values.value(QStringLiteral("luminance")).toDouble() - 250.0) < 1e-9,
+                    QStringLiteral("the luminance migration is idempotent (a second load keeps 250 nits)"));
+            }
             const auto sss = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"));
             check(sss.enabled && sss.values.value(QStringLiteral("mode")).toString() == QLatin1String("Combined")
                     && sss.values.value(QStringLiteral("profile")).toString() == QLatin1String("Custom")
@@ -4192,7 +4212,9 @@ int main(int argc, char* argv[])
         // above the metal mix so metals keep their base-colour F0.
         const int resolveAt = preview.indexOf(QStringLiteral("vec3 dielectricF0=defaults?vec3(.04):"));
         const int stateBlendAt = preview.indexOf(QStringLiteral("dielectricF0=mix(dielectricF0,vec3(uStateF0Target[i])"));
-        const int metalMixAt = preview.indexOf(QStringLiteral(",base,metal),F=fresnel(VoH,f0);"));
+        // 2026-09-17: the metal side of the mix is the OpenPBR F82 Fresnel
+        // (Specular Color as the 82-degree edge tint), the dielectric side Schlick.
+        const int metalMixAt = preview.indexOf(QStringLiteral(",base,metal),F=min(mix(fresnel(VoH,dielectricF0),f82(VoH,base,metalTint),metal)"));
         check(resolveAt >= 0 && stateBlendAt > resolveAt && metalMixAt > stateBlendAt,
             QStringLiteral("PBRM v6: states weather the resolved dielectric F0, above the metal mix"));
 

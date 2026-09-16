@@ -279,6 +279,26 @@ runtime integration.
 
 ## Changelog
 
+### 2026-09-17 — OpenPBR alignment (preview and format)
+
+- **Energy accounting** - the thin film is folded into the base Fresnel (an
+  energy-neutral blend with and without film) instead of an additive rim; the
+  coat tint is OpenPBR `coat_color` (the normal-incidence colour) applied over
+  the refracted path length; the Clearcoat slot gains `darkening` (OpenPBR
+  coat_darkening, default 1) and `anisotropy` (along the base tangent).
+- **Fuzz is the Zeltner-2022 SGGX sheen** through its 32×32 LTC table
+  (tizian/ltc-sheen, Apache-2.0, `src/fuzzltc_table.h`); `fuzzColor` is the
+  fuzz's own albedo and `fuzzStrength` is a 0..1 weight (default 1); the lobe
+  sits above the coat and dims what is beneath by its albedo.
+- **Metals take the Specular Color as their F82 edge tint** (preview; the
+  runtime keeps the dielectric use until FO4CS lands the term).
+- **Emission is in nits** - `luminance` replaces `intensity` on every
+  Emissive slot; 100 nits is the preview's display white, old documents load
+  as intensity × 100 and the converter writes emittance × 100.
+- **Diffuse roughness** - `diffuseRoughness` on Base Color, shaded as EON.
+- **Transmission depth** - `absorptionDistance` is documented as OpenPBR
+  `transmission_depth` (the same Beer law; nothing changed in the shading).
+
 ### 2026-09-17 — Retroreflection input, sheen is fuzz
 
 - **Retroreflection input** - retroreflection is its own texture slot

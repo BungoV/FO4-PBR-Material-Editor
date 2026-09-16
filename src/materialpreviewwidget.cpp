@@ -1,4 +1,5 @@
 #include "materialpreviewwidget.h"
+#include "fuzzltc_table.h"
 #include "colorpicker.h"
 #include "disclosureicon.h"
 #include "dragnumericedit.h"
@@ -256,7 +257,7 @@ PbrPreviewGL::~PbrPreviewGL()
     if (!context()) return;
     makeCurrent();
     m_baseTexture.reset(); m_normalTexture.reset(); m_heightTexture.reset(); m_rmaosTexture.reset(); m_emissiveTexture.reset(); m_environmentTexture.reset();
-    m_prefilteredEnvironmentTexture.reset(); m_brdfLutTexture.reset();
+    m_prefilteredEnvironmentTexture.reset(); m_brdfLutTexture.reset(); m_fuzzLtcTexture.reset();
     m_secondaryBaseTexture.reset(); m_secondaryNormalTexture.reset(); m_secondaryRmaosTexture.reset(); m_secondaryEmissiveTexture.reset(); m_layerCoverageTexture.reset(); m_gradientTexture.reset();m_specialTextureArray.reset();
     m_vertexBuffer.destroy(); m_indexBuffer.destroy(); m_groundVertexBuffer.destroy(); m_groundIndexBuffer.destroy();
     m_gridBuffer.destroy(); m_highlightIndexBuffer.destroy();
@@ -541,7 +542,7 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     m_overrideEmissiveColor = boolValue(emissive.values, QStringLiteral("overrideColor"), !m_hasEmissive);
     m_overrideEmissiveMask = boolValue(emissive.values, QStringLiteral("overrideMask"), !m_hasEmissive);
     m_emissiveMask = numberValue(emissive.values, QStringLiteral("mask"), 1.0f);
-    m_emissiveIntensity = numberValue(emissive.values, QStringLiteral("intensity"), 0.0f);
+    m_emissiveIntensity = numberValue(emissive.values, QStringLiteral("luminance"), 0.0f) / 100.0f;
     m_hasGradient = !m_gradientImage.isNull();
     const QColor gradientColor(gradient.values.value(QStringLiteral("color")).toString(QStringLiteral("#FFFFFF")));
     m_gradientColor = gradientColor.isValid() ? gradientColor : Qt::white;
@@ -601,7 +602,7 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     m_overrideSecondaryEmissiveColor = boolValue(secondaryEmissive.values, QStringLiteral("overrideColor"), !m_hasSecondaryEmissive);
     m_overrideSecondaryEmissiveMask = boolValue(secondaryEmissive.values, QStringLiteral("overrideMask"), !m_hasSecondaryEmissive);
     m_secondaryEmissiveMask = numberValue(secondaryEmissive.values, QStringLiteral("mask"), 1.0f);
-    m_secondaryEmissiveIntensity = numberValue(secondaryEmissive.values, QStringLiteral("intensity"), 0.0f);
+    m_secondaryEmissiveIntensity = numberValue(secondaryEmissive.values, QStringLiteral("luminance"), 0.0f) / 100.0f;
     const QJsonObject layer = document.settingGroup(QStringLiteral("UV1/Composition"));
     const QString coverageMode = layer.value(QStringLiteral("coverageMode")).toString(QStringLiteral("Multiply"));
     m_coverageMode = coverageMode == QStringLiteral("Vertex Only") ? 0
@@ -653,7 +654,7 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     m_overrideTertiaryEmissiveColor = boolValue(tertiaryEmissive.values, QStringLiteral("overrideColor"), !m_hasTertiaryEmissive);
     m_overrideTertiaryEmissiveMask = boolValue(tertiaryEmissive.values, QStringLiteral("overrideMask"), !m_hasTertiaryEmissive);
     m_tertiaryEmissiveMask = numberValue(tertiaryEmissive.values, QStringLiteral("mask"), 1.0f);
-    m_tertiaryEmissiveIntensity = numberValue(tertiaryEmissive.values, QStringLiteral("intensity"), 0.0f);
+    m_tertiaryEmissiveIntensity = numberValue(tertiaryEmissive.values, QStringLiteral("luminance"), 0.0f) / 100.0f;
     const QJsonObject tertiaryLayer = document.settingGroup(QStringLiteral("UV2/Composition"));
     const QString tCoverageMode = tertiaryLayer.value(QStringLiteral("coverageMode")).toString(QStringLiteral("Multiply"));
     m_tCoverageMode = tCoverageMode == QStringLiteral("Vertex Only") ? 0
@@ -1034,7 +1035,7 @@ PbrPreviewGL::CompanionMaterial PbrPreviewGL::makeCompanionMaterial(const QStrin
     companion.overrideEmissiveColor = boolValue(emissive.values, QStringLiteral("overrideColor"), !companion.hasEmissive);
     companion.overrideEmissiveMask = boolValue(emissive.values, QStringLiteral("overrideMask"), !companion.hasEmissive);
     companion.emissiveMask = numberValue(emissive.values, QStringLiteral("mask"), 1.0f);
-    companion.emissiveIntensity = numberValue(emissive.values, QStringLiteral("intensity"), 0.0f);
+    companion.emissiveIntensity = numberValue(emissive.values, QStringLiteral("luminance"), 0.0f) / 100.0f;
     companion.uvTransform = QVector4D(
         float(document.setting(QStringLiteral("UV0"), QStringLiteral("scaleU"), 1.0).toDouble()),
         float(document.setting(QStringLiteral("UV0"), QStringLiteral("scaleV"), 1.0).toDouble()),
@@ -1139,7 +1140,9 @@ void PbrPreviewGL::applyCompanionUniforms(const CompanionMaterial& companion)
     m_program->setUniformValue("uSssCurvatureThickness", false);
     m_program->setUniformValue("uStateAdhesion", 1.0f);
     m_program->setUniformValue("uShelterChannel", -1);
-    m_program->setUniformValue("uSheenStrength", 0.0f);
+    m_program->setUniformValue("uFuzzStrength", 0.0f);
+    m_program->setUniformValue("uDiffuseRoughness", 0.0f);
+    m_program->setUniformValue("uFuzzLtc", 15);
     m_program->setUniformValue("uFuzzColor", QVector3D(1, 1, 1));
     m_program->setUniformValue("uGlintIntensity", 0.0f);
     m_program->setUniformValue("uIridescenceStrength", 0.0f);
@@ -1702,14 +1705,14 @@ void PbrPreviewGL::initializeGL()
         uniform float uGradientOpacity,uGradientIntensity,uGradientConstant,uUnlitIntensity;
         uniform float uDynamicStrength,uDynamicDriverValue,uDynamicInputMin,uDynamicInputMax;
         uniform float uSubsurfaceWeight,uSubsurfaceTransmission,uSubsurfaceThickness;
-        uniform float uSheenStrength,uSheenRoughness,uGlintIntensity,uGlintScale,uFilmIor,uIridescenceStrength;
-        uniform vec3 uFuzzColor;
+        uniform float uFuzzStrength,uFuzzRoughness,uGlintIntensity,uGlintScale,uFilmIor,uIridescenceStrength,uDiffuseRoughness;
+        uniform vec3 uFuzzColor;uniform sampler2D uFuzzLtc;
         uniform float uHairPrimaryStrength,uHairPrimaryRoughness,uHairPrimaryShift,uHairSecondaryStrength,uHairSecondaryRoughness,uHairSecondaryShift,uHairScatter,uHairBacklight,uHairDirectionStrength;
         uniform float uGlassIor,uGlassAbsorptionDistance,uGlassRefractionRoughness,uGlassThickness;
         uniform float uWaterIor,uWaterAbsorptionDistance,uWaterScattering,uWaterReflectionStrength,uWaterFlowSpeed,uWaterFlowStrength;
         uniform float uEyeCorneaIor,uEyeIrisDepth,uEyeLimbalStrength,uEyePupilScale,uEyeWetness;
         uniform float uDistortionVectorScale,uLandscapeMacroScale,uLandscapeMacroColorStrength,uLandscapeMacroRoughnessStrength,uSecondaryGradientIntensity,uSecondaryGradientConstant;
-        uniform float uCoatStrength[3],uCoatIor[3],uCoatNormalStrength[3],uCoatAbsorption[3];
+        uniform float uCoatStrength[3],uCoatIor[3],uCoatNormalStrength[3],uCoatAbsorption[3],uCoatDarkening[3],uCoatAnisotropy[3];
         uniform vec3 uCoatTint[3];
         uniform int uCoatSpecialLayer[3];
         uniform float uDecalAngleFade,uDecalDistanceFade;
@@ -1781,6 +1784,12 @@ void PbrPreviewGL::initializeGL()
         float D_GGX(float n,float a){float a2=a*a,d=n*n*(a2-1.0)+1.0;return a2/max(PI*d*d,.0001);}
         float G1(float n,float k){return n/(n*(1.0-k)+k);}
         vec3 fresnel(float h,vec3 f){return f+(1.0-f)*pow(1.0-h,5.0);}
+        // OpenPBR F82 conductor Fresnel: Schlick over F0 bent so the 82-degree
+        // reflectance is tint * Schlick(82); tint = 1 is plain Schlick.
+        vec3 f82(float mu,vec3 f0,vec3 tint){const float mb=1.0/7.0;vec3 fs=f0+(1.0-f0)*pow(1.0-mu,5.0);vec3 fsb=f0+(1.0-f0)*pow(1.0-mb,5.0);vec3 b=fsb*(1.0-tint)/(mb*pow(1.0-mb,6.0));return clamp(fs-b*mu*pow(1.0-mu,6.0),0.0,1.0);}
+        // EON (Portsmouth-Kutz-Hill 2024) directional albedo of the Fujii
+        // Oren-Nayar lobe, the polynomial fit from the paper.
+        float eonAlbedo(float mu,float r){float mc=1.0-mu,mc2=mc*mc;float g=0.0571085289*mc+0.491881867*mc2+(-0.332181442*mc+0.0714429953*mc2)*mc2;return (1.0+r*g)/(1.0+0.287861*r);}
         bool hasSpecial(int layer){return (uSpecialMask&(1<<layer))!=0;}
         vec2 polarizeUv(vec2 uv){
             vec2 centered=uv-vec2(.5);
@@ -2623,7 +2632,16 @@ void PbrPreviewGL::initializeGL()
             }
             vec3 H=normalize(V+L);
             float NoL=max(dot(N,L),0.0),NoV=max(dot(N,V),.001),NoH=max(dot(N,H),0.0),VoH=max(dot(V,H),0.0);
-            vec3 f0=mix(dielectricF0,base,metal),F=fresnel(VoH,f0);
+            vec4 surfaceFx=vec4(0.0,0.0,.5,0.0);bool surfaceFxOn=hasSpecial(1)&&!defaults;if(surfaceFxOn)surfaceFx=specialSample(1,uv);
+            // OpenPBR thin film: an interference layer on the substrate, folded
+            // into the Fresnel factor (the weight blends the BSDF with and
+            // without film, energy-neutral) instead of the old additive rim.
+            float filmW=clamp(surfaceFx.a*uIridescenceStrength,0.0,1.0);vec3 filmTint=mix(vec3(1.0),thinFilmColor(NoV,surfaceFx.b,uFilmIor)*2.0,filmW);
+            // OpenPBR F82: the specular colour is the 82-degree edge tint of a
+            // metal; dielectrics keep Schlick over the IOR F0 (tinted at F0).
+            vec3 metalTint=defaults?vec3(1.0):specularTint;
+            vec3 f0=mix(dielectricF0,base,metal),F=min(mix(fresnel(VoH,dielectricF0),f82(VoH,base,metalTint),metal)*filmTint,vec3(1.0));
+            float fuzzAtten=1.0;vec3 fuzzAdd=vec3(0.0);
             float alpha=rough*rough,k=(rough+1.0)*(rough+1.0)/8.0;
             vec2 brdf=texture(uBrdfLut,vec2(NoV,rough)).rg;
             // Kulla-Conty multi-scatter energy compensation: single-scatter GGX
@@ -2659,6 +2677,17 @@ void PbrPreviewGL::initializeGL()
                 spec*=1.0-clamp((curvature-.5)*2.0,0.0,1.0)*uCavitySpecOcclusion;
             }
             vec3 diffuse=(1.0-F)*(1.0-metal)*base/PI;
+            if(uDiffuseRoughness>0.0&&!defaults){
+                // OpenPBR base_diffuse_roughness: EON, the energy-preserving
+                // Fujii Oren-Nayar with its multi-scatter compensation term.
+                float dr=clamp(uDiffuseRoughness,0.0,1.0),AF=1.0/(1.0+0.287861*dr);
+                float sON=dot(L,V)-NoL*NoV,stinv=sON>0.0?sON/max(max(NoL,NoV),.001):sON;
+                vec3 rho=(1.0-metal)*base,fss=rho/PI*AF*(1.0+dr*stinv);
+                float EFo=eonAlbedo(NoV,dr),EFi=eonAlbedo(NoL,dr),avgEF=AF*(1.0+0.072488*dr);
+                vec3 rhoMs=rho*rho*avgEF/max(vec3(1.0)-rho*(1.0-avgEF),vec3(.001));
+                vec3 fms=rhoMs/PI*max(.01,1.0-EFo)*max(.01,1.0-EFi)/max(.01,1.0-avgEF);
+                diffuse=(1.0-F)*(fss+fms);
+            }
             float heightVisibility=(uParallaxMode==3&&!defaults)?parallaxShadow(uv,hitDepth,normalize(worldToTangent*L)):1.0;
             float keyShadow=shadowVisibility(vWorldPosition,N);
             vec3 color=(uShaderMode==10
@@ -2684,7 +2713,7 @@ void PbrPreviewGL::initializeGL()
             vec3 envDiffuse=diffuseIrradiance(diffuseN);
             vec3 environmentF=fresnel(NoV,f0);
             vec3 environmentDiffuse=(1.0-environmentF)*(1.0-metal)*base*envDiffuse*.45*uDiffuseScale;
-            vec3 environmentSpecular=envSpec*(f0*brdf.x+brdf.y)*multiScatter*specularOcclusion*uSpecularScale;
+            vec3 environmentSpecular=envSpec*(f0*brdf.x+brdf.y*mix(vec3(1.0),metalTint,metal))*filmTint*multiScatter*specularOcclusion*uSpecularScale;
             vec3 environmentLighting=(environmentDiffuse+environmentSpecular)*uEnvironmentIntensity*ao;
             if(uShaderMode!=10)color+=environmentLighting;
             if(uParticleActive&&uShaderMode>=10&&hasSpecial(uSixWayALayer)&&hasSpecial(uSixWayBLayer)&&!defaults){
@@ -2720,14 +2749,26 @@ void PbrPreviewGL::initializeGL()
                 float retro=pow(max(dot(V,L),0.0),mix(192.0,12.0,clamp(uRetroWidth,0.0,1.0)));
                 color+=uKeyColor*uKeyIntensity*uRetroStrength*retroMask*retro*NoL*keyShadow;
             }
-            if(hasSpecial(1)&&!defaults){
-                vec4 surface=specialSample(1,uv);
-                float sheenMask=surface.r*uSheenStrength,glintMask=surface.g*uGlintIntensity;
-                color+=base*pow(max(uFuzzColor,vec3(0.0)),vec3(2.2))*sheenMask*pow(1.0-NoV,max(.25,4.0*(1.0-uSheenRoughness)))*(envDiffuse+uKeyColor*uKeyIntensity*.15);
+            if(surfaceFxOn){
+                float glintMask=surfaceFx.g*uGlintIntensity;
                 float glint=step(1.0-clamp(glintMask*.01,0.0,.98),hash13(vWorldPosition*max(uGlintScale,.001)+N*17.0))*pow(NoH,256.0);
                 color+=uKeyColor*uKeyIntensity*glint*NoL;
-                float iri=surface.a*uIridescenceStrength;vec3 film=thinFilmColor(NoV,surface.b,uFilmIor);
-                color+=environmentSpecular*(film-vec3(.5))*iri*2.0;
+                // OpenPBR fuzz: the Zeltner-Burley-Chiang 2022 SGGX fibre sheen
+                // through its 32x32 LTC fit (a_inv, b_inv, R over cos(theta_o) x
+                // alpha; the "volume" table of tizian/ltc-sheen, Apache-2.0).
+                // The lobe sits above the coat, so it is applied after emission:
+                // colour * (1 - w*R) + w * fuzz_color * R * (LTC lobe).
+                float fuzzW=clamp(surfaceFx.r*uFuzzStrength,0.0,1.0);
+                if(fuzzW>0.0){
+                    vec3 ltc=texture(uFuzzLtc,(vec2(NoV,clamp(uFuzzRoughness,0.0,1.0))*31.0+.5)/32.0).xyz;
+                    vec3 fT=V-N*dot(N,V);fT=dot(fT,fT)>1e-8?normalize(fT):normalize(cross(N,abs(N.y)<.9?vec3(0.0,1.0,0.0):vec3(1.0,0.0,0.0)));vec3 fB=cross(N,fT);
+                    vec3 wi=vec3(dot(L,fT),dot(L,fB),NoL);
+                    vec3 wo=vec3(ltc.x*wi.x+ltc.y*wi.z,ltc.x*wi.y,wi.z);float wl=max(length(wo),1e-5);
+                    float ltcVal=NoL>0.0?max(wo.z/wl,0.0)/PI*ltc.x*ltc.x/(wl*wl*wl):0.0;
+                    vec3 fuzzAlbedo=pow(max(uFuzzColor,vec3(0.0)),vec3(2.2));
+                    fuzzAdd=fuzzW*fuzzAlbedo*ltc.z*(ltcVal*uKeyColor*uKeyIntensity*keyShadow+envDiffuse*.45*uDiffuseScale*uEnvironmentIntensity*ao);
+                    fuzzAtten=1.0-fuzzW*ltc.z;
+                }
             }
 
             if(hasSpecial(3)&&uSubsurfaceMode>0&&!defaults){
@@ -2786,13 +2827,35 @@ void PbrPreviewGL::initializeGL()
                 float coatRough=clamp(coat.b,.025,1.0),coatCoverage=coat.a*uCoatStrength[ci],coatNoV=max(dot(coatN,V),.001),coatNoL=max(dot(coatN,L),0.0);
                 float coatF0=pow((uCoatIor[ci]-1.0)/(uCoatIor[ci]+1.0),2.0);vec3 coatF=fresnel(max(dot(V,normalize(V+L)),0.0),vec3(coatF0));
                 float coatAlpha=coatRough*coatRough,coatNoH=max(dot(coatN,normalize(V+L)),0.0),coatK=(coatRough+1.0)*(coatRough+1.0)/8.0;
-                vec3 coatDirect=D_GGX(coatNoH,coatAlpha)*G1(coatNoL,coatK)*G1(coatNoV,coatK)*coatF/max(4.0*coatNoL*coatNoV,.001)*coatNoL*uKeyColor*uKeyIntensity;
+                float coatD=D_GGX(coatNoH,coatAlpha);
+                if(uCoatAnisotropy[ci]>.001){
+                    // OpenPBR coat_roughness_anisotropy, stretched along the base
+                    // tangent (neither side has a geometry_coat_tangent).
+                    vec3 cT=normalize(tangentToWorld*vec3(1.0,0.0,0.0));vec3 cB=normalize(cross(coatN,cT));cT=cross(cB,coatN);vec3 cH=normalize(V+L);
+                    float cat=max(coatAlpha*(1.0+.9*uCoatAnisotropy[ci]),.0005),cab=max(coatAlpha*(1.0-.9*uCoatAnisotropy[ci]),.0005);
+                    float cToH=dot(cT,cH),cBoH=dot(cB,cH),cd=cToH*cToH/(cat*cat)+cBoH*cBoH/(cab*cab)+coatNoH*coatNoH;
+                    coatD=1.0/(PI*cat*cab*max(cd*cd,.0001));
+                }
+                vec3 coatDirect=coatD*G1(coatNoL,coatK)*G1(coatNoV,coatK)*coatF/max(4.0*coatNoL*coatNoV,.001)*coatNoL*uKeyColor*uKeyIntensity;
                 vec3 coatR=environmentDirection(reflect(-V,coatN));vec3 coatEnv=textureLod(uPrefilteredEnvironment,coatR,coatRough*uPrefilteredEnvironmentMaxLod).rgb;vec2 coatBrdf=texture(uBrdfLut,vec2(coatNoV,coatRough)).rg;
+                // OpenPBR coat_color is the SQUARE of the normal-incidence
+                // transmittance, and the path through the coat lengthens with
+                // the refracted angles: T^(1/mu_i' + 1/mu_o'), mu' = the cosine
+                // inside the coat. The colour already sums key and environment
+                // light, so the incident side is taken at normal incidence.
                 vec3 coatTint=pow(max(uCoatTint[ci],vec3(.001)),vec3(2.2));
-                vec3 coatTransmittance=mix(vec3(1.0),coatTint,clamp(uCoatAbsorption[ci]*coatCoverage,0.0,1.0));
-                color*=coatTransmittance;
+                float coatEta=max(uCoatIor[ci],1.0001),coatMuV=sqrt(max(1.0-(1.0-coatNoV*coatNoV)/(coatEta*coatEta),.05));
+                vec3 coatTransmittance=pow(coatTint,vec3(clamp(uCoatAbsorption[ci]*coatCoverage,0.0,1.0)*.5*(1.0+1.0/coatMuV)));
+                // OpenPBR coat_darkening: light bouncing between the base and the
+                // coat's underside, delta = (1 - K) / (1 - E_base * K) with
+                // K = lerp(F(view), K_r, base roughness), K_r = 1 - (1 - <F>)/eta^2.
+                // coat_darkening = 0 un-darkens the base entirely (the boost).
+                float coatAvgF=coatF0+(1.0-coatF0)/21.0,coatKr=1.0-(1.0-coatAvgF)/(coatEta*coatEta),coatKs=coatF0+(1.0-coatF0)*pow(1.0-coatNoV,5.0);
+                float coatRd=mix(1.0,rough,clamp(max(max(dielectricF0.r,dielectricF0.g),dielectricF0.b),0.0,1.0)),coatKd=mix(coatKs,coatKr,mix(coatRd,rough,metal));
+                vec3 coatDelta=(1.0-coatKd)/max(vec3(1.0)-clamp(base,0.0,1.0)*coatKd,vec3(.001));
+                vec3 coatBase=color*coatTransmittance*mix(vec3(1.0),coatDelta,clamp(coatCoverage*uCoatDarkening[ci],0.0,1.0));
                 coatEmissionTransmittance*=coatTransmittance;
-                color=mix(color*(1.0-coatF0*coatCoverage),color+coatDirect*coatCoverage+coatEnv*(coatF0*coatBrdf.x+coatBrdf.y)*coatCoverage*uEnvironmentIntensity,clamp(coatCoverage,0.0,1.0));
+                color=mix(color,coatBase+coatDirect*coatCoverage+coatEnv*(coatF0*coatBrdf.x+coatBrdf.y)*coatCoverage*uEnvironmentIntensity,clamp(coatCoverage,0.0,1.0));
             }
 
             if((uShaderMode==6||(uShaderMode==8&&hasSpecial(12)))&&hasSpecial(12)&&!defaults){
@@ -2854,6 +2917,7 @@ void PbrPreviewGL::initializeGL()
             // 1357-1358). With no coat layer the factor is exactly vec3(1.0)
             // and this line is bit-identical to the plain add it replaces.
             color+=emission*coatEmissionTransmittance;
+            color=color*fuzzAtten+fuzzAdd;
             vec3 mapped=tonemap(color);if(uCompositionMode==3)mapped*=opacity;
             fragColor=vec4(mapped,opacity);
         }
@@ -3700,6 +3764,11 @@ void PbrPreviewGL::createEnvironmentCubemap()
 void PbrPreviewGL::createBrdfLut()
 {
     constexpr int size=256;
+    m_fuzzLtcTexture=std::make_unique<QOpenGLTexture>(QOpenGLTexture::Target2D);
+    m_fuzzLtcTexture->setSize(32,32);m_fuzzLtcTexture->setFormat(QOpenGLTexture::RGBA32F);m_fuzzLtcTexture->setMipLevels(1);
+    m_fuzzLtcTexture->allocateStorage(QOpenGLTexture::RGBA,QOpenGLTexture::Float32);
+    m_fuzzLtcTexture->setData(QOpenGLTexture::RGBA,QOpenGLTexture::Float32,kFuzzLtcVolume);
+    m_fuzzLtcTexture->setWrapMode(QOpenGLTexture::ClampToEdge);m_fuzzLtcTexture->setMinMagFilters(QOpenGLTexture::Linear,QOpenGLTexture::Linear);
     m_brdfLutTexture=std::make_unique<QOpenGLTexture>(QOpenGLTexture::Target2D);
     m_brdfLutTexture->setSize(size,size);m_brdfLutTexture->setFormat(QOpenGLTexture::RGBA16F);
     m_brdfLutTexture->setMipLevels(1);m_brdfLutTexture->allocateStorage();
@@ -4839,7 +4908,7 @@ void PbrPreviewGL::renderPathTraced(int pixelWidth, int pixelHeight)
     glActiveTexture(GL_TEXTURE23); glBindTexture(GL_TEXTURE_BUFFER, m_bvhTrianglesTexture);
     glActiveTexture(GL_TEXTURE0);
     m_baseTexture->bind(0); m_normalTexture->bind(1); m_rmaosTexture->bind(2); m_emissiveTexture->bind(3); m_environmentTexture->bind(5);
-    m_prefilteredEnvironmentTexture->bind(12); m_brdfLutTexture->bind(13);
+    m_prefilteredEnvironmentTexture->bind(12); m_brdfLutTexture->bind(13);if(m_fuzzLtcTexture)m_fuzzLtcTexture->bind(15);
     glActiveTexture(GL_TEXTURE7); glBindTexture(GL_TEXTURE_2D, m_accumFboA->texture());
     glActiveTexture(GL_TEXTURE0);
     m_traceProgram->setUniformValue("uBase", 0);
@@ -5059,7 +5128,7 @@ void PbrPreviewGL::paintGL()
         if(postActive){m_sceneFbo->bind();glClearColor(.1f,.1f,.1f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);}
     }
     glViewport(0,0,pixelWidth,pixelHeight);
-    m_environmentTexture->bind(5);m_prefilteredEnvironmentTexture->bind(12);m_brdfLutTexture->bind(13);m_specialTextureArray->bind(14);
+    m_environmentTexture->bind(5);m_prefilteredEnvironmentTexture->bind(12);m_brdfLutTexture->bind(13);if(m_fuzzLtcTexture)m_fuzzLtcTexture->bind(15);m_specialTextureArray->bind(14);
     // 2D is a texture view, so the environment does not belong behind it: an
     // HDRI tints the eye's judgement of the very values being inspected. Flat
     // grey instead — but by running the same pass in Gray mode, not by skipping
@@ -5204,8 +5273,8 @@ void PbrPreviewGL::paintGL()
     const auto subsurfaceState=slot(QStringLiteral("Subsurface"));const QJsonObject subsurface=subsurfaceState.values;const QString subsurfaceMode=subsurfaceState.enabled?subsurface.value(QStringLiteral("mode")).toString(m_document.shaderMode()==Pbr::ShaderMode::VegetationSurface?QStringLiteral("Thin Transmission"):QStringLiteral("Diffusion Profile")):QStringLiteral("Disabled");m_program->setUniformValue("uSubsurfaceMode",subsurfaceMode==QStringLiteral("Diffusion Profile")?1:(subsurfaceMode==QStringLiteral("Thin Transmission")?2:(subsurfaceMode==QStringLiteral("Combined")?3:0)));
     const QString profile=subsurface.value(QStringLiteral("profile")).toString(QStringLiteral("Skin"));QVector3D profileColor=profile==QStringLiteral("Wax")?QVector3D(1,.72,.4):(profile==QStringLiteral("Flesh")?QVector3D(1,.3,.22):(profile==QStringLiteral("Plant")?QVector3D(.42,.8,.28):(profile==QStringLiteral("Custom")?jsonColor(subsurface,QStringLiteral("customScatterColor"),QStringLiteral("#FFB39D")):QVector3D(1,.55,.42))));m_program->setUniformValue("uSubsurfaceProfileColor",profileColor);
     m_program->setUniformValue("uSubsurfaceWeight",float(subsurface.value(QStringLiteral("weight")).toDouble(1.0)));m_program->setUniformValue("uSubsurfaceTransmission",float(subsurface.value(QStringLiteral("transmission")).toDouble(0.0)));m_program->setUniformValue("uTransmissionTint",jsonColor(subsurface,QStringLiteral("transmissionTint"),QStringLiteral("#FFFFFF")));m_program->setUniformValue("uSubsurfaceThickness",numberValue(subsurface,QStringLiteral("thickness"),1.0f));
-    const auto fxState=slot(QStringLiteral("SurfaceEffects"));const float fxOn=fxState.enabled?1.0f:0.0f;
-    m_program->setUniformValue("uSheenStrength",fxOn*numberValue(fxState.values,QStringLiteral("fuzzStrength"),0));m_program->setUniformValue("uSheenRoughness",numberValue(fxState.values,QStringLiteral("fuzzRoughness"),.6f));m_program->setUniformValue("uFuzzColor",jsonColor(fxState.values,QStringLiteral("fuzzColor"),QStringLiteral("#FFFFFF")));m_program->setUniformValue("uGlintIntensity",fxOn*numberValue(fxState.values,QStringLiteral("glintIntensity"),0));m_program->setUniformValue("uGlintScale",numberValue(fxState.values,QStringLiteral("glintScale"),1));m_program->setUniformValue("uFilmIor",numberValue(fxState.values,QStringLiteral("filmIor"),1.5f));m_program->setUniformValue("uIridescenceStrength",fxOn*numberValue(fxState.values,QStringLiteral("iridescenceStrength"),0));
+    const auto fxState=slot(QStringLiteral("SurfaceEffects"));m_program->setUniformValue("uDiffuseRoughness",numberValue(slot(QStringLiteral("BaseColor")).values,QStringLiteral("diffuseRoughness"),0));const float fxOn=fxState.enabled?1.0f:0.0f;
+    m_program->setUniformValue("uFuzzStrength",fxOn*numberValue(fxState.values,QStringLiteral("fuzzStrength"),1));m_program->setUniformValue("uFuzzRoughness",numberValue(fxState.values,QStringLiteral("fuzzRoughness"),.6f));m_program->setUniformValue("uFuzzColor",jsonColor(fxState.values,QStringLiteral("fuzzColor"),QStringLiteral("#FFFFFF")));m_program->setUniformValue("uGlintIntensity",fxOn*numberValue(fxState.values,QStringLiteral("glintIntensity"),0));m_program->setUniformValue("uGlintScale",numberValue(fxState.values,QStringLiteral("glintScale"),1));m_program->setUniformValue("uFilmIor",numberValue(fxState.values,QStringLiteral("filmIor"),1.5f));m_program->setUniformValue("uIridescenceStrength",fxOn*numberValue(fxState.values,QStringLiteral("iridescenceStrength"),0));
     const QJsonObject hair=slot(QStringLiteral("HairDirection")).values;const QJsonObject hairScatter=slot(QStringLiteral("HairScatter")).values;m_program->setUniformValue("uHairPrimaryStrength",float(hair.value("primaryStrength").toDouble(1)));m_program->setUniformValue("uHairPrimaryRoughness",float(hair.value("primaryRoughness").toDouble(.25)));m_program->setUniformValue("uHairPrimaryShift",float(hair.value("primaryShift").toDouble(-.08)));m_program->setUniformValue("uHairSecondaryStrength",float(hair.value("secondaryStrength").toDouble(.5)));m_program->setUniformValue("uHairSecondaryRoughness",float(hair.value("secondaryRoughness").toDouble(.45)));m_program->setUniformValue("uHairSecondaryShift",float(hair.value("secondaryShift").toDouble(.12)));m_program->setUniformValue("uHairScatter",float(hairScatter.value("scatterStrength").toDouble(.5)));m_program->setUniformValue("uHairBacklight",float(hairScatter.value("backlightStrength").toDouble(.5)));m_program->setUniformValue("uHairDirectionStrength",numberValue(slot(QStringLiteral("HairDirection")).values,QStringLiteral("strength"),1));
     const auto transmissionState=slot(QStringLiteral("TransmissionAbsorption"));m_program->setUniformValue("uGlassIor",numberValue(transmissionState.values,QStringLiteral("ior"),1.5f));m_program->setUniformValue("uGlassAbsorptionDistance",numberValue(transmissionState.values,QStringLiteral("absorptionDistance"),1));m_program->setUniformValue("uGlassRefractionRoughness",numberValue(transmissionState.values,QStringLiteral("refractionRoughness"),0));m_program->setUniformValue("uGlassThinWalled",boolValue(transmissionState.values,QStringLiteral("thinWalled"),false));m_program->setUniformValue("uGlassThickness",numberValue(transmissionState.values,QStringLiteral("thickness"),1));
     const auto waterFlow=slot(QStringLiteral("WaterFlow"));m_program->setUniformValue("uWaterIor",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("ior"),1.333f));m_program->setUniformValue("uWaterAbsorptionDistance",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("absorptionDistance"),300));m_program->setUniformValue("uWaterScattering",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("scattering"),.25f));m_program->setUniformValue("uWaterReflectionStrength",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("reflectionStrength"),1));m_program->setUniformValue("uWaterShoreFoam",settingBool(QStringLiteral("Shading/Water"),QStringLiteral("shoreFoam"),true));m_program->setUniformValue("uWaterFlowSpeed",numberValue(waterFlow.values,QStringLiteral("speed"),.05f));m_program->setUniformValue("uWaterFlowStrength",numberValue(waterFlow.values,QStringLiteral("strength"),1));
@@ -5213,7 +5282,7 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uEyeCorneaIor",numberValue(corneaParams,QStringLiteral("ior"),1.376f));m_program->setUniformValue("uEyeIrisDepth",numberValue(irisParams,QStringLiteral("irisDepth"),.08f));m_program->setUniformValue("uEyeLimbalStrength",numberValue(irisParams,QStringLiteral("limbalStrength"),1));m_program->setUniformValue("uEyePupilScale",numberValue(irisParams,QStringLiteral("pupilScale"),1));m_program->setUniformValue("uEyeWetness",numberValue(corneaParams,QStringLiteral("wetness"),1));
     {
         const char* coatSets[3]={"UV0","UV1","UV2"};const char* coatPrefixes[3]={"primary","secondary","tertiary"};
-        GLfloat coatStrength[3],coatIor[3],coatNormalStrength[3],coatAbsorption[3];QVector3D coatTint[3];
+        GLfloat coatStrength[3],coatIor[3],coatNormalStrength[3],coatAbsorption[3],coatDarkening[3],coatAnisotropy[3];QVector3D coatTint[3];
         const GLint coatLayers[3]={ClearcoatLayer,ClearcoatSecondaryLayer,ClearcoatTertiaryLayer};
         for(int ci=0;ci<3;++ci){
             const auto state=m_document.textureSlot(QString::fromLatin1(coatSets[ci]),QString::fromLatin1(coatPrefixes[ci])+QStringLiteral("Clearcoat"));
@@ -5221,12 +5290,16 @@ void PbrPreviewGL::paintGL()
             coatIor[ci]=numberValue(state.values,QStringLiteral("ior"),1.5f);
             coatNormalStrength[ci]=numberValue(state.values,QStringLiteral("normalStrength"),1);
             coatAbsorption[ci]=numberValue(state.values,QStringLiteral("absorption"),1);
+            coatDarkening[ci]=numberValue(state.values,QStringLiteral("darkening"),1);
+            coatAnisotropy[ci]=numberValue(state.values,QStringLiteral("anisotropy"),0);
             coatTint[ci]=jsonColor(state.values,QStringLiteral("tint"),QStringLiteral("#FFFFFF"));
         }
         m_program->setUniformValueArray("uCoatStrength",coatStrength,3,1);
         m_program->setUniformValueArray("uCoatIor",coatIor,3,1);
         m_program->setUniformValueArray("uCoatNormalStrength",coatNormalStrength,3,1);
         m_program->setUniformValueArray("uCoatAbsorption",coatAbsorption,3,1);
+        m_program->setUniformValueArray("uCoatDarkening",coatDarkening,3,1);
+        m_program->setUniformValueArray("uCoatAnisotropy",coatAnisotropy,3,1);
         m_program->setUniformValueArray("uCoatTint",coatTint,3);
         m_program->setUniformValueArray("uCoatSpecialLayer",coatLayers,3);
     }

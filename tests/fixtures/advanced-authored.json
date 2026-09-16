@@ -49,7 +49,7 @@
       "path": "textures\\pbr\\golden_adv_glow.dds",
       "values": {
         "color": "#FF9C4A",
-        "intensity": 2.5
+        "luminance": 250.0
       }
     },
     "primarySubsurface": {

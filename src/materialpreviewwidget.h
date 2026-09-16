@@ -343,6 +343,7 @@ private:
     std::unique_ptr<QOpenGLTexture> m_environmentTexture;
     std::unique_ptr<QOpenGLTexture> m_prefilteredEnvironmentTexture;
     std::unique_ptr<QOpenGLTexture> m_brdfLutTexture;
+    std::unique_ptr<QOpenGLTexture> m_fuzzLtcTexture; // 32x32 Zeltner sheen LTC fit (a_inv, b_inv, R)
     std::unique_ptr<QOpenGLTexture> m_secondaryBaseTexture, m_secondaryNormalTexture, m_secondaryRmaosTexture;
     std::unique_ptr<QOpenGLTexture> m_secondaryEmissiveTexture, m_layerCoverageTexture;
     std::unique_ptr<QOpenGLTexture> m_tertiaryBaseTexture, m_tertiaryNormalTexture, m_tertiaryRmaosTexture;

@@ -240,15 +240,15 @@ not yet consume.
 | `base_weight` | float `[0,1]`, default 1 | `primaryBaseColor` `colorScale` | Present, different name |
 | `base_color` | color3 `[0,1]³`, default 0.8 grey | `primaryBaseColor` RGB (sRGB) | Present; OpenPBR additionally constrains it by `E_diffuse = (1 − E_spec)·C` |
 | `base_metalness` | float `[0,1]`, default 0 | `RMAOS` G | Present |
-| `base_diffuse_roughness` | float `[0,1]`, default 0 | — | Absent (no Oren-Nayar σ on either side) |
+| `base_diffuse_roughness` | float `[0,1]`, default 0 | `primaryBaseColor` `diffuseRoughness` | Present (2026-09-17); the preview shades it as EON, the energy-preserving Oren-Nayar |
 | `specular_weight` | float `[0,∞)`, norm `[0,1]`, default 1 | `RMAOS` A while `alphaCarries="Specular Weight"`, else the `specularWeight` constant; `[0,1]`, default 1 | Present |
-| `specular_color` | color3 `[0,1]³`, default white | `primarySpecularColor` RGB (sRGB; dielectric-only) | Different: OpenPBR uses it as the 82° **edge tint** on metals (the F82 model), which PBRM does not implement |
+| `specular_color` | color3 `[0,1]³`, default white | `primarySpecularColor` RGB (sRGB) | Present: the tint over the IOR F0 of dielectrics, and the F82 edge tint of metals (preview 2026-09-17; the runtime reads it for dielectrics only until FO4CS carries the F82 term) |
 | `specular_roughness` | float `[0,1]`, default 0.3 | `RMAOS` R | Present, same convention (α = r²) |
 | `specular_roughness_anisotropy` | float `[0,1]`, default 0 | `Anisotropy` slot | Editor-only, and a bent-reflection approximation rather than OpenPBR's αt/αb split |
 | `specular_ior` | float `(0,∞)`, norm `[1,3]`, default 1.5 | `primarySpecularColor` constant `ior` (default 1.5, no ceiling), or its A over `[0, iorMax]` (ceiling default 4.25) while `overrideIor=false` | Present; `F0 = ((η−1)/(η+1))²`, IOR 0 makes the tint the F0 outright |
 | `transmission_weight` | float `[0,1]`, default 0 | `CompositionMode::PhysicalTransmission` | Different: a composition mode, not a mix weight |
 | `transmission_color` | color3 `[0,1]³`, default white | `TransmissionAbsorption` RGB | Editor-only |
-| `transmission_depth` | length, default 0 | `TransmissionAbsorption` A | Different: a thickness, with no Beer-law `μt = −ln T / λ` |
+| `transmission_depth` | length, default 0 | `TransmissionAbsorption` `absorptionDistance` (A = path length) | Present: the same Beer law, `T(d) = colour^(d/λ) = exp(−μt d)` with `μt = −ln(colour)/λ`; ours also carries a per-texel path length in A |
 | `transmission_scatter`, `transmission_scatter_anisotropy` | — | — | Absent |
 | `transmission_dispersion_scale`, `transmission_dispersion_abbe_number` | — | — | Absent by design (a deferred G-buffer has no wavelength dimension) |
 | `subsurface_weight` | float `[0,1]`, default 0 | `primarySubsurfaceScatter` W × thickness × scale | Present |
@@ -257,20 +257,20 @@ not yet consume.
 | `subsurface_scatter_anisotropy` | float `[−1,1]` | — | Absent by design (a Gaussian-sum blur has no phase function) |
 | — | — | `subsurfaceTransmission` / `subsurfaceTransmissionTint` | PBRM extension: OpenPBR has this only in thin-walled mode |
 | `fuzz_weight` | float `[0,1]`, default 0 | `SurfaceEffects` R ("fuzz") | Editor-only |
-| `fuzz_color` | color3 `[0,1]³`, default white | `primarySurfaceEffects` `fuzzColor` (sRGB, default white) | Different: ours tints the base colour the lobe reflects; OpenPBR's is the fuzz albedo on its own |
-| `fuzz_roughness` | float `[0,1]`, default 0.5 | `fuzzRoughness` | Different: OpenPBR mandates the Zeltner-2022 SGGX microflake LTC model; ours is a Fresnel-rim add |
+| `fuzz_color` | color3 `[0,1]³`, default white | `primarySurfaceEffects` `fuzzColor` (sRGB, default white) | Present (2026-09-17): the albedo of the fuzz itself; it no longer tints the base |
+| `fuzz_roughness` | float `[0,1]`, default 0.5 | `fuzzRoughness` (default 0.6) | Present (2026-09-17): the Zeltner-2022 SGGX fibre sheen through its 32×32 LTC fit; what lies beneath is dimmed by `1 − w·R` |
 | `coat_weight` | float `[0,1]`, default 0 | `Clearcoat` A × coat strength | Editor-only |
-| `coat_color` | color3 `[0,1]³` — the **square** of normal-incidence transmittance | coat tint × coat absorption | Different units: ours is a straight multiply, OpenPBR's is T² and view-dependent |
+| `coat_color` | color3 `[0,1]³` — the **square** of normal-incidence transmittance | `Clearcoat` tint × absorption | Present (2026-09-17): the tint is coat_color, the colour seen at normal incidence, applied as `T^(1/μ_i′ + 1/μ_o′)` over the refracted cosines (preview: incident side at normal incidence) |
 | `coat_roughness` | float `[0,1]`, default 0 | `Clearcoat` B | Present |
-| `coat_roughness_anisotropy` | float `[0,1]`, default 0 | — | Absent |
+| `coat_roughness_anisotropy` | float `[0,1]`, default 0 | `Clearcoat` `anisotropy` | Present (2026-09-17), stretched along the base tangent |
 | `coat_ior` | float `(0,∞)`, default 1.6 | coat IOR (`F0 = ((η−1)/(η+1))²`) | Present |
-| `coat_darkening` | float `[0,1]`, default 1 | — | Absent |
+| `coat_darkening` | float `[0,1]`, default 1 | `Clearcoat` `darkening` | Present (2026-09-17): `Δ = (1 − K)/(1 − E_b K)`, `K = lerp(F(ω_o), K_r, r_b)`, `K_r = 1 − (1 − ⟨F⟩)/η²`; 0 boosts the darkening away |
 | — | — | `Clearcoat` RG (coat normal) | Matches `geometry_coat_normal` |
-| `thin_film_weight` | float `[0,1]`, default 0 | `SurfaceEffects` A × iridescence strength | Present in spirit |
+| `thin_film_weight` | float `[0,1]`, default 0 | `SurfaceEffects` A × iridescence strength | Present (2026-09-17): blends the base Fresnel with and without the film, energy-neutral, above the base and under the coat |
 | `thin_film_thickness` | **micrometres (µm)**, `[0,∞)`, default 0.5 | `SurfaceEffects` B | **Present, and the unit is µm** — see the channel-semantics note above |
 | `thin_film_ior` | float `(0,∞)`, default 1.4 | film IOR | Present |
 | — (placement) | between coat and base, folded into the Fresnel factor, energy-neutral (spec lines 867/873) | an additive post-shade term above the coat | Different, and known-wrong; scheduled, not fixed here |
-| `emission_luminance` | cd/m² (nits), `[0,∞)`, norm `[0,1000]`, default 0 | `primaryEmissive` intensity × the class-based emissive radiance ladder | Different units: ours is a dimensionless authored intensity times a per-class multiplier calibrated against a measured frame, deliberately not nits |
+| `emission_luminance` | cd/m² (nits), `[0,∞)`, norm `[0,1000]`, default 0 | `primaryEmissive` `luminance` × the A mask | Present (2026-09-17): nits; the preview maps 100 nits to display white before exposure; a pre-2026-09-17 `intensity` loads as luminance = intensity × 100 |
 | `emission_color` | color3 `[0,∞)³`, default white | `primaryEmissive` RGB (sRGB) | Present; OpenPBR permits values above 1 for HDR textures, ours caps at 1 and puts the headroom in the intensity scalar |
 | `geometry_opacity` | float `[0,1]`, default 1 | `primaryBaseColor` A + global opacity + alpha threshold | Present, richer |
 | `geometry_thin_walled` | bool | — | Absent by design |
@@ -329,10 +329,10 @@ and these Primary UV socket keys:
 
 | Socket | Texture data | Missing-value defaults |
 | --- | --- | --- |
-| `primaryBaseColor` | sRGB RGB color, A opacity/coverage | `overrideColor=true`, color `#FFFFFF`; `overrideOpacity=true`, opacity `1.0`; tint `#FFFFFF`, scale `1.0`, blend `Base` |
+| `primaryBaseColor` | sRGB RGB color, A opacity/coverage | `overrideColor=true`, color `#FFFFFF`; `overrideOpacity=true`, opacity `1.0`; tint `#FFFFFF`, scale `1.0`, blend `Base`, `diffuseRoughness` `0.0` |
 | `primaryNormal` | linear RG tangent normal, optional B height, A signed curvature or cone map per `alphaCarries` | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `alphaCarries="None"`, `cavitySpecOcclusion=1.0` |
 | `primaryRmaos` | linear R roughness, G metallic, B AO, A specular weight or porosity | `override*` channel fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, specular weight `1.0`; `alphaCarries="Specular Weight"`, `overridePorosity=false`, porosity `0.5` |
-| `primaryEmissive` | sRGB RGB radiance, A intensity mask | color `#FFFFFF`, intensity `0.0` |
+| `primaryEmissive` | sRGB RGB radiance, A intensity mask | color `#FFFFFF`, luminance `0.0` (nits) |
 | `primarySpecularColor` | sRGB RGB specular tint (read only while `overrideColor=false`), A specular IOR map (read only while `overrideIor=false`) | `overrideColor=true`, `color=#FFFFFF`, `overrideIor=true`, `ior=1.5`, `iorMax=4.25`; the IOR constants are read whether or not the slot is enabled; an enabled slot with RGB overridden or no map tints with `color`; a disabled or absent slot means a white tint and the constant IOR |
 
 `primarySpecularColor` RGB is the OpenPBR `specular_color` tint on the

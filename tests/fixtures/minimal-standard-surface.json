@@ -44,7 +44,7 @@
       "path": "",
       "values": {
         "color": "#FFFFFF",
-        "intensity": 0.0
+        "luminance": 0.0
       }
     }
   },

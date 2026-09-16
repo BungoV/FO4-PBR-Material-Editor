@@ -208,6 +208,15 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
                 changed = true;
             }
         }
+        // 2026-09-17: emission is OpenPBR emission_luminance in nits. The old
+        // intensity was a plain radiance multiplier with 1 = the preview's
+        // display white, which is 100 nits. Idempotent: luminance-form slots
+        // carry no intensity key.
+        if (key.endsWith(QStringLiteral("Emissive")) && values.contains(QStringLiteral("intensity")) && !values.contains(QStringLiteral("luminance"))) {
+            values.insert(QStringLiteral("luminance"), values.value(QStringLiteral("intensity")).toDouble() * 100.0);
+            values.remove(QStringLiteral("intensity"));
+            changed = true;
+        }
         // 2026-09-17: sheen is fuzz (OpenPBR's term), and retroreflection is
         // its own input. A first-cut v6 SurfaceEffects slot renames its sheen
         // keys and hands its retro parameters to the same set's

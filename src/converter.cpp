@@ -524,7 +524,7 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     }
     if (!emissivePortable.isEmpty())
         wireSlot(&document, QStringLiteral("primaryEmissive"), emissivePortable,
-            QJsonObject{{QStringLiteral("intensity"), double(std::max(material.emittanceMult, 0.0f))}});
+            QJsonObject{{QStringLiteral("luminance"), double(std::max(material.emittanceMult, 0.0f)) * 100.0}});
     if (!subsurfacePortable.isEmpty()) {
         // The scatter tint is the material's own subsurface colour; the map
         // says where it applies. mapParameters already set the profile.

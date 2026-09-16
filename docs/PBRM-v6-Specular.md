@@ -142,3 +142,20 @@ Cone-step marching is a later lane on both sides.
 8. Build root, then `cli/`, then `tests/` (three qmake targets; timestamps
    must agree), run the suite, `scripts\package.ps1`, hash-verify, commit and
    push main.
+
+## 6. OpenPBR fields the editor honours ahead of the runtime (2026-09-17)
+
+These are format fields the preview shades today. The FO4CS half is built
+last, by standing order; until it lands the runtime ignores them, and nothing
+here changes the bits or constants of section 5.
+
+| Field | Where | Preview shading | Runtime note |
+| --- | --- | --- | --- |
+| Specular Color RGB on metals | `primarySpecularColor` RGB | F82 edge tint: `F82(μ) = F_Schlick(μ) − μ(1−μ)⁶/(μ̄(1−μ̄)⁶)·(F_Schlick(μ̄) − tint·F_Schlick(μ̄))`, μ̄ = 1/7 | needs the tint in the G-buffer beside the dielectric use |
+| `luminance` | `*Emissive` | nits; 100 nits = display white before exposure, so radiance = luminance / 100 × the old scale | replaces `intensity` (loader migrates ×100) |
+| `darkening` | `*Clearcoat` | OpenPBR coat_darkening Δ | new constant |
+| `anisotropy` | `*Clearcoat` | coat GGX stretched along the base tangent | new constant |
+| `diffuseRoughness` | `*BaseColor` | EON diffuse | new constant |
+| `fuzzStrength` (weight), `fuzzColor`, `fuzzRoughness` | `*SurfaceEffects` | Zeltner-2022 LTC sheen above the coat, base dimmed by `1 − w·R` | the 32×32 table is `src/fuzzltc_table.h` (Apache-2.0) |
+| thin film (B thickness, A weight) | `*SurfaceEffects` | folded into the base Fresnel, energy-neutral | was an additive rim |
+

@@ -83,7 +83,8 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
             numberField("opacity", "Opacity override", 1.0, 0.0, 1.0, 0.005, "Constant opacity used when alpha is overridden or unavailable."),
             colorField("tint", "Tint", "#FFFFFF", "Multiplies the sampled base color."),
             numberField("scale", "Color scale", 1.0, 0.0, 32.0, 0.01, "Scales the decoded base color."),
-            choiceField("blend", "Layer blend", secondary ? "Masked Replace" : "Base", {"Base", "Masked Replace", "Multiply", "Modulate 2x", "Add", "Screen", "Subtract", "Min (Darken)", "Max (Lighten)", "Overlay"}, "Controls how this UV layer combines with the previous material color.")
+            choiceField("blend", "Layer blend", secondary ? "Masked Replace" : "Base", {"Base", "Masked Replace", "Multiply", "Modulate 2x", "Add", "Screen", "Subtract", "Min (Darken)", "Max (Lighten)", "Overlay"}, "Controls how this UV layer combines with the previous material color."),
+            numberField("diffuseRoughness", "Diffuse roughness", 0.0, 0.0, 1.0, 0.005, "OpenPBR base_diffuse_roughness: roughness of the diffuse lobe, shaded as EON (energy-preserving Oren-Nayar). 0 is Lambert."),
         }));
 
     const bool effect = mode == Pbr::ShaderMode::UnlitEffect || mode == Pbr::ShaderMode::SimpleLitEffect || mode == Pbr::ShaderMode::PhysicallyLitEffect;
@@ -116,7 +117,7 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                     colorField("color", "Emission override", "#FFFFFF", "Constant emission color used when RGB is overridden or unavailable."),
                     toggleField("overrideMask", "A • Intensity mask", true, "Checked replaces the sampled intensity mask with a constant."),
                     numberField("mask", "Intensity mask override", 1.0, 0.0, 1.0, 0.005, "Constant emissive intensity mask."),
-                    numberField("intensity", "Intensity", 0.0, 0.0, 1000.0, 0.05, "Emission multiplier.")
+                    numberField("luminance", "Luminance (nits)", 0.0, 0.0, 100000.0, 1.0, "OpenPBR emission_luminance in cd/m² (nits). 100 nits is the preview's display white before exposure; a pre-2026-09-17 intensity loads as luminance = intensity × 100.")
                 }));
         }
         if (mode != Pbr::ShaderMode::UnlitEffect) {
@@ -248,7 +249,7 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 colorField("color", "Emission override", "#FFFFFF", "Constant emission color used when RGB is overridden or unavailable."),
                 toggleField("overrideMask", "A • Intensity mask", true, "Checked replaces the sampled intensity mask with a constant."),
                 numberField("mask", "Intensity mask override", 1.0, 0.0, 1.0, 0.005, "Constant emissive intensity mask."),
-                numberField("intensity", "Intensity", 0.0, 0.0, 1000.0, 0.05, "Emission multiplier.")
+                numberField("luminance", "Luminance (nits)", 0.0, 0.0, 100000.0, 1.0, "OpenPBR emission_luminance in cd/m² (nits). 100 nits is the preview's display white before exposure; a pre-2026-09-17 intensity loads as luminance = intensity × 100.")
             }));
     }
 
@@ -317,9 +318,9 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 numberField("filmFallback", "Film thickness override", 0.5, 0.0, 1.0, 0.005, "Thin-film thickness when texture B is overridden or absent."),
                 toggleField("overrideIridescence", "A • Iridescence", true, "Checked uses the constant iridescence override."),
                 numberField("iridescenceFallback", "Iridescence override", 0.0, 0.0, 1.0, 0.005, "Iridescence mask when texture A is overridden or absent."),
-                numberField("fuzzStrength", "Fuzz strength", 0.0, 0.0, 8.0, 0.01, "Grazing fabric fuzz (sheen) reflection masked by R."),
-                numberField("fuzzRoughness", "Fuzz roughness", 0.6, 0.0, 1.0, 0.005, "Width of the fuzz lobe."),
-                colorField("fuzzColor", "Fuzz color", "#FFFFFF", "sRGB tint of the fuzz lobe over the base color; white is no change (OpenPBR fuzz_color)."),
+                numberField("fuzzStrength", "Fuzz weight", 1.0, 0.0, 1.0, 0.005, "OpenPBR fuzz_weight scaling the R mask: the fibre sheen lobe (Zeltner 2022) sits above the coat and dims what is beneath by its own albedo."),
+                numberField("fuzzRoughness", "Fuzz roughness", 0.6, 0.0, 1.0, 0.005, "OpenPBR fuzz_roughness: the SGGX fibre roughness of the sheen lobe."),
+                colorField("fuzzColor", "Fuzz color", "#FFFFFF", "OpenPBR fuzz_color: the sRGB albedo of the fuzz itself (white fuzz over any base is white); it no longer tints the base."),
                 numberField("glintIntensity", "Glint intensity", 0.0, 0.0, 100.0, 0.01, "Sparse microfacet sparkle masked by G."),
                 numberField("glintScale", "Glint scale", 1.0, 0.001, 10000.0, 0.01, "Spatial frequency of procedural glints."),
                 numberField("filmIor", "Thin-film IOR", 1.5, 1.0, 3.0, 0.001, "IOR of the iridescent thin film."),
@@ -507,7 +508,9 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
                 numberField("strength", "Clearcoat strength", 1.0, 0.0, 4.0, 0.01, "Scales the complete clearcoat reflection lobe after texture coverage."),
                 numberField("ior", "Clearcoat IOR", 1.5, 1.0, 3.0, 0.001, "Index of refraction used to derive clearcoat dielectric F0."),
                 colorField("tint", "Coat tint", "#FFFFFF", "Tints light passing through the coat, darkening and saturating the layers beneath (amber varnish, candy paint). The coat's own reflection stays untinted."),
-                numberField("absorption", "Tint absorption", 1.0, 0.0, 1.0, 0.005, "How strongly the coat tint absorbs light on its way through the coat.")
+                numberField("absorption", "Tint absorption", 1.0, 0.0, 1.0, 0.005, "How strongly the coat tint absorbs light on its way through the coat."),
+                numberField("darkening", "Coat darkening", 1.0, 0.0, 1.0, 0.005, "OpenPBR coat_darkening: 1 is the physical darkening and saturation of the base by light bouncing under the coat, 0 boosts it away."),
+                numberField("anisotropy", "Coat anisotropy", 0.0, 0.0, 1.0, 0.005, "OpenPBR coat_roughness_anisotropy, stretched along the base tangent (the coat has no tangent of its own).")
             }));
     }
     if (secondary && (mode == Pbr::ShaderMode::StandardSurface || all)) {
