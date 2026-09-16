@@ -583,7 +583,7 @@ int main(int argc, char* argv[])
                 {QStringLiteral("Specular"), QJsonObject{{QStringLiteral("ior"), 1.8}, {QStringLiteral("iorMax"), 5.0}}},
                 {QStringLiteral("Shading/Subsurface"), QJsonObject{{QStringLiteral("mode"), QStringLiteral("Combined")}, {QStringLiteral("profile"), QStringLiteral("Custom")},
                     {QStringLiteral("weight"), 1.5}, {QStringLiteral("thicknessScale"), 3.0}}},
-                {QStringLiteral("Shading/SurfaceEffects"), QJsonObject{{QStringLiteral("sheenStrength"), 0.7}}},
+                {QStringLiteral("Shading/SurfaceEffects"), QJsonObject{{QStringLiteral("sheenStrength"), 0.7}, {QStringLiteral("retroStrength"), 0.5}}},
                 {QStringLiteral("Shading/Hair"), QJsonObject{{QStringLiteral("scatter"), 1.25}, {QStringLiteral("primaryShift"), -0.1}}},
                 {QStringLiteral("Shading/Glass"), QJsonObject{{QStringLiteral("ior"), 1.52}, {QStringLiteral("thinWalled"), true}}},
                 {QStringLiteral("Shading/Eye"), QJsonObject{{QStringLiteral("corneaIor"), 1.4}, {QStringLiteral("pupilScale"), 1.3}}}});
@@ -602,8 +602,12 @@ int main(int argc, char* argv[])
                     && qFuzzyCompare(sss.values.value(QStringLiteral("thickness")).toDouble(), 6.0),
                 QStringLiteral("v6: subsurface parameters move onto the input (page weight wins, thickness = scale x slot), and the input is enabled for a subsurface family"));
             const auto fx = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySurfaceEffects"));
-            check(fx.enabled && qFuzzyCompare(fx.values.value(QStringLiteral("sheenStrength")).toDouble(), 0.7),
-                QStringLiteral("v6: a lit surface-effect strength enables the surface effects input"));
+            check(fx.enabled && qFuzzyCompare(fx.values.value(QStringLiteral("fuzzStrength")).toDouble(), 0.7) && !fx.values.contains(QStringLiteral("sheenStrength")),
+                QStringLiteral("v6: a lit surface-effect strength enables the surface effects input, and sheen lands as fuzz"));
+            const auto retro = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryRetroreflection"));
+            check(retro.enabled && qFuzzyCompare(retro.values.value(QStringLiteral("retroStrength")).toDouble(), 0.5)
+                    && !fx.values.contains(QStringLiteral("retroStrength")),
+                QStringLiteral("v6: a lit retroreflection strength enables the retroreflection input, not the surface effects input"));
             check(qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryHairScatter")).values.value(QStringLiteral("scatterStrength")).toDouble(), 1.25)
                     && qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryHairDirection")).values.value(QStringLiteral("primaryShift")).toDouble(), -0.1)
                     && qFuzzyCompare(moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primaryTransmissionAbsorption")).values.value(QStringLiteral("ior")).toDouble(), 1.52)

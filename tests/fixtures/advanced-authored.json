@@ -71,12 +71,12 @@
       "expanded": false,
       "path": "",
       "values": {
-        "overrideSheen": true,
-        "sheenFallback": 0.2,
+        "overrideFuzz": true,
+        "fuzzFallback": 0.2,
         "overrideGlints": true,
         "glintsFallback": 0.0,
-        "sheenStrength": 0.75,
-        "sheenRoughness": 0.6
+        "fuzzStrength": 0.75,
+        "fuzzRoughness": 0.6
       }
     }
   },

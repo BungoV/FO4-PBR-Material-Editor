@@ -129,6 +129,7 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
     if (!set) return;
     Q_UNUSED(settings);
     double pendingIor = 0.0; // v5 constant F0 above 0.04: its level becomes the slot's IOR
+    QVector<QPair<QString, QJsonObject>> pendingRetro; // retro parameters leaving a SurfaceEffects slot
     for (auto it = set->begin(); it != set->end(); ++it) {
         if (!it.value().isObject()) continue;
         QJsonObject slot = it.value().toObject();
@@ -190,10 +191,49 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
             values.insert(QStringLiteral("overrideColor"), false);
             changed = true;
         }
+        // 2026-09-17: sheen is fuzz (OpenPBR's term), and retroreflection is
+        // its own input. A first-cut v6 SurfaceEffects slot renames its sheen
+        // keys and hands its retro parameters to the same set's
+        // Retroreflection slot (applied after the loop; the slot may not exist
+        // yet). Idempotent: a fuzz-form slot carries none of these keys.
+        if (key.endsWith(QStringLiteral("SurfaceEffects"))) {
+            static const char* const renames[][2] = {{"overrideSheen", "overrideFuzz"}, {"sheenFallback", "fuzzFallback"},
+                {"sheenStrength", "fuzzStrength"}, {"sheenRoughness", "fuzzRoughness"}};
+            for (const auto& rename : renames) {
+                const QString from = QString::fromLatin1(rename[0]);
+                if (!values.contains(from)) continue;
+                values.insert(QString::fromLatin1(rename[1]), values.value(from));
+                values.remove(from);
+                changed = true;
+            }
+            QJsonObject retroValues;
+            for (const char* moved : {"retroStrength", "retroWidth"}) {
+                const QString movedKey = QString::fromLatin1(moved);
+                if (!values.contains(movedKey)) continue;
+                retroValues.insert(movedKey, values.value(movedKey));
+                values.remove(movedKey);
+                changed = true;
+            }
+            if (!retroValues.isEmpty())
+                pendingRetro.append({key.left(key.size() - int(QStringLiteral("SurfaceEffects").size())) + QStringLiteral("Retroreflection"), retroValues});
+        }
         if (changed) {
             slot.insert(QStringLiteral("values"), values);
             it.value() = slot;
         }
+    }
+    for (const auto& pending : pendingRetro) {
+        QJsonObject slot = set->value(pending.first).toObject();
+        QJsonObject values = slot.value(QStringLiteral("values")).toObject();
+        for (auto it = pending.second.begin(); it != pending.second.end(); ++it)
+            if (!values.contains(it.key())) values.insert(it.key(), it.value());
+        if (!slot.contains(QStringLiteral("expanded"))) slot.insert(QStringLiteral("expanded"), false);
+        if (!slot.contains(QStringLiteral("path"))) slot.insert(QStringLiteral("path"), QString());
+        // The strength used to be the switch: a lit strength switches the slot on.
+        slot.insert(QStringLiteral("enabled"), slot.value(QStringLiteral("enabled")).toBool(false)
+            || pending.second.value(QStringLiteral("retroStrength")).toDouble(0.0) > 0.0);
+        slot.insert(QStringLiteral("values"), values);
+        set->insert(pending.first, slot);
     }
     if (pendingIor > 0.0) {
         QJsonObject slot = set->value(QStringLiteral("primarySpecularColor")).toObject();
@@ -230,14 +270,14 @@ void migrateV6FeatureParams(QJsonObject* uv0, QJsonObject* settings, ShaderMode 
         {"Shading/Subsurface", "weight", "primarySubsurface", "weight"},
         {"Shading/Subsurface", "transmission", "primarySubsurface", "transmission"},
         {"Shading/Subsurface", "transmissionTint", "primarySubsurface", "transmissionTint"},
-        {"Shading/SurfaceEffects", "sheenStrength", "primarySurfaceEffects", "sheenStrength"},
-        {"Shading/SurfaceEffects", "sheenRoughness", "primarySurfaceEffects", "sheenRoughness"},
+        {"Shading/SurfaceEffects", "sheenStrength", "primarySurfaceEffects", "fuzzStrength"},
+        {"Shading/SurfaceEffects", "sheenRoughness", "primarySurfaceEffects", "fuzzRoughness"},
         {"Shading/SurfaceEffects", "glintIntensity", "primarySurfaceEffects", "glintIntensity"},
         {"Shading/SurfaceEffects", "glintScale", "primarySurfaceEffects", "glintScale"},
         {"Shading/SurfaceEffects", "filmIor", "primarySurfaceEffects", "filmIor"},
         {"Shading/SurfaceEffects", "iridescenceStrength", "primarySurfaceEffects", "iridescenceStrength"},
-        {"Shading/SurfaceEffects", "retroStrength", "primarySurfaceEffects", "retroStrength"},
-        {"Shading/SurfaceEffects", "retroWidth", "primarySurfaceEffects", "retroWidth"},
+        {"Shading/SurfaceEffects", "retroStrength", "primaryRetroreflection", "retroStrength"},
+        {"Shading/SurfaceEffects", "retroWidth", "primaryRetroreflection", "retroWidth"},
         {"Shading/Hair", "direction", "primaryHairDirection", "direction"},
         {"Shading/Hair", "primaryStrength", "primaryHairDirection", "primaryStrength"},
         {"Shading/Hair", "primaryRoughness", "primaryHairDirection", "primaryRoughness"},
@@ -301,12 +341,17 @@ void migrateV6FeatureParams(QJsonObject* uv0, QJsonObject* settings, ShaderMode 
     if (settings->contains(QStringLiteral("Shading/SurfaceEffects"))) {
         const QJsonObject group = settings->value(QStringLiteral("Shading/SurfaceEffects")).toObject();
         bool lit = false;
-        for (const char* key : {"sheenStrength", "glintIntensity", "iridescenceStrength", "retroStrength"})
+        for (const char* key : {"sheenStrength", "glintIntensity", "iridescenceStrength"})
             lit = lit || group.value(QString::fromLatin1(key)).toDouble(0.0) > 0.0;
         if (lit) {
             QJsonObject slot = slotObject(QStringLiteral("primarySurfaceEffects"));
             slot.insert(QStringLiteral("enabled"), true);
             uv0->insert(QStringLiteral("primarySurfaceEffects"), slot);
+        }
+        if (group.value(QStringLiteral("retroStrength")).toDouble(0.0) > 0.0) {
+            QJsonObject slot = slotObject(QStringLiteral("primaryRetroreflection"));
+            slot.insert(QStringLiteral("enabled"), true);
+            uv0->insert(QStringLiteral("primaryRetroreflection"), slot);
         }
     }
     for (const char* group : {"Specular", "Shading/Subsurface", "Shading/SurfaceEffects", "Shading/Hair", "Shading/Glass", "Shading/Eye"})

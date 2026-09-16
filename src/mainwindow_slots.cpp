@@ -286,23 +286,28 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
     }
     const bool usesSurfaceEffects = mode == Pbr::ShaderMode::StandardSurface || all;
     if (usesSurfaceEffects) {
-        add(slot(prefix + "SurfaceEffects", tr("Surface Effects"), "FX", "Linear • R sheen / G glints / B film thickness / A iridescence", QColor(137, 91, 169), false, {},
+        add(slot(prefix + "SurfaceEffects", tr("Surface Effects"), "FX", "Linear • R fuzz / G glints / B film thickness / A iridescence", QColor(137, 91, 169), false, {},
             "Packed masks for optional surface lobes and the lobes' physical response. The lobes are off while this input is disabled.", {
-                toggleField("overrideSheen", "R • Sheen", true, "Checked uses the constant sheen override."),
-                numberField("sheenFallback", "Sheen override", 0.0, 0.0, 1.0, 0.005, "Constant sheen mask when texture R is overridden or absent."),
+                toggleField("overrideFuzz", "R • Fuzz", true, "Checked uses the constant fuzz override."),
+                numberField("fuzzFallback", "Fuzz override", 0.0, 0.0, 1.0, 0.005, "Constant fuzz mask when texture R is overridden or absent."),
                 toggleField("overrideGlints", "G • Glints", true, "Checked uses the constant glint override."),
                 numberField("glintsFallback", "Glints override", 0.0, 0.0, 1.0, 0.005, "Constant glint density when texture G is overridden or absent."),
                 toggleField("overrideFilm", "B • Film thickness", true, "Checked uses the constant film-thickness override."),
                 numberField("filmFallback", "Film thickness override", 0.5, 0.0, 1.0, 0.005, "Thin-film thickness when texture B is overridden or absent."),
                 toggleField("overrideIridescence", "A • Iridescence", true, "Checked uses the constant iridescence override."),
                 numberField("iridescenceFallback", "Iridescence override", 0.0, 0.0, 1.0, 0.005, "Iridescence mask when texture A is overridden or absent."),
-                numberField("sheenStrength", "Sheen strength", 0.0, 0.0, 8.0, 0.01, "Grazing fabric/fuzz reflection masked by R."),
-                numberField("sheenRoughness", "Sheen roughness", 0.6, 0.0, 1.0, 0.005, "Width of the sheen lobe."),
+                numberField("fuzzStrength", "Fuzz strength", 0.0, 0.0, 8.0, 0.01, "Grazing fabric fuzz (sheen) reflection masked by R."),
+                numberField("fuzzRoughness", "Fuzz roughness", 0.6, 0.0, 1.0, 0.005, "Width of the fuzz lobe."),
                 numberField("glintIntensity", "Glint intensity", 0.0, 0.0, 100.0, 0.01, "Sparse microfacet sparkle masked by G."),
                 numberField("glintScale", "Glint scale", 1.0, 0.001, 10000.0, 0.01, "Spatial frequency of procedural glints."),
                 numberField("filmIor", "Thin-film IOR", 1.5, 1.0, 3.0, 0.001, "IOR of the iridescent thin film."),
-                numberField("iridescenceStrength", "Iridescence strength", 0.0, 0.0, 4.0, 0.01, "Angle-dependent thin-film interference masked by A."),
-                numberField("retroStrength", "Retroreflection", 0.0, 0.0, 8.0, 0.01, "Bounces light back toward its source (road signs, safety tape, cat-eye markers). Strongest when the viewer is near the light, e.g. a Pip-Boy lamp at night."),
+                numberField("iridescenceStrength", "Iridescence strength", 0.0, 0.0, 4.0, 0.01, "Angle-dependent thin-film interference masked by A.")
+            }));
+        add(slot(prefix + "Retroreflection", tr("Retroreflection"), "RETRO", "Linear • R retro mask", QColor(196, 150, 62), false, {},
+            "Mask of where the surface bounces light back toward its source (road signs, safety tape, cat-eye markers). Strongest when the viewer is near the light, e.g. a Pip-Boy lamp at night. Off while this input is disabled.", {
+                toggleField("overrideRetro", "R • Retro mask", true, "Checked uses the constant retro mask override."),
+                numberField("retroFallback", "Retro mask override", 1.0, 0.0, 1.0, 0.005, "Constant retro mask when texture R is overridden or absent."),
+                numberField("retroStrength", "Retroreflection strength", 1.0, 0.0, 8.0, 0.01, "Strength of the lobe aimed back at the light, masked by R."),
                 numberField("retroWidth", "Retroreflection width", 0.25, 0.0, 1.0, 0.005, "Angular width of the retroreflective lobe.")
             }));
     }

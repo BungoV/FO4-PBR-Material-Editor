@@ -136,7 +136,7 @@ optional B carries micro roughness variation (`overrideRoughVariation` /
 optional A masks where detail applies; the `InteriorMap` cubemap's alpha is
 a lit-window mask whose areas self-illuminate at the slot's
 `windowEmissive` intensity;
-`SurfaceEffects` R is the sheen/fuzz weight, B is the **thin-film thickness
+`SurfaceEffects` R is the fuzz (sheen) weight, B is the **thin-film thickness
 in MICROMETRES (µm)** and A is the thin-film weight. The unit on B is
 normative and matches OpenPBR Surface v1.1.1's `thin_film_thickness`, whose
 range is `[0, ∞)` µm with a default of `0.5`; it is stated here because an
@@ -165,9 +165,10 @@ hold its channel overrides and the parameters of the lobe or effect that
 input drives: `primarySpecularColor` (`overrideColor`, `color`, `ior`, `iorMax`, `overrideIor`),
 `primarySubsurface` (`mode`, `profile`, `customScatterColor`,
 `customRadiusR/G/B`, `weight`, `transmission`, `transmissionTint`,
-`thickness`), `primarySurfaceEffects` (`sheenStrength`, `sheenRoughness`,
-`glintIntensity`, `glintScale`, `filmIor`, `iridescenceStrength`,
-`retroStrength`, `retroWidth`), `primaryHairDirection` (`direction`, the
+`thickness`), `primarySurfaceEffects` (`fuzzStrength`, `fuzzRoughness`,
+`glintIntensity`, `glintScale`, `filmIor`, `iridescenceStrength`),
+`primaryRetroreflection` (`retroStrength`, `retroWidth`; R masks the lobe,
+`overrideRetro` / `retroFallback` like every channel), `primaryHairDirection` (`direction`, the
 `primary*` and `secondary*` lobe constants), `primaryHairScatter`
 (`scatterStrength`, `backlightStrength`), `primaryTransmissionAbsorption`
 (glass `ior`, `absorptionDistance`, `refractionRoughness`, `thinWalled`),
@@ -255,9 +256,9 @@ not yet consume.
 | `subsurface_radius` × `subsurface_radius_scale` | length per channel, default (1, 0.5, 0.25) | per-profile blur radius **in pixels** | Different: a global screen-space radius, not a per-material world-space mean free path |
 | `subsurface_scatter_anisotropy` | float `[−1,1]` | — | Absent by design (a Gaussian-sum blur has no phase function) |
 | — | — | `subsurfaceTransmission` / `subsurfaceTransmissionTint` | PBRM extension: OpenPBR has this only in thin-walled mode |
-| `fuzz_weight` | float `[0,1]`, default 0 | `SurfaceEffects` R ("sheen") | Editor-only |
+| `fuzz_weight` | float `[0,1]`, default 0 | `SurfaceEffects` R ("fuzz") | Editor-only |
 | `fuzz_color` | color3 `[0,1]³`, default white | — | Absent (the preview reuses the base colour) |
-| `fuzz_roughness` | float `[0,1]`, default 0.5 | `uSheenRoughness` | Different: OpenPBR mandates the Zeltner-2022 SGGX microflake LTC model; ours is a Fresnel-rim add |
+| `fuzz_roughness` | float `[0,1]`, default 0.5 | `fuzzRoughness` | Different: OpenPBR mandates the Zeltner-2022 SGGX microflake LTC model; ours is a Fresnel-rim add |
 | `coat_weight` | float `[0,1]`, default 0 | `Clearcoat` A × coat strength | Editor-only |
 | `coat_color` | color3 `[0,1]³` — the **square** of normal-incidence transmittance | coat tint × coat absorption | Different units: ours is a straight multiply, OpenPBR's is T² and view-dependent |
 | `coat_roughness` | float `[0,1]`, default 0 | `Clearcoat` B | Present |

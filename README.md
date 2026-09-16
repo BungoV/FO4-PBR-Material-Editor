@@ -152,7 +152,7 @@ scratch for this project and do not depend on Bethesda's Material Editor.
   parallax occlusion mapping, and key-light self-shadowed POM from Primary or
   Secondary Normal Blue / Separate Height sources, with adaptive quality
   presets, expert ray-step overrides, grazing fade, and optional UV clipping.
-  Tessellated true displacement, dynamic normals, tint masks, surface sheen,
+  Tessellated true displacement, dynamic normals, tint masks, surface fuzz (sheen),
   glints, iridescence, clearcoat, subsurface/transmission, hair lobes, glass,
   water/foam, eye/cornea, vegetation wind, projected-decal channel masks,
   distortion, and distinct unlit/simple-lit/full-PBR effect paths are evaluated
@@ -278,6 +278,17 @@ prototype-format license continues: breaking changes remain possible before
 runtime integration.
 
 ## Changelog
+
+### 2026-09-17 — Retroreflection input, sheen is fuzz
+
+- **Retroreflection input** - retroreflection is its own texture slot
+  (`primaryRetroreflection`, R = retro mask with the usual override + constant)
+  carrying `retroStrength` (default 1) and `retroWidth`. The slot checkbox is
+  the switch. Documents that kept the retro pair on Surface Effects, or in the
+  old Shading group, move it on load; a lit strength enables the slot.
+- **Sheen is fuzz** - the Surface Effects sheen keys and labels are now fuzz
+  (OpenPBR's term): `overrideFuzz`, `fuzzFallback`, `fuzzStrength`,
+  `fuzzRoughness`. Sheen-keyed documents migrate on load.
 
 ### 2026-09-16 — PBRM v6, feature parameters on their inputs, specular color override (v0.5.0)
 

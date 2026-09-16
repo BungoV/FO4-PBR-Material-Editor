@@ -137,6 +137,7 @@ enum SpecialLayer {
     MotionVectorsLayer,
     DetailNormalLayer,
     SpecularColorLayer,
+    RetroreflectionLayer,
     SpecialLayerCount
 };
 
@@ -735,8 +736,8 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
     }
     {
         const auto state=stateFor(QStringLiteral("SurfaceEffects"));
-        addSpecial(SurfaceEffectsLayer,QStringLiteral("SurfaceEffects"),QVector4D(numberValue(state.values,"sheenFallback",0),numberValue(state.values,"glintsFallback",0),numberValue(state.values,"filmFallback",.5f),numberValue(state.values,"iridescenceFallback",0)),
-            QVector4D(used(state.values,"overrideSheen"),used(state.values,"overrideGlints"),used(state.values,"overrideFilm"),used(state.values,"overrideIridescence")));
+        addSpecial(SurfaceEffectsLayer,QStringLiteral("SurfaceEffects"),QVector4D(numberValue(state.values,"fuzzFallback",0),numberValue(state.values,"glintsFallback",0),numberValue(state.values,"filmFallback",.5f),numberValue(state.values,"iridescenceFallback",0)),
+            QVector4D(used(state.values,"overrideFuzz"),used(state.values,"overrideGlints"),used(state.values,"overrideFilm"),used(state.values,"overrideIridescence")));
     }
     {
         const auto state=stateFor(QStringLiteral("DynamicNormal"));const QVector3D color=jsonColor(state.values,"normal","#8080FF");
@@ -824,6 +825,13 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
         const auto state=stateFor(QStringLiteral("SpecularColor"));const QVector3D color=jsonColor(state.values,"color","#FFFFFF");const float useColor=used(state.values,"overrideColor");
         const float iorMax=numberValue(state.values,"iorMax",4.25f);const float iorTexel=std::clamp(numberValue(state.values,"ior",1.5f)/std::max(iorMax,1e-3f),0.0f,1.0f);
         addSpecial(SpecularColorLayer,QStringLiteral("SpecularColor"),QVector4D(color,iorTexel),QVector4D(useColor,useColor,useColor,used(state.values,"overrideIor")));
+    }
+    {
+        // Retroreflection is its own input (bungo 2026-09-17): R masks the
+        // lobe, the strength and width sit on the slot. Bound only while the
+        // slot is enabled, so the slot checkbox is the feature switch.
+        const auto state=stateFor(QStringLiteral("Retroreflection"));
+        addSpecial(RetroreflectionLayer,QStringLiteral("Retroreflection"),QVector4D(numberValue(state.values,"retroFallback",1),0,0,0),QVector4D(used(state.values,"overrideRetro"),0,0,0));
     }
     {
         const auto state=stateFor(QStringLiteral("DetailNormal"));const QVector3D normalColor=jsonColor(state.values,"normal","#8080FF");const float useNormal=used(state.values,"overrideNormal");
@@ -1641,7 +1649,7 @@ void PbrPreviewGL::initializeGL()
         uniform float uParticleAge,uParticleSeed;
         uniform int uSixWayALayer,uSixWayBLayer;
         uniform float uSixWayAmbient,uSixWayIntensity,uSixWayFireIntensity;
-        uniform int uMotionVectorsLayer,uDetailNormalLayer,uSpecularColorLayer;
+        uniform int uMotionVectorsLayer,uDetailNormalLayer,uSpecularColorLayer,uRetroLayer;
         uniform float uMotionStrength,uDetailNormalStrength,uDetailNormalScale,uDetailRoughVariation;
         uniform float uStateEdgeShedding[8];
         uniform bool uLandscapeUsePorosityTexture;
@@ -2696,11 +2704,13 @@ void PbrPreviewGL::initializeGL()
                 float sparkle=pow(hash13(vec3(floor(uv*max(uGlintScale,1.0)*220.0),1.0)),24.0);
                 color+=uKeyColor*uKeyIntensity*sparkle*stateSparkle*8.0*NoL*keyShadow;
             }
-            if(uRetroStrength>0.0&&!defaults){
+            if(hasSpecial(uRetroLayer)&&uRetroStrength>0.0&&!defaults){
                 // Small lobe aimed back toward the light: visible when the viewer
                 // sits near the light source, like tape and signs under a headlamp.
+                // R of the Retroreflection input masks it.
+                float retroMask=specialSample(uRetroLayer,uv).r;
                 float retro=pow(max(dot(V,L),0.0),mix(192.0,12.0,clamp(uRetroWidth,0.0,1.0)));
-                color+=uKeyColor*uKeyIntensity*uRetroStrength*retro*NoL*keyShadow;
+                color+=uKeyColor*uKeyIntensity*uRetroStrength*retroMask*retro*NoL*keyShadow;
             }
             if(hasSpecial(1)&&!defaults){
                 vec4 surface=specialSample(1,uv);
@@ -5187,7 +5197,7 @@ void PbrPreviewGL::paintGL()
     const QString profile=subsurface.value(QStringLiteral("profile")).toString(QStringLiteral("Skin"));QVector3D profileColor=profile==QStringLiteral("Wax")?QVector3D(1,.72,.4):(profile==QStringLiteral("Flesh")?QVector3D(1,.3,.22):(profile==QStringLiteral("Plant")?QVector3D(.42,.8,.28):(profile==QStringLiteral("Custom")?jsonColor(subsurface,QStringLiteral("customScatterColor"),QStringLiteral("#FFB39D")):QVector3D(1,.55,.42))));m_program->setUniformValue("uSubsurfaceProfileColor",profileColor);
     m_program->setUniformValue("uSubsurfaceWeight",float(subsurface.value(QStringLiteral("weight")).toDouble(1.0)));m_program->setUniformValue("uSubsurfaceTransmission",float(subsurface.value(QStringLiteral("transmission")).toDouble(0.0)));m_program->setUniformValue("uTransmissionTint",jsonColor(subsurface,QStringLiteral("transmissionTint"),QStringLiteral("#FFFFFF")));m_program->setUniformValue("uSubsurfaceThickness",numberValue(subsurface,QStringLiteral("thickness"),1.0f));
     const auto fxState=slot(QStringLiteral("SurfaceEffects"));const float fxOn=fxState.enabled?1.0f:0.0f;
-    m_program->setUniformValue("uSheenStrength",fxOn*numberValue(fxState.values,QStringLiteral("sheenStrength"),0));m_program->setUniformValue("uSheenRoughness",numberValue(fxState.values,QStringLiteral("sheenRoughness"),.6f));m_program->setUniformValue("uGlintIntensity",fxOn*numberValue(fxState.values,QStringLiteral("glintIntensity"),0));m_program->setUniformValue("uGlintScale",numberValue(fxState.values,QStringLiteral("glintScale"),1));m_program->setUniformValue("uFilmIor",numberValue(fxState.values,QStringLiteral("filmIor"),1.5f));m_program->setUniformValue("uIridescenceStrength",fxOn*numberValue(fxState.values,QStringLiteral("iridescenceStrength"),0));
+    m_program->setUniformValue("uSheenStrength",fxOn*numberValue(fxState.values,QStringLiteral("fuzzStrength"),0));m_program->setUniformValue("uSheenRoughness",numberValue(fxState.values,QStringLiteral("fuzzRoughness"),.6f));m_program->setUniformValue("uGlintIntensity",fxOn*numberValue(fxState.values,QStringLiteral("glintIntensity"),0));m_program->setUniformValue("uGlintScale",numberValue(fxState.values,QStringLiteral("glintScale"),1));m_program->setUniformValue("uFilmIor",numberValue(fxState.values,QStringLiteral("filmIor"),1.5f));m_program->setUniformValue("uIridescenceStrength",fxOn*numberValue(fxState.values,QStringLiteral("iridescenceStrength"),0));
     const QJsonObject hair=slot(QStringLiteral("HairDirection")).values;const QJsonObject hairScatter=slot(QStringLiteral("HairScatter")).values;m_program->setUniformValue("uHairPrimaryStrength",float(hair.value("primaryStrength").toDouble(1)));m_program->setUniformValue("uHairPrimaryRoughness",float(hair.value("primaryRoughness").toDouble(.25)));m_program->setUniformValue("uHairPrimaryShift",float(hair.value("primaryShift").toDouble(-.08)));m_program->setUniformValue("uHairSecondaryStrength",float(hair.value("secondaryStrength").toDouble(.5)));m_program->setUniformValue("uHairSecondaryRoughness",float(hair.value("secondaryRoughness").toDouble(.45)));m_program->setUniformValue("uHairSecondaryShift",float(hair.value("secondaryShift").toDouble(.12)));m_program->setUniformValue("uHairScatter",float(hairScatter.value("scatterStrength").toDouble(.5)));m_program->setUniformValue("uHairBacklight",float(hairScatter.value("backlightStrength").toDouble(.5)));m_program->setUniformValue("uHairDirectionStrength",numberValue(slot(QStringLiteral("HairDirection")).values,QStringLiteral("strength"),1));
     const auto transmissionState=slot(QStringLiteral("TransmissionAbsorption"));m_program->setUniformValue("uGlassIor",numberValue(transmissionState.values,QStringLiteral("ior"),1.5f));m_program->setUniformValue("uGlassAbsorptionDistance",numberValue(transmissionState.values,QStringLiteral("absorptionDistance"),1));m_program->setUniformValue("uGlassRefractionRoughness",numberValue(transmissionState.values,QStringLiteral("refractionRoughness"),0));m_program->setUniformValue("uGlassThinWalled",boolValue(transmissionState.values,QStringLiteral("thinWalled"),false));m_program->setUniformValue("uGlassThickness",numberValue(transmissionState.values,QStringLiteral("thickness"),1));
     const auto waterFlow=slot(QStringLiteral("WaterFlow"));m_program->setUniformValue("uWaterIor",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("ior"),1.333f));m_program->setUniformValue("uWaterAbsorptionDistance",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("absorptionDistance"),300));m_program->setUniformValue("uWaterScattering",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("scattering"),.25f));m_program->setUniformValue("uWaterReflectionStrength",settingNumber(QStringLiteral("Shading/Water"),QStringLiteral("reflectionStrength"),1));m_program->setUniformValue("uWaterShoreFoam",settingBool(QStringLiteral("Shading/Water"),QStringLiteral("shoreFoam"),true));m_program->setUniformValue("uWaterFlowSpeed",numberValue(waterFlow.values,QStringLiteral("speed"),.05f));m_program->setUniformValue("uWaterFlowStrength",numberValue(waterFlow.values,QStringLiteral("strength"),1));
@@ -5217,7 +5227,7 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uBentNormalLayer",int(BentNormalLayer));m_program->setUniformValue("uBentNormalStrength",numberValue(slot(QStringLiteral("BentNormal")).values,QStringLiteral("strength"),1));
     const auto detailNormal=slot(QStringLiteral("DetailNormal"));
     m_program->setUniformValue("uDetailNormalLayer",int(DetailNormalLayer));
-    m_program->setUniformValue("uSpecularColorLayer",int(SpecularColorLayer));
+    m_program->setUniformValue("uSpecularColorLayer",int(SpecularColorLayer));m_program->setUniformValue("uRetroLayer",int(RetroreflectionLayer));
     m_program->setUniformValue("uDetailNormalStrength",numberValue(detailNormal.values,QStringLiteral("strength"),1));
     m_program->setUniformValue("uDetailNormalScale",numberValue(detailNormal.values,QStringLiteral("uvScale"),4));
     m_program->setUniformValue("uDetailRoughVariation",numberValue(detailNormal.values,QStringLiteral("roughVariation"),.5f));
@@ -5225,7 +5235,7 @@ void PbrPreviewGL::paintGL()
     m_program->setUniformValue("uLandscapeUsePorosityTexture",!boolValue(landscapeNormalArray.values,QStringLiteral("overridePorosity"),true));
     m_program->setUniformValue("uLandscapePorosity",numberValue(landscapeNormalArray.values,QStringLiteral("porosity"),.5f));
     m_program->setUniformValue("uSpecularAa",settingBool(QStringLiteral("Shading/Core"),QStringLiteral("specularAa"),true));m_program->setUniformValue("uSpecularAaStrength",settingNumber(QStringLiteral("Shading/Core"),QStringLiteral("specularAaStrength"),1.0f));
-    m_program->setUniformValue("uRetroStrength",fxOn*numberValue(fxState.values,QStringLiteral("retroStrength"),0.0f));m_program->setUniformValue("uRetroWidth",numberValue(fxState.values,QStringLiteral("retroWidth"),.25f));
+    const auto retroState=slot(QStringLiteral("Retroreflection"));m_program->setUniformValue("uRetroStrength",retroState.enabled?numberValue(retroState.values,QStringLiteral("retroStrength"),1.0f):0.0f);m_program->setUniformValue("uRetroWidth",numberValue(retroState.values,QStringLiteral("retroWidth"),.25f));
     const QJsonObject decal=m_document.settingGroup(QStringLiteral("Decal"));const QString decalBlend=decal.value(QStringLiteral("blend")).toString(QStringLiteral("Normal"));m_program->setUniformValue("uDecalEnabled",decal.value(QStringLiteral("enabled")).toBool(false));m_program->setUniformValue("uDecalBlend",decalBlend==QStringLiteral("Modulate")?1:(decalBlend==QStringLiteral("Additive")?2:0));m_program->setUniformValue("uDecalAngleFade",float(decal.value(QStringLiteral("angleFade")).toDouble(.25)));m_program->setUniformValue("uDecalDistanceFade",float(decal.value(QStringLiteral("distanceFade")).toDouble(0)));
     const QJsonObject decalChannels=m_document.settingGroup(QStringLiteral("Decal/Channels"));m_program->setUniformValue("uDecalBaseColor",decalChannels.value(QStringLiteral("baseColor")).toBool(true));m_program->setUniformValue("uDecalNormal",decalChannels.value(QStringLiteral("normal")).toBool(true));m_program->setUniformValue("uDecalRoughness",decalChannels.value(QStringLiteral("roughness")).toBool(true));m_program->setUniformValue("uDecalMetallic",decalChannels.value(QStringLiteral("metallic")).toBool(false));m_program->setUniformValue("uDecalAo",decalChannels.value(QStringLiteral("ao")).toBool(false));m_program->setUniformValue("uDecalEmissive",decalChannels.value(QStringLiteral("emissive")).toBool(false));
     const QJsonObject displacement=m_document.settingGroup(QStringLiteral("Geometry/Displacement"));m_program->setUniformValue("uDisplacementEnabled",displacement.value(QStringLiteral("enabled")).toBool(false));m_program->setUniformValue("uDisplacementStrength",float(displacement.value(QStringLiteral("strength")).toDouble(0)));m_program->setUniformValue("uDisplacementFadeEnd",float(displacement.value(QStringLiteral("fadeEnd")).toDouble(1024)));
