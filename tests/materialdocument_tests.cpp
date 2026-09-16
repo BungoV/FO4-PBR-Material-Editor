@@ -323,11 +323,12 @@ int main(int argc, char* argv[])
         // SPECULAR COLOR + SPECULAR IOR. RMAOS alpha carries the specular
         // weight, so a painted color is the only way to author a tinted
         // dielectric reflection. The tint itself has no constants; the only
-        // values on the slot are the v6 specular IOR (bungo 2026-09-16: a
-        // feature's parameters sit on its texture input): the A override
-        // toggle, the IOR constant and the map ceiling. Values are sparse
-        // (defaults implicit), so an untouched slot with no map carries only
-        // the override toggle, forced on because no texture provides A.
+        // values on the slot are its RGB override (constant tint, white = no
+        // change) and the v6 specular IOR (bungo 2026-09-16: a feature's
+        // parameters sit on its texture input): the A override toggle, the
+        // IOR constant and the map ceiling. Values are sparse (defaults
+        // implicit), so an untouched slot with no map carries only the two
+        // override toggles, forced on because no texture provides RGB or A.
         MainWindow specularWindow;
         const TextureSlotWidget* specularSlot = nullptr;
         for (const TextureSlotWidget* candidate : specularWindow.findChildren<TextureSlotWidget*>())
@@ -335,9 +336,9 @@ int main(int argc, char* argv[])
         check(specularSlot != nullptr,
             QStringLiteral("the primary layer offers a specular color map"));
         const QJsonObject specularValues = specularSlot ? specularSlot->state().values : QJsonObject();
-        check(specularSlot && specularValues.keys() == QStringList{QStringLiteral("overrideIor")}
-                && specularValues.value(QStringLiteral("overrideIor")).toBool(),
-            QStringLiteral("an untouched specular color input carries only the forced-on IOR override; the tint has no constants (%1)")
+        check(specularSlot && specularValues.keys() == QStringList{QStringLiteral("overrideColor"), QStringLiteral("overrideIor")}
+                && specularValues.value(QStringLiteral("overrideColor")).toBool() && specularValues.value(QStringLiteral("overrideIor")).toBool(),
+            QStringLiteral("an untouched specular color input carries only the forced-on RGB and IOR overrides (%1)")
                 .arg(specularValues.keys().join(QLatin1Char(','))));
 
         QTemporaryDir specularDirectory;
@@ -571,6 +572,8 @@ int main(int argc, char* argv[])
             QJsonObject primary = legacy.value(QStringLiteral("primaryUv")).toObject();
             QJsonObject specColor = primary.value(QStringLiteral("primarySpecularColor")).toObject();
             specColor.insert(QStringLiteral("values"), QJsonObject{{QStringLiteral("iorInAlpha"), true}});
+            specColor.insert(QStringLiteral("enabled"), true);
+            specColor.insert(QStringLiteral("path"), QStringLiteral("textures/test/spec_s.dds"));
             primary.insert(QStringLiteral("primarySpecularColor"), specColor);
             primary.insert(QStringLiteral("primarySubsurface"), QJsonObject{{QStringLiteral("enabled"), false}, {QStringLiteral("expanded"), true},
                 {QStringLiteral("path"), QString()}, {QStringLiteral("values"), QJsonObject{{QStringLiteral("thickness"), 2.0}, {QStringLiteral("weight"), 0.25}}}});
@@ -590,6 +593,8 @@ int main(int argc, char* argv[])
             check(qFuzzyCompare(spec.value(QStringLiteral("ior")).toDouble(), 1.8) && qFuzzyCompare(spec.value(QStringLiteral("iorMax")).toDouble(), 5.0)
                     && spec.contains(QStringLiteral("overrideIor")) && !spec.value(QStringLiteral("overrideIor")).toBool(true) && !spec.contains(QStringLiteral("iorInAlpha")),
                 QStringLiteral("v6: Specular/ior + iorMax move onto the specular colour input and iorInAlpha=true becomes overrideIor=false"));
+            check(spec.contains(QStringLiteral("overrideColor")) && !spec.value(QStringLiteral("overrideColor")).toBool(true),
+                QStringLiteral("v6: an authored specular colour map without the RGB override key is read (overrideColor=false written on load)"));
             const auto sss = moved.textureSlot(QStringLiteral("UV0"), QStringLiteral("primarySubsurface"));
             check(sss.enabled && sss.values.value(QStringLiteral("mode")).toString() == QLatin1String("Combined")
                     && sss.values.value(QStringLiteral("profile")).toString() == QLatin1String("Custom")

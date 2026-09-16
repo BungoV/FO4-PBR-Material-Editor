@@ -291,8 +291,8 @@ runtime integration.
   both the exact identity, and a material without the map renders exactly as it
   did before. Metals are untouched — their F0 is the base color, and a metal's
   82-degree edge tint is an angular effect this shading model does not carry.
-  The slot has no constants by design: the map is the whole input, which is what
-  lets the preview and the runtime agree by construction. The "Specular F0"
+  The slot had no constants at first; since 2026-09-16 it carries the RGB
+  override (`overrideColor`, `color`) and the specular IOR (see PBRM v6). The "Specular F0"
   render mode now shows the resolved color, and the preview clamps the
   dielectric level to 0.16 the way the runtime always has.
 - **Converter** - Fallout 76 materials get the hue of their `_r` reflectance

@@ -162,7 +162,7 @@ multi-material preview.
 
 Feature parameters live on the feature's texture input. A slot's `values`
 hold its channel overrides and the parameters of the lobe or effect that
-input drives: `primarySpecularColor` (`ior`, `iorMax`, `overrideIor`),
+input drives: `primarySpecularColor` (`overrideColor`, `color`, `ior`, `iorMax`, `overrideIor`),
 `primarySubsurface` (`mode`, `profile`, `customScatterColor`,
 `customRadiusR/G/B`, `weight`, `transmission`, `transmissionTint`,
 `thickness`), `primarySurfaceEffects` (`sheenStrength`, `sheenRoughness`,
@@ -332,7 +332,7 @@ and these Primary UV socket keys:
 | `primaryNormal` | linear RG tangent normal, optional B height, A signed curvature or cone map per `alphaCarries` | `overrideNormal=true`, neutral normal `#8080FF`; strength `1.0`, `heightInBlue=false`, `alphaCarries="None"`, `cavitySpecOcclusion=1.0` |
 | `primaryRmaos` | linear R roughness, G metallic, B AO, A specular weight or porosity | `override*` channel fields default true; roughness `0.5`, metallic `0.0`, AO `1.0`, specular weight `1.0`; `alphaCarries="Specular Weight"`, `overridePorosity=false`, porosity `0.5` |
 | `primaryEmissive` | sRGB RGB radiance, A intensity mask | color `#FFFFFF`, intensity `0.0` |
-| `primarySpecularColor` | sRGB RGB specular tint, A specular IOR map (read only while `overrideIor=false`) | `overrideIor=true`, `ior=1.5`, `iorMax=4.25`; the constants are read whether or not the slot is enabled; an absent, disabled, or unresolvable slot means a white tint and the constant IOR |
+| `primarySpecularColor` | sRGB RGB specular tint (read only while `overrideColor=false`), A specular IOR map (read only while `overrideIor=false`) | `overrideColor=true`, `color=#FFFFFF`, `overrideIor=true`, `ior=1.5`, `iorMax=4.25`; the IOR constants are read whether or not the slot is enabled; an enabled slot with RGB overridden or no map tints with `color`; a disabled or absent slot means a white tint and the constant IOR |
 
 `primarySpecularColor` RGB is the OpenPBR `specular_color` tint on the
 dielectric Fresnel, and its alpha, while `overrideIor=false`, is the
@@ -390,7 +390,7 @@ is:
 
 | Bit | Name | Condition |
 | ---: | --- | --- |
-| 25 | `SpecularColorTexture` | enabled, valid `primarySpecularColor` path |
+| 25 | `SpecularColorTexture` | enabled, valid `primarySpecularColor` path, and `overrideColor=false` |
 
 These are parser/cache feature bits, not the older BGSM CB2 sentinel. Secondary
 UV, specialized shaders, and other sockets remain parseable authoring data but

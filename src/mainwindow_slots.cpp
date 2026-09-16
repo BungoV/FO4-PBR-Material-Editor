@@ -203,6 +203,8 @@ QVector<TextureSlotSpec> MainWindow::textureSlotsFor(Pbr::ShaderMode mode, const
             "SPEC", "sRGB • RGB specular tint / A specular IOR", QColor(128, 130, 156), false,
             QString(),
             "Tints the dielectric specular reflection (OpenPBR specular_color): RGB multiplies the reflectance the specular IOR and weight set, so white is no change and a color can only darken or shift the hue. Alpha is the specular IOR map over 0 to the IOR map ceiling (texel 90 of 255 is IOR 1.5 at the default ceiling 4.25, texel 0 makes the tint the reflectance outright) while its override is unchecked; otherwise the IOR override applies everywhere. Metals are untouched: their F0 is the base color.", {
+                toggleField("overrideColor", "RGB • Specular color", true, "Checked uses the constant specular color below; unchecked samples the texture RGB as the tint."),
+                colorField("color", "Specular color override", "#FFFFFF", "Constant sRGB specular tint used when RGB is overridden or unavailable; white is no change."),
                 toggleField("overrideIor", "A • Specular IOR", true, "Checked uses the constant specular IOR below everywhere. Unchecked reads the texture alpha as the IOR map; an opaque texture decodes alpha as 1, which would be the ceiling, so leave this checked unless the alpha was authored as IOR."),
                 numberField("ior", "Specular IOR override", 1.5, 0.0, 100.0, 0.001, "OpenPBR specular_ior. 1.5 is the dielectric default (F0 0.04); 0 makes the specular color the reflectance outright."),
                 numberField("iorMax", "IOR map ceiling", 4.25, 0.01, 100.0, 0.01, "The IOR that texel 255 of an IOR map stands for. 4.25 puts IOR 1.5 exactly on texel 90.")

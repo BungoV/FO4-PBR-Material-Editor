@@ -815,10 +815,15 @@ void PbrPreviewGL::setMaterial(const Pbr::MaterialDocument& document, const QStr
             QVector4D(useNormal,useNormal,used(state.values,"overrideConeOcclusion"),used(state.values,"overrideMask")));
     }
     {
-        // Specular color has no constants by design, so its fallback is a zero
-        // weight: an enabled-but-unresolved slot samples (0,0,0,0) and the
-        // shader's lerp collapses onto the scalar F0 it always used.
-        addSpecial(SpecularColorLayer,QStringLiteral("SpecularColor"),QVector4D(0,0,0,0),QVector4D(1,1,1,1));
+        // v6: the constants live on the slot. RGB packs the specular colour
+        // override (sRGB bytes, decoded in the shader like every sampled
+        // tint) and A the constant IOR as a texel over the ceiling, so an
+        // enabled slot with no map, or with a channel overridden, resolves to
+        // its constants. A disabled slot is not bound: white tint, constant
+        // IOR downstream.
+        const auto state=stateFor(QStringLiteral("SpecularColor"));const QVector3D color=jsonColor(state.values,"color","#FFFFFF");const float useColor=used(state.values,"overrideColor");
+        const float iorMax=numberValue(state.values,"iorMax",4.25f);const float iorTexel=std::clamp(numberValue(state.values,"ior",1.5f)/std::max(iorMax,1e-3f),0.0f,1.0f);
+        addSpecial(SpecularColorLayer,QStringLiteral("SpecularColor"),QVector4D(color,iorTexel),QVector4D(useColor,useColor,useColor,used(state.values,"overrideIor")));
     }
     {
         const auto state=stateFor(QStringLiteral("DetailNormal"));const QVector3D normalColor=jsonColor(state.values,"normal","#8080FF");const float useNormal=used(state.values,"overrideNormal");

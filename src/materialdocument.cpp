@@ -183,6 +183,13 @@ void migrateV5Specular(QJsonObject* set, QJsonObject* settings, int schemaVersio
             values.remove(QStringLiteral("iorInAlpha"));
             changed = true;
         }
+        // The tint's RGB override follows the editor-wide pattern too. A map
+        // authored before the override existed is read, not replaced by the
+        // toggle's default (checked = the constant, white).
+        if (key.endsWith(QStringLiteral("SpecularColor")) && enabledWithPath && !values.contains(QStringLiteral("overrideColor"))) {
+            values.insert(QStringLiteral("overrideColor"), false);
+            changed = true;
+        }
         if (changed) {
             slot.insert(QStringLiteral("values"), values);
             it.value() = slot;

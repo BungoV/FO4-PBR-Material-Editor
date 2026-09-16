@@ -15,6 +15,8 @@ describes what ships.
 | `primaryRmaos.alphaCarries` | `"Dielectric F0"` / `"Porosity"` | `"Specular Weight"` / `"Porosity"` |
 | `primarySpecularColor` RGB | sRGB tint on the dielectric Fresnel (doc row wrongly said linear) | unchanged, doc row corrected to sRGB |
 | `primarySpecularColor` A | tint coverage weight | `specular_ior` map, linear 0..`specularIorMax`, texel 255 = `iorMax`; read only while `overrideIor=false` |
+| `primarySpecularColor.overrideColor` | — | bool, default true; checked = the constant `color` tint (the editor forces it while no texture resolves), unchecked = the map's RGB |
+| `primarySpecularColor.color` | — | sRGB, default `#FFFFFF` (no change); the tint while the slot is enabled and `overrideColor=true` |
 | `primarySpecularColor.overrideIor` | — | bool, default true; checked = the constant `ior` everywhere, unchecked = alpha is the IOR map (the editor forces it while the texture has no alpha) |
 | `primarySpecularColor.ior` | — | float, default 1.5, range [0, inf). Used when no IOR map is read; read whether or not the slot is enabled |
 | `primarySpecularColor.iorMax` | — | float, default 4.25, range (0, inf). What texel 255 of the IOR map means |
@@ -29,7 +31,7 @@ it; the guard has no operand left.
 ## 2. Arithmetic
 
     F0_ior     = ((ior - 1) / (ior + 1))^2
-    tint       = decodeSrgb(specularColor.rgb)            (1,1,1 when the slot is absent)
+    tint       = decodeSrgb(overrideColor ? color : specularColor.rgb)   (1,1,1 when the slot is disabled)
     F0_diel    = specularWeight * tint * F0_ior           (per channel)
     F0         = lerp(F0_diel, baseColor, metallic)       (metals untouched, as before)
 
@@ -96,13 +98,15 @@ a test pin. A v6 file is refused by a v5 reader (schemaVersion gate, as before).
 
 - `res/Lighting/deferred_prepass.hlsl` ~854-867: `f4fxF0Scalar` becomes the
   weight; drop `min(., 0.16)`; multiply by `F0_ior` from the new constants and
-  by the tint when the color map is bound.
-- Constant buffer: two new floats, `specularIor` and `specularIorMax`, read
-  from `primarySpecularColor.ior` / `.iorMax` (not a setting group). The v5
+  by the tint: the map while bit 25, else the constant `specularColor`.
+- Constant buffer: two new floats, `specularIor` and `specularIorMax`, and a
+  float3 `specularColor`, read from `primarySpecularColor.ior` / `.iorMax` /
+  `.color` (not a setting group). The v5
   note "the color slot needs no new constant-buffer space" is void.
 - Feature bits: 7 `RmaosF0` renamed `RmaosSpecularWeight` (condition: bit 3,
   `overrideSpecularWeight=false`, `alphaCarries="Specular Weight"`); 9
-  `NormalCurvature` condition becomes `alphaCarries="Curvature"`; NEW 26
+  `NormalCurvature` condition becomes `alphaCarries="Curvature"`; 25
+  `SpecularColorTexture` gains `overrideColor=false`; NEW 26
   `SpecularIorTexture` (bit 25 and `overrideIor=false`); NEW 27 `NormalConeMap`
   (bit 1 and `alphaCarries="Cone Map"`), reserved, no consumer yet.
 - PREREQUISITE: the glossy-diffuse energy split (OpenPBR alignment item A2,

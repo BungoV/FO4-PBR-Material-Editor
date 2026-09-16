@@ -538,10 +538,11 @@ JobResult convertParsed(Bgsm::Material& material, JobResult result, const QStrin
     }
 
     if (!specularColorPortable.isEmpty()) {
-        // The map is the whole input: RGB tints the dielectric F0 and A weighs
-        // the tint in. The slot has no constants, so there is nothing else to
-        // write and nothing that can disagree with the runtime.
-        wireSlot(&document, QStringLiteral("primarySpecularColor"), specularColorPortable, QJsonObject{});
+        // RGB tints the dielectric F0. The map is read, so the RGB override
+        // (checked = the constant colour) is written off; the IOR constants
+        // follow below.
+        wireSlot(&document, QStringLiteral("primarySpecularColor"), specularColorPortable,
+            QJsonObject{{QStringLiteral("overrideColor"), false}});
     }
     {
         // v6: the reflectance level is the specular IOR on the specular colour
